@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+.git/
+.gitignore
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
+README.md
+MIGRATION.md
+DEPLOY.md
+tests/

@@ -1,0 +1,206 @@
+[
+  {
+    "caseId": "HA2-001",
+    "category": "clear_hazard_hot_work",
+    "input": {
+      "activity": {
+        "description": "Welding rectification of conveyor return idler frame, cement mill 2 elevation +18m platform",
+        "routine": "NON_ROUTINE",
+        "frequency": "OCCASIONAL",
+        "equipmentUsed": ["MIG welding set"],
+        "materialsUsed": ["mild steel"],
+        "energySources": ["ELECTRICAL"],
+        "personsEmployees": 2,
+        "personsContractors": 0
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-05", "HA-04", "HA-09", "HA-10"],
+      "expectedHazardCategoriesAtLeast": ["fire_explosion", "electrical", "height"],
+      "expectedReviewerNotes": ["hot work permit", "fall arrest"]
+    }
+  },
+  {
+    "caseId": "HA2-002",
+    "category": "confined_space",
+    "input": {
+      "activity": {
+        "description": "Internal cleaning of raw mill cyclone after planned shutdown, vessel entry through manhole",
+        "routine": "NON_ROUTINE",
+        "frequency": "MONTHLY",
+        "equipmentUsed": ["pneumatic vacuum"],
+        "materialsUsed": ["cement clinker dust"],
+        "energySources": ["PNEUMATIC"],
+        "personsEmployees": 1,
+        "personsContractors": 2
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-01", "HA-05", "HA-08"],
+      "expectedHazardCategoriesAtLeast": ["confined_space", "atmospheric", "respiratory"],
+      "expectedReviewerNotes": ["confined space permit", "gas test", "contractor competency"]
+    }
+  },
+  {
+    "caseId": "HA2-003",
+    "category": "multi_signal_chemical_height",
+    "input": {
+      "activity": {
+        "description": "Replacement of corroded acid dosing line on scrubber platform at 4m elevation",
+        "routine": "NON_ROUTINE",
+        "frequency": "OCCASIONAL",
+        "equipmentUsed": ["scaffold", "rigging"],
+        "materialsUsed": ["sulphuric acid 98%"],
+        "energySources": [],
+        "personsEmployees": 2,
+        "personsContractors": 1
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-02", "HA-03", "HA-05", "HA-08", "HA-09"],
+      "expectedHazardCategoriesAtLeast": ["chemical", "height", "mechanical"],
+      "multiSignalExpected": "chemical splash + fall arrest interaction"
+    }
+  },
+  {
+    "caseId": "HA2-004",
+    "category": "routine_high_frequency_baseline",
+    "input": {
+      "activity": {
+        "description": "Loading cement bags onto delivery trucks at dispatch bay 3",
+        "routine": "ROUTINE",
+        "frequency": "CONTINUOUS",
+        "equipmentUsed": ["forklift", "conveyor"],
+        "materialsUsed": ["cement"],
+        "energySources": ["ELECTRICAL"],
+        "personsEmployees": 4,
+        "personsContractors": 2
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-04", "HA-07", "HA-08"],
+      "expectedBaselineLikelihoodMin": 4,
+      "expectedHazardCategoriesAtLeast": ["mechanical", "ergonomic", "respiratory"]
+    }
+  },
+  {
+    "caseId": "HA2-005",
+    "category": "sparse_information",
+    "input": {
+      "activity": {
+        "description": "Inspection round",
+        "routine": "ROUTINE",
+        "frequency": "DAILY",
+        "equipmentUsed": [],
+        "materialsUsed": [],
+        "energySources": [],
+        "personsEmployees": 1,
+        "personsContractors": 0
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-07"],
+      "expectedLowConfidence": true,
+      "expectedReviewerNotes": ["activity description too sparse"]
+    }
+  },
+  {
+    "caseId": "HA2-006",
+    "category": "lifting_operation",
+    "input": {
+      "activity": {
+        "description": "Rotor extraction from kiln main drive motor using 50T mobile crane",
+        "routine": "NON_ROUTINE",
+        "frequency": "RARE",
+        "equipmentUsed": ["50T mobile crane", "rigging slings", "tackle"],
+        "materialsUsed": [],
+        "energySources": ["ELECTRICAL"],
+        "personsEmployees": 4,
+        "personsContractors": 6
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-02", "HA-04", "HA-05", "HA-08"],
+      "expectedHazardCategoriesAtLeast": ["mechanical", "struck_by"],
+      "expectedReviewerNotes": ["lifting plan", "load test", "contractor competency"]
+    }
+  },
+  {
+    "caseId": "HA2-007",
+    "category": "electrical_hv",
+    "input": {
+      "activity": {
+        "description": "33kV switchgear isolation and testing for transformer T2 maintenance",
+        "routine": "NON_ROUTINE",
+        "frequency": "MONTHLY",
+        "equipmentUsed": ["HV insulated tools", "phase rotation tester"],
+        "materialsUsed": [],
+        "energySources": ["ELECTRICAL", "HIGH_VOLTAGE"],
+        "personsEmployees": 3,
+        "personsContractors": 0
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-04", "HA-05"],
+      "expectedHazardCategoriesAtLeast": ["electrical", "arc_flash"],
+      "expectedReviewerNotes": ["LOTO", "arc flash PPE"]
+    }
+  },
+  {
+    "caseId": "HA2-008",
+    "category": "duplicate_hazards_existing",
+    "input": {
+      "activity": {
+        "description": "Welding on conveyor structure",
+        "routine": "NON_ROUTINE",
+        "frequency": "OCCASIONAL"
+      },
+      "existingEntryHazards": ["fire_explosion_hot_work", "burn"]
+    },
+    "expectations": {
+      "shouldNotResuggest": ["fire_explosion_hot_work", "burn"],
+      "expectedNewSignal": "fume inhalation"
+    }
+  },
+  {
+    "caseId": "HA2-009",
+    "category": "no_clear_hazards",
+    "input": {
+      "activity": {
+        "description": "Documentation review in office",
+        "routine": "ROUTINE",
+        "frequency": "DAILY",
+        "equipmentUsed": [],
+        "materialsUsed": [],
+        "energySources": [],
+        "personsEmployees": 1
+      }
+    },
+    "expectations": {
+      "layerARulesExpected": ["HA-07"],
+      "expectedHazardCategoriesAtLeast": ["ergonomic", "psychosocial"],
+      "expectedLowConfidence": true
+    }
+  },
+  {
+    "caseId": "HA2-010",
+    "category": "compare_versions",
+    "input": {
+      "task": "compare_versions",
+      "currentEntry": {
+        "controls": [{"hierarchy": "PPE", "description": "safety helmet"}],
+        "residualScore": 12
+      },
+      "priorVersionSnapshot": {
+        "controls": [
+          {"hierarchy": "PPE", "description": "safety helmet"},
+          {"hierarchy": "ENGINEERING", "description": "guarded conveyor"}
+        ],
+        "residualScore": 6
+      }
+    },
+    "expectations": {
+      "expectedDriftFlags": ["engineering control removed", "residual score increase unjustified"]
+    }
+  }
+]
