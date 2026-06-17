@@ -453,11 +453,16 @@ async def upload_attachment(
     if obs is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
     record = {"observerId": obs.observerId, "responsiblePersonId": obs.responsiblePersonId}
+    # The observer who logged this observation can always attach their own
+    # evidence — mirrors the gallery-read rule. Observations can be CREATEd for
+    # any plant (ALL_PLANTS), so without this the observer would be blocked from
+    # adding a photo to their own cross-plant observation (UPDATE is OWN_PLANT).
+    is_observer = bool(user.id) and obs.observerId == user.id
     result = await can(
         db, user.id, "OBSERVATION.UPDATE",
         PermissionContext(record_id=obs.id, plant_id=obs.plantId, record=record),
     )
-    if not result.allowed:
+    if not result.allowed and not is_observer:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     if not is_storage_configured():
         raise HTTPException(

@@ -1818,14 +1818,6 @@ async def for_ptw(
         base = base.where(HiraEntry.areaId == area_id)
 
     explicit_q = base.where(HiraEntry.influencesPtwRiskLevel.is_(True))
-    if permit_type:
-        # Filter in SQL using JSON contains — fall back to Python if DB doesn't support it
-        explicit_q = explicit_q.where(
-            or_(
-                HiraEntry.influencesPtwPermitTypes.is_(None),
-                HiraEntry.influencesPtwPermitTypes.contains([permit_type]),
-            )
-        )
     explicit = explicit_q.limit(200)
     high_risk = base.where(
         or_(HiraEntry.residualRiskLevel == "HIGH", HiraEntry.residualRiskLevel == "CRITICAL")
@@ -1833,6 +1825,17 @@ async def for_ptw(
 
     explicit_rows = (await db.execute(explicit)).all()
     high_rows = (await db.execute(high_risk)).all()
+
+    # Filter by permit_type in Python — `influencesPtwPermitTypes` is a JSON
+    # column, so SQLAlchemy's `.contains()` emits a `LIKE` (jsonb ~~ text) that
+    # Postgres rejects. An entry applies when it lists no specific permit types
+    # (NULL/empty = all) or explicitly includes this permit type.
+    if permit_type:
+        explicit_rows = [
+            (e, s)
+            for (e, s) in explicit_rows
+            if not e.influencesPtwPermitTypes or permit_type in e.influencesPtwPermitTypes
+        ]
 
     by_id: dict[str, tuple[HiraEntry, HiraStudy]] = {}
     for e, s in explicit_rows:
@@ -1842,7 +1845,7 @@ async def for_ptw(
 
     sorted_entries = sorted(
         by_id.values(),
-        key=lambda x: (x[0].residualRiskScore or x[0].initialRiskScore),
+        key=lambda x: (x[0].residualRiskScore or x[0].initialRiskScore or 0),
         reverse=True,
     )
     entries = [_serialize_integration_entry(e, s) for e, s in sorted_entries]
