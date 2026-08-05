@@ -191,6 +191,12 @@ class AuditCheckpointResponse(Base, IdMixin):
     responseType: Mapped[str] = mapped_column(String, nullable=False, default="pass_partial_fail")
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Column I of the Page Industries checklist — STATUTORY_REGULATORY |
+    # INTERNAL_REQUIREMENT. Master data, not a verdict: a factory licence is
+    # statutory regardless of who audits it, so this is snapshotted from the
+    # library checkpoint at materialization and rendered read-only.
+    requirementType: Mapped[str | None] = mapped_column(String)
+
     # Denormalized per-checkpoint rules.
     requiresPhotoOnFail: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     autoTriggerCapaOnFail: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -215,6 +221,22 @@ class AuditCheckpointResponse(Base, IdMixin):
     assessmentStatus: Mapped[str] = mapped_column(String, nullable=False, default="NOT_ASSESSED")
     workflowState: Mapped[str] = mapped_column(String, nullable=False, default="OPEN")
     currentRound: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # ── Page Industries grading (workbook columns C–F, H) ─────────────────
+    #
+    # First-class columns rather than keys inside `auditorResponse`, because the
+    # discipline rollup and the audit score are SQL aggregates over 1,500-row
+    # audits — summing points out of a JSON blob would force a full row load on
+    # every navigator repaint. `assessmentStatus` stays the engine's verdict and
+    # is derived from `gradeAwarded`, so nothing downstream had to change.
+    #
+    # scoreAllotted is NULL for an N/A checkpoint (the workbook's literal "NA"),
+    # which is exactly what takes it out of the denominator.
+    gradeAwarded: Mapped[str | None] = mapped_column(String)      # C
+    scoreAllotted: Mapped[int | None] = mapped_column(Integer)    # D — 3 or NULL
+    scoreObtained: Mapped[int | None] = mapped_column(Integer)    # E — 3..-1
+    complianceStatus: Mapped[str | None] = mapped_column(String)  # F
+    riskGrade: Mapped[str | None] = mapped_column(String)         # H
 
     # Carousel capture (first-class).
     observation: Mapped[str | None] = mapped_column(Text)
@@ -251,6 +273,7 @@ class AuditCheckpointResponse(Base, IdMixin):
         Index("ix_AuditCheckpointResponse_audit_routed", "auditId", "routedToUserId"),
         Index("ix_AuditCheckpointResponse_audit_owner", "auditId", "assignedOwnerId"),
         Index("ix_AuditCheckpointResponse_audit_wfstate", "auditId", "workflowState"),
+        Index("ix_AuditCheckpointResponse_audit_grade", "auditId", "gradeAwarded"),
     )
 
 

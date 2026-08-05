@@ -23,6 +23,7 @@ from app.core.deps import get_current_user
 from app.models.user import User
 from app.services import audit_assignment as assignment
 from app.services import audit_compliance as svc
+from app.services import page_grading
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -237,6 +238,17 @@ _TRANSITION_PERM = {
 
 
 class SaveResponseBody(BaseModel):
+    """A partial-save from the conduct screen.
+
+    Every field is optional and the service merges only what was actually sent
+    (the route passes `exclude_unset`), so an autosave carrying just the audit
+    findings can never blank the grade.
+
+    `value` (the engine's pass/partial/fail/na bucket) is retained: the bulk
+    fast path and the older external clients still speak it, and the service
+    derives the Page grade back from it. When both arrive, `gradeAwarded` wins.
+    """
+
     checkpointCode: str
     value: Literal["pass", "partial", "fail", "na", "yes", "no"] | None = None
     numericValue: float | None = None
@@ -245,6 +257,17 @@ class SaveResponseBody(BaseModel):
     auditorNotes: str = ""
     photos: list[dict[str, Any]] = []
     evidenceLinks: list[dict[str, Any]] = []
+
+    # ── Page Industries grading (checklist columns C–H) ───────────────────
+    # Codes are validated in app/services/page_grading.py rather than by
+    # Literal here, so the vocabulary has exactly one definition and the
+    # endpoint also accepts the workbook's own labels ("Repeated Non
+    # Compliance") for anyone posting straight from the sheet.
+    gradeAwarded: str | None = None       # C
+    scoreObtained: int | None = None      # E — override of the derived score
+    complianceStatus: str | None = None   # F
+    auditFindings: str | None = None      # G — alias of textObservation
+    riskGrade: str | None = None          # H
 
 
 class BulkResponseBody(BaseModel):
@@ -386,6 +409,19 @@ async def add_template_custom_checkpoint(
         return await svc.add_template_custom_checkpoint(db, user=user, template_id=template_id, payload=body.model_dump())
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.get("/grading-vocabulary")
+async def grading_vocabulary() -> dict[str, Any]:
+    """The Page Industries grading dropdowns (checklist columns C, D, E, F, H, I).
+
+    Unauthenticated on purpose — it is a static option list with no tenant data
+    in it, and making the conduct screen wait on a session to learn what
+    "Effective" is called would be a needless round-trip on a field device.
+    Serving it rather than hard-coding the same five labels in the client is
+    what stops the two drifting apart.
+    """
+    return page_grading.vocabulary()
 
 
 @router.get("/dashboard/programme")
@@ -561,6 +597,12 @@ async def list_checkpoints(
     value: str | None = Query(None, description="pass|partial|fail|na|unanswered"),
     criticality: str | None = Query(None),
     q: str | None = Query(None),
+    grade: str | None = Query(None, description="Grade Awarded (col C) code or label"),
+    complianceStatus: str | None = Query(None, description="Status (col F) code or label"),
+    riskGrade: str | None = Query(None, description="Risk Grade (col H): HIGH|MEDIUM|LOW"),
+    requirementType: str | None = Query(
+        None, description="Requirement Type (col I): STATUTORY_REGULATORY|INTERNAL_REQUIREMENT"
+    ),
     assignedAuditorId: str | None = Query(None),
     mine: bool = Query(False, description="only checkpoints assigned to me (auditor)"),
     cursor: str | None = Query(None),
@@ -578,7 +620,9 @@ async def list_checkpoints(
         return await svc.list_checkpoints(
             db, audit_id=audit_id, discipline_id=disciplineId, workflow_state=workflowState,
             assessment_status=assessmentStatus, value=value, criticality=criticality,
-            q=q, assigned_auditor_id=auditor_filter, cursor=cursor, limit=limit,
+            q=q, grade=grade, compliance_status=complianceStatus, risk_grade=riskGrade,
+            requirement_type=requirementType,
+            assigned_auditor_id=auditor_filter, cursor=cursor, limit=limit,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e

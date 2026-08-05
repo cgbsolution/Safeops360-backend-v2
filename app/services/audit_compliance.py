@@ -42,6 +42,7 @@ from app.services import (
     citations,
     independence,
     independence_events,
+    page_grading,
     scoring_rules,
     signoff,
 )
@@ -116,6 +117,107 @@ def _norm_value(value: Any) -> str | None:
     return None
 
 
+# The engine's verdict bucket -> the Page grade that means the same thing.
+# The inverse of page_grading.GRADE_TO_VALUE, needed because two paths still
+# set a bare bucket: the bulk "mark discipline Pass/NA" fast path, and the
+# supplier-portal / legacy API clients. Both must leave the grading columns
+# populated, or a bulk-marked discipline would score zero out of its allotment.
+_VALUE_TO_GRADE = {
+    "pass": page_grading.GRADE_EFFECTIVE,
+    "partial": page_grading.GRADE_SOME_IMPROVEMENT,
+    "fail": page_grading.GRADE_MAJOR_IMPROVEMENT,
+    "na": page_grading.GRADE_NA,
+}
+
+
+def _apply_page_grading(
+    resp: AuditCheckpointResponse, payload: dict[str, Any], merged: dict[str, Any]
+) -> str | None:
+    """Reconcile the Page grading columns with the engine's verdict bucket, in
+    whichever direction this particular save supplied.
+
+    Returns the resulting bucket (pass/partial/fail/na, or None if cleared) so
+    the caller drives the existing routing / CAPA / workflow logic off it
+    unchanged — the grading is a richer face on the same verdict, not a second
+    state machine beside it.
+
+    Precedence is deliberate: an explicit `gradeAwarded` always wins over a bare
+    `value` in the same payload, because the grade is what the auditor actually
+    chose on screen and the value is derived from it.
+    """
+    grade_sent = "gradeAwarded" in payload
+    value_sent = "value" in payload
+
+    if grade_sent:
+        grade = page_grading.normalise_grade(payload.get("gradeAwarded"))
+        if payload.get("gradeAwarded") not in (None, "") and grade is None:
+            raise ValueError(f"Unknown grade '{payload.get('gradeAwarded')}'")
+    elif value_sent:
+        grade = _VALUE_TO_GRADE.get(_norm_value(payload.get("value")) or "")
+    else:
+        grade = resp.gradeAwarded
+
+    val = page_grading.value_for_grade(grade)
+    resp.gradeAwarded = grade
+    # Keep the JSON blob coherent with the columns. Reports, the supplier
+    # portal and the auditee screens all still read `auditorResponse.value`;
+    # letting the two disagree would be the worst of both models.
+    merged["value"] = val
+
+    # Status (column F). Only auto-suggested when the auditor has not chosen one
+    # for this checkpoint — a Repeated Non Compliance must never be silently
+    # downgraded to Non Compliance by a later re-grade.
+    if "complianceStatus" in payload:
+        status = page_grading.normalise_status(payload.get("complianceStatus"))
+        if payload.get("complianceStatus") not in (None, "") and status is None:
+            raise ValueError(f"Unknown status '{payload.get('complianceStatus')}'")
+        resp.complianceStatus = status
+    elif grade is None:
+        resp.complianceStatus = None
+    elif resp.complianceStatus is None:
+        resp.complianceStatus = page_grading.suggest_status(grade)
+
+    # Risk grade (column H). Cleared when the checkpoint stops being a finding,
+    # so a re-graded-to-Effective checkpoint cannot keep reporting High risk.
+    if "riskGrade" in payload:
+        risk = page_grading.normalise_risk_grade(payload.get("riskGrade"))
+        if payload.get("riskGrade") not in (None, "") and risk is None:
+            raise ValueError(f"Unknown risk grade '{payload.get('riskGrade')}'")
+        resp.riskGrade = risk
+    if not page_grading.requires_risk_grade(grade):
+        resp.riskGrade = None
+
+    # Score allotted (column D) is never the auditor's choice — it is 3 for a
+    # scored checkpoint and NULL for an N/A one, which is what takes it out of
+    # the denominator.
+    resp.scoreAllotted = page_grading.allotted_for_grade(grade)
+
+    # Score obtained (column E). An explicit value from the client is honoured —
+    # the workbook lets an auditor override the ladder — and otherwise it follows
+    # grade + status, which is where the -1 repeat penalty comes from.
+    #
+    # The re-derivation is guarded on the grading actually having moved in THIS
+    # payload. Without that guard an observation-only autosave (the conduct
+    # screen fires one on every keystroke pause) would silently reset a score the
+    # auditor had deliberately overridden a moment earlier.
+    if "scoreObtained" in payload and payload.get("scoreObtained") is not None:
+        try:
+            score = int(payload["scoreObtained"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("scoreObtained must be a whole number") from e
+        if score not in page_grading.SCORE_OBTAINED_CHOICES:
+            raise ValueError(
+                f"scoreObtained must be one of {', '.join(str(s) for s in page_grading.SCORE_OBTAINED_CHOICES)}"
+            )
+        resp.scoreObtained = None if resp.scoreAllotted is None else score
+    elif grade_sent or value_sent or "complianceStatus" in payload:
+        resp.scoreObtained = page_grading.suggest_score(grade, resp.complianceStatus)
+    elif resp.scoreAllotted is None:
+        resp.scoreObtained = None  # became N/A — nothing left to score
+
+    return val
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Serialization
 # ─────────────────────────────────────────────────────────────────────
@@ -136,6 +238,13 @@ def _response_to_dict(r: AuditCheckpointResponse, *, include_interactions: bool 
         "responseType": r.responseType,
         "sequence": r.sequence,
         "orderIndex": r.orderIndex,
+        # Page Industries grading (checklist columns C–F, H, I).
+        "requirementType": r.requirementType,
+        "gradeAwarded": r.gradeAwarded,
+        "scoreAllotted": r.scoreAllotted,
+        "scoreObtained": r.scoreObtained,
+        "complianceStatus": r.complianceStatus,
+        "riskGrade": r.riskGrade,
         "requiresPhotoOnFail": r.requiresPhotoOnFail,
         "autoTriggerCapaOnFail": r.autoTriggerCapaOnFail,
         "capaSeverity": r.capaSeverity,
@@ -370,6 +479,18 @@ async def import_library(db: AsyncSession, *, user: User, payload: dict[str, Any
             if cp["code"] in seen_codes:
                 raise ValueError(f"Duplicate checkpoint code: {cp['code']}")
             seen_codes.add(cp["code"])
+            # Requirement Type is optional, but a MISSPELLED one must not pass:
+            # it would normalise to null at materialisation and the checkpoint
+            # would silently lose its statutory classification on every audit
+            # thereafter — an omission nobody would notice until an auditor
+            # went looking for it.
+            if cp.get("requirement_type") is not None:
+                if page_grading.normalise_requirement_type(cp["requirement_type"]) is None:
+                    raise ValueError(
+                        f"Checkpoint {cp['code']}: requirement_type must be "
+                        f"STATUTORY_REGULATORY or INTERNAL_REQUIREMENT "
+                        f"(got '{cp['requirement_type']}')"
+                    )
             cp_count += 1
     if cp_count == 0:
         raise ValueError("The library has no checkpoints")
@@ -706,6 +827,20 @@ async def _discipline_rollup(db: AsyncSession, audit_id: str) -> list[dict[str, 
                 func.count(R.id).filter(
                     and_(A == "FAIL", R.criticality.notin_(["critical", "major"]))
                 ).label("minorFailed"),
+                # Page grading — summed in SQL for the same reason the counts
+                # are: the navigator repaints on every save of a 1,500-row audit
+                # and must never pull rows to add up points.
+                func.coalesce(func.sum(R.scoreAllotted), 0).label("scoreAllotted"),
+                func.coalesce(func.sum(R.scoreObtained), 0).label("scoreObtained"),
+                func.count(R.id).filter(
+                    and_(
+                        A.in_(["FAIL", "PARTIAL"]),
+                        R.complianceStatus.in_(sorted(page_grading.REPEAT_STATUSES)),
+                    )
+                ).label("repeatFindings"),
+                func.count(R.id).filter(
+                    and_(A.in_(["FAIL", "PARTIAL"]), R.requirementType == page_grading.REQ_STATUTORY)
+                ).label("statutoryFindings"),
             )
             .where(R.auditId == audit_id)
             .group_by(R.categoryId, R.categoryName, R.categoryColor)
@@ -718,6 +853,13 @@ async def _discipline_rollup(db: AsyncSession, audit_id: str) -> list[dict[str, 
             "answered": r.answered, "passed": r.passed, "partial": r.partial,
             "failed": r.failed, "na": r.na, "criticalFailed": r.criticalFailed,
             "majorFailed": r.majorFailed, "minorFailed": r.minorFailed,
+            "scoreAllotted": int(r.scoreAllotted or 0),
+            "scoreObtained": int(r.scoreObtained or 0),
+            "scorePct": page_grading.compute_points_score(
+                obtained=int(r.scoreObtained or 0), allotted=int(r.scoreAllotted or 0)
+            ),
+            "repeatFindings": r.repeatFindings,
+            "statutoryFindings": r.statutoryFindings,
         }
         for r in rows
     ]
@@ -737,16 +879,22 @@ def _score_from_rollup(rollup: list[dict[str, Any]]) -> dict[str, Any]:
     major = sum(c["majorFailed"] for c in rollup)
     minor = sum(c["minorFailed"] for c in rollup)
     answered = passed + partial + failed + na
-    assessable = passed + partial + failed
-    overall = round((passed + 0.5 * partial) / assessable * 100, 1) if assessable else 0.0
+    obtained_total = sum(c["scoreObtained"] for c in rollup)
+    allotted_total = sum(c["scoreAllotted"] for c in rollup)
+    # Points, not the pass-ratio — see `_compute_score`. The two paths must
+    # agree exactly, because this one serves the register and that one is what
+    # gets frozen into the report snapshot.
+    overall = page_grading.compute_points_score(
+        obtained=obtained_total, allotted=allotted_total
+    )
     category_scores = []
     for c in rollup:
-        c_assess = c["passed"] + c["partial"] + c["failed"]
         category_scores.append({
             "category_id": c["categoryId"], "category_name": c["categoryName"],
             "total": c["total"], "passed": c["passed"], "partial": c["partial"],
             "failed": c["failed"], "na": c["na"],
-            "score_pct": round((c["passed"] + 0.5 * c["partial"]) / c_assess * 100, 1) if c_assess else 0.0,
+            "score_obtained": c["scoreObtained"], "score_allotted": c["scoreAllotted"],
+            "score_pct": c["scorePct"],
         })
     return {
         "total_checkpoints": total, "answered": answered, "passed": passed,
@@ -755,6 +903,11 @@ def _score_from_rollup(rollup: list[dict[str, Any]]) -> dict[str, Any]:
         "category_scores": sorted(category_scores, key=lambda c: c["category_name"]),
         "critical_failures": crit, "major_failures": major, "minor_failures": minor,
         "audit_passed": crit == 0 and overall >= MINIMUM_PASS_SCORE,
+        "score_obtained": obtained_total,
+        "score_allotted": allotted_total,
+        "score_band": page_grading.band(overall, MINIMUM_PASS_SCORE),
+        "repeat_findings": sum(c["repeatFindings"] for c in rollup),
+        "statutory_findings": sum(c["statutoryFindings"] for c in rollup),
     }
 
 
@@ -829,6 +982,8 @@ async def list_checkpoints(
     db: AsyncSession, *, audit_id: str, discipline_id: str | None = None,
     workflow_state: str | None = None, assessment_status: str | None = None,
     value: str | None = None, criticality: str | None = None, q: str | None = None,
+    grade: str | None = None, compliance_status: str | None = None,
+    risk_grade: str | None = None, requirement_type: str | None = None,
     assigned_auditor_id: str | None = None, cursor: str | None = None, limit: int = 50,
 ) -> dict[str, Any]:
     """Paginated, filterable checkpoint slice for an audit. Cursor =
@@ -851,6 +1006,29 @@ async def list_checkpoints(
         conds.append(R.assessmentStatus == mapped)
     if criticality:
         conds.append(R.criticality == criticality)
+    # Page grading filters. Each raises rather than silently returning
+    # everything on an unknown token — a filter that quietly does nothing is
+    # how an auditor concludes a discipline is clean when it isn't.
+    if grade:
+        code = page_grading.normalise_grade(grade)
+        if code is None:
+            raise ValueError(f"Invalid grade filter '{grade}'")
+        conds.append(R.gradeAwarded == code)
+    if compliance_status:
+        code = page_grading.normalise_status(compliance_status)
+        if code is None:
+            raise ValueError(f"Invalid status filter '{compliance_status}'")
+        conds.append(R.complianceStatus == code)
+    if risk_grade:
+        code = page_grading.normalise_risk_grade(risk_grade)
+        if code is None:
+            raise ValueError(f"Invalid risk grade filter '{risk_grade}'")
+        conds.append(R.riskGrade == code)
+    if requirement_type:
+        code = page_grading.normalise_requirement_type(requirement_type)
+        if code is None:
+            raise ValueError(f"Invalid requirement type filter '{requirement_type}'")
+        conds.append(R.requirementType == code)
     if q:
         like = f"%{q.strip()}%"
         conds.append(or_(R.checkpointCode.ilike(like), R.checkpointQuestion.ilike(like)))
@@ -945,6 +1123,15 @@ async def bulk_save_response(
         resp.overallStatus = f"answered_{value}"
         resp.answeredAt = now
         resp.workflowState = "PASSED"
+        # Bulk-marking is still a grade. Leaving the Page columns null here
+        # would drop every bulk-marked checkpoint out of the score denominator,
+        # so a discipline marked compliant in one click would read 0%.
+        grade = _VALUE_TO_GRADE[value]
+        resp.gradeAwarded = grade
+        resp.complianceStatus = page_grading.suggest_status(grade)
+        resp.scoreAllotted = page_grading.allotted_for_grade(grade)
+        resp.scoreObtained = page_grading.suggest_score(grade, resp.complianceStatus)
+        resp.riskGrade = None
 
     if audit.status == "scheduled" and rows:
         audit.status = "in_progress"
@@ -1102,8 +1289,24 @@ def _live_progress(responses: list[AuditCheckpointResponse]) -> dict[str, Any]:
 
 
 def _compute_score(audit: ComplianceAudit, responses: list[AuditCheckpointResponse]) -> dict[str, Any]:
+    """The write-path score, from loaded rows.
+
+    Scoring is POINTS-based: Σ score obtained / Σ score allotted, where every
+    scored checkpoint is allotted 3 and an N/A one is allotted nothing. That is
+    the number Page reconcile against their own workbook, and it is not the same
+    as the engine's historic `(passed + 0.5·partial) / assessable` pass-ratio —
+    a repeat non-compliance scores -1 against an allotment of 3, so a discipline
+    can legitimately land below zero. It is reported as-is; clamping it would
+    hide exactly the penalty the -1 exists to apply.
+
+    The pass/partial/fail/na counts are still produced. They are what the
+    critical-failure gate, the RAG bars and every existing consumer read, and
+    they remain the same verdict seen from the other side.
+    """
     passed = partial = failed = na = answered = 0
     crit_fail = major_fail = minor_fail = 0
+    repeat_findings = statutory_findings = 0
+    obtained_total = allotted_total = 0
     cat_scores: dict[str, dict[str, Any]] = {}
 
     for r in responses:
@@ -1111,9 +1314,15 @@ def _compute_score(audit: ComplianceAudit, responses: list[AuditCheckpointRespon
         cat = cat_scores.setdefault(
             r.categoryId,
             {"category_id": r.categoryId, "category_name": r.categoryName, "total": 0,
-             "passed": 0, "partial": 0, "failed": 0, "na": 0},
+             "passed": 0, "partial": 0, "failed": 0, "na": 0,
+             "score_obtained": 0, "score_allotted": 0},
         )
         cat["total"] += 1
+        if r.scoreAllotted:
+            cat["score_allotted"] += r.scoreAllotted
+            cat["score_obtained"] += r.scoreObtained or 0
+            allotted_total += r.scoreAllotted
+            obtained_total += r.scoreObtained or 0
         if val is None:
             continue
         answered += 1
@@ -1135,14 +1344,21 @@ def _compute_score(audit: ComplianceAudit, responses: list[AuditCheckpointRespon
         elif val == "na":
             na += 1
             cat["na"] += 1
+        if val in ("fail", "partial"):
+            if page_grading.is_repeat(r.complianceStatus):
+                repeat_findings += 1
+            if r.requirementType == page_grading.REQ_STATUTORY:
+                statutory_findings += 1
 
-    assessable = passed + partial + failed
-    overall = round((passed + 0.5 * partial) / assessable * 100, 1) if assessable else 0.0
+    overall = page_grading.compute_points_score(
+        obtained=obtained_total, allotted=allotted_total
+    )
 
     category_scores = []
     for c in cat_scores.values():
-        c_assess = c["passed"] + c["partial"] + c["failed"]
-        c["score_pct"] = round((c["passed"] + 0.5 * c["partial"]) / c_assess * 100, 1) if c_assess else 0.0
+        c["score_pct"] = page_grading.compute_points_score(
+            obtained=c["score_obtained"], allotted=c["score_allotted"]
+        )
         category_scores.append(c)
 
     audit_passed = crit_fail == 0 and overall >= MINIMUM_PASS_SCORE
@@ -1160,6 +1376,13 @@ def _compute_score(audit: ComplianceAudit, responses: list[AuditCheckpointRespon
         "major_failures": major_fail,
         "minor_failures": minor_fail,
         "audit_passed": audit_passed,
+        # Page grading rollup — the workbook's own arithmetic, so a reader can
+        # check the percentage rather than take it on trust.
+        "score_obtained": obtained_total,
+        "score_allotted": allotted_total,
+        "score_band": page_grading.band(overall, MINIMUM_PASS_SCORE),
+        "repeat_findings": repeat_findings,
+        "statutory_findings": statutory_findings,
     }
 
 
@@ -1518,6 +1741,12 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
                     categoryColor=cat.get("category_color", ""),
                     criticality=cp.get("criticality", "major"),
                     responseType=cp.get("response_type", "pass_partial_fail"),
+                    # Column I — master data, snapshotted with the rest of the
+                    # checkpoint definition so a later library edit cannot
+                    # retroactively restate what an audit was assessed against.
+                    requirementType=page_grading.normalise_requirement_type(
+                        cp.get("requirement_type")
+                    ),
                     sequence=seq,
                     orderIndex=order_in_disc,
                     requiresPhotoOnFail=bool(cp.get("requires_photo_on_fail", False)),
@@ -1673,6 +1902,12 @@ async def add_disciplines(
                     categoryColor=cat.get("category_color", ""),
                     criticality=cp.get("criticality", "major"),
                     responseType=cp.get("response_type", "pass_partial_fail"),
+                    # Column I — master data, snapshotted with the rest of the
+                    # checkpoint definition so a later library edit cannot
+                    # retroactively restate what an audit was assessed against.
+                    requirementType=page_grading.normalise_requirement_type(
+                        cp.get("requirement_type")
+                    ),
                     sequence=seq,
                     orderIndex=order_in_disc,
                     requiresPhotoOnFail=bool(cp.get("requires_photo_on_fail", False)),
@@ -2116,11 +2351,17 @@ async def add_template_custom_checkpoint(
 
 
 # camelCase payload key -> stored snake_case key, for partial-merge saves.
+#
+# `auditFindings` is the workbook's column G under its own name. It is an ALIAS
+# onto the same observation field the engine already had rather than a second
+# store — the auditor's comment on a checkpoint is one thing, and two columns
+# holding it would immediately disagree.
 _SAVE_KEY_MAP = {
     "value": "value",
     "numericValue": "numeric_value",
     "selectedOptions": "selected_options",
     "textObservation": "text_observation",
+    "auditFindings": "text_observation",
     "auditorNotes": "auditor_notes",
     "photos": "photos",
     "evidenceLinks": "evidence_links",
@@ -2154,9 +2395,13 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
             merged[dst] = payload[src]
     merged["responded_at"] = now.isoformat()
     merged["is_saved"] = True
+
+    # Page grading (columns C–F, H) — writes the grading columns and returns the
+    # engine bucket everything below this line already keys off. It also rewrites
+    # merged["value"], so it must run before auditorResponse is handed over.
+    val = _apply_page_grading(resp, payload, merged)
     resp.auditorResponse = merged
 
-    val = _norm_value(merged.get("value"))
     if val is not None:
         resp.overallStatus = f"answered_{val}"
         resp.answeredAt = now
@@ -2204,9 +2449,11 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
                     # photo where the checkpoint demands one). Without this the
                     # reopen→fail path would mint an evidence-free finding/CAPA.
                     if not (resp.observation or "").strip():
-                        raise ValueError("An observation is required before routing a fail/partial finding.")
+                        raise ValueError("Audit findings are required before routing a finding.")
                     if resp.requiresPhotoOnFail and not (resp.auditorEvidenceIds or []):
                         raise ValueError("An evidence photo is required for this checkpoint before routing the finding.")
+                    if not resp.riskGrade:
+                        raise ValueError("A risk grade is required before routing a finding.")
                     owner = resp.assignedOwnerId or resp.routedToUserId or audit.plantManagerUserId or audit.leadAuditorUserId
                     resp.routedToUserId = owner
                     resp.workflowState = "AWAITING_AUDITEE"
@@ -2277,13 +2524,18 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
         v = _norm_value(ar.get("value"))
         if v in ("fail", "partial"):
             if not (ar.get("text_observation") or "").strip():
-                missing.append(f"{r.checkpointCode} (observation)")
+                missing.append(f"{r.checkpointCode} (audit findings)")
             elif r.requiresPhotoOnFail and not (ar.get("photos") or []):
                 missing.append(f"{r.checkpointCode} (evidence photo)")
+            # A finding with no assessed risk cannot be prioritised by the
+            # auditee or the plant head, and it is the one column of the
+            # workbook that nothing else can supply.
+            elif not r.riskGrade:
+                missing.append(f"{r.checkpointCode} (risk grade)")
     if missing:
         head = ", ".join(missing[:8])
         more = f" + {len(missing) - 8} more" if len(missing) > 8 else ""
-        raise ValueError(f"{len(missing)} fail/partial checkpoint(s) need an observation/evidence before submit: {head}{more}")
+        raise ValueError(f"{len(missing)} graded checkpoint(s) are incomplete: {head}{more}")
 
     now = _utcnow()
     capa_count = 0
@@ -2400,7 +2652,15 @@ async def _spawn_capa(
             from app.schemas.capa import CapaCreate
 
             obs = (response.auditorResponse or {}).get("text_observation", "")
-            severity = _CAPA_SEVERITY.get(response.capaSeverity or response.criticality, "MODERATE")
+            # The auditor's Risk Grade (column H) beats the checkpoint's
+            # configured criticality here: criticality was set before anyone
+            # visited the site, the risk grade is what they concluded having
+            # seen the actual finding. Falls back to the configured severity
+            # when no risk grade was captured.
+            severity = page_grading.capa_severity(
+                response.riskGrade,
+                _CAPA_SEVERITY.get(response.capaSeverity or response.criticality, "MODERATE"),
+            )
             problem = (
                 f"Audit {audit.auditNumber} ({audit.auditType}) — checkpoint {response.checkpointCode} "
                 f"in category '{response.categoryName}' failed. Question: {response.checkpointQuestion} "
@@ -2926,6 +3186,12 @@ def _build_report_snapshot(
                 "assessmentStatus": r.assessmentStatus, "workflowState": r.workflowState, "round": r.currentRound,
                 "ownerId": owner, "question": r.checkpointQuestion, "observation": r.observation,
                 "standard": r.standard, "requirementReference": r.requirementReference,
+                # A finding is read for how bad it is and whether it is a
+                # repeat. Both are workbook columns and both belong on the row.
+                "requirementType": r.requirementType, "gradeAwarded": r.gradeAwarded,
+                "scoreAllotted": r.scoreAllotted, "scoreObtained": r.scoreObtained,
+                "complianceStatus": r.complianceStatus, "riskGrade": r.riskGrade,
+                "isRepeat": page_grading.is_repeat(r.complianceStatus),
                 "capaNumber": capa.get("capa_number"), "capaStatus": capa.get("capa_status"),
                 "isAdHoc": r.isAdHoc,
             })
@@ -3459,6 +3725,11 @@ async def list_report_register(
             "checkpointCode": r.checkpointCode, "discipline": r.categoryName, "question": r.checkpointQuestion,
             "severity": r.criticality, "assessmentStatus": r.assessmentStatus, "workflowState": r.workflowState,
             "standard": r.standard, "requirementReference": r.requirementReference,
+            # The workbook's own columns, so the printed register is the same
+            # document the customer already reviews — not a translation of it.
+            "requirementType": r.requirementType, "gradeAwarded": r.gradeAwarded,
+            "scoreAllotted": r.scoreAllotted, "scoreObtained": r.scoreObtained,
+            "complianceStatus": r.complianceStatus, "riskGrade": r.riskGrade,
             "observation": r.observation, "isAdHoc": r.isAdHoc,
             "ownerId": r.assignedOwnerId or r.routedToUserId, "capaNumber": (r.capa or {}).get("capa_number"),
             "auditorEvidenceIds": r.auditorEvidenceIds or [], "auditeeEvidenceIds": r.auditeeEvidenceIds or [],
