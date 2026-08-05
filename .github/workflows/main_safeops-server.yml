@@ -47,15 +47,17 @@ on:
   workflow_dispatch:
 
 env:
-  # Overridable with a repository VARIABLE (Settings → Variables), not a secret.
+  # Set as a repository VARIABLE (Settings → Variables → Actions), not a secret.
   #
-  # It is a variable rather than a hard-coded string because this repository is
-  # the Page Industries copy of the backend, while `safeops-server` is the app
-  # service the ORIGINAL product deploys to. Pointing this pipeline at that app
-  # would publish the Page build over the other product's backend. Set
-  # AZURE_WEBAPP_NAME to the Page app service before enabling deploys, or
-  # confirm deliberately that this really is the intended target.
-  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME || 'safeops-server' }}
+  # Deliberately has NO fallback value. The workflow's name still says
+  # `safeops-server` because that is the app service the ORIGINAL product
+  # deploys to — and this repository is the Page Industries copy, which is
+  # confirmed to belong on a SEPARATE app service. A default of
+  # `safeops-server` would mean that the moment a deployment credential is
+  # added here, the very next push publishes the Page build over the other
+  # product's live backend. Leaving this empty makes that accident impossible:
+  # the preflight below refuses to deploy until the target is named explicitly.
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
 
 jobs:
   build:
@@ -130,6 +132,30 @@ jobs:
           TENANT_ID: ${{ secrets.AZURE_TENANT_ID || secrets.AZUREAPPSERVICE_TENANTID_599CC67E7A1F44D5981A776CA279843A }}
           SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID || secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_41CD105B25B74ED6B1A6AE61D602F1DF }}
         run: |
+          # The target is checked BEFORE the credentials, because deploying the
+          # right build to the wrong app service is the more damaging of the two
+          # failures — it would overwrite another product's running backend,
+          # and unlike a missing secret it would look like a success.
+          if [ -z "$AZURE_WEBAPP_NAME" ]; then
+            {
+              echo "## Deployment target is not set"
+              echo
+              echo "This repository is the **Page Industries** copy of the backend and deploys to its"
+              echo "own app service, which has not been named yet."
+              echo
+              echo "Add a repository **variable** (Settings → Secrets and variables → Actions →"
+              echo "**Variables** tab, not Secrets):"
+              echo
+              echo "- \`AZURE_WEBAPP_NAME\` — the Page Industries app service name"
+              echo
+              echo "There is no default on purpose. The workflow file is still named after"
+              echo "\`safeops-server\`, which is the ORIGINAL product's app service — defaulting to it"
+              echo "would publish this build over that backend the moment a credential is added here."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Deployment target not set::Set the AZURE_WEBAPP_NAME repository variable to the Page Industries app service. There is no default — see the job summary."
+            exit 1
+          fi
+
           echo "Deployment target: $AZURE_WEBAPP_NAME"
 
           if [ -n "$PUBLISH_PROFILE" ]; then
