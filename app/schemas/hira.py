@@ -64,6 +64,7 @@ class RiskMatrixOut(BaseModel):
     likelihoodLevels: int
     severityLevels: int
     acceptableResidual: dict[str, Any]
+    alarpBands: dict[str, Any] | None = None
     controlHierarchyEnforced: bool
     isActive: bool
     isDefault: bool
@@ -94,8 +95,19 @@ class HiraHazardOut(BaseModel):
     isStandard: str | None
     isoReference: str | None
     typicalControlsSuggested: list[Any] | None
+    requiresPermit: bool = False
+    permitTypes: list[Any] | None = None
     isActive: bool
     isGlobal: bool
+
+
+class HiraHazardPermitUpdate(BaseModel):
+    """Library-level permit gate. Only these two fields are patchable here —
+    the rest of the hazard master is managed by the seed/library import."""
+
+    model_config = ConfigDict(extra="ignore")
+    requiresPermit: bool
+    permitTypes: list[str] | None = None
 
 
 class HiraControlOut(BaseModel):
@@ -255,12 +267,18 @@ class HiraEntryHazardOut(BaseModel):
     potentialHarm: list[Any] | None
     affectedPersons: list[Any] | None
     consequence: str | None = None
+    regulationRef: str | None = None
+    regulationSection: str | None = None
     sortOrder: int
     # Denormalised hazard library fields so the editor renders without a
     # second lookup.
     hazardCode: str | None = None
     hazardCategory: str | None = None
     hazardName: str | None = None
+    # Permit gate, denormalised from the library so Section 2 can show the
+    # Create-PTW prompt without a second fetch.
+    hazardRequiresPermit: bool = False
+    hazardPermitTypes: list[Any] | None = None
 
 
 class HiraEntryControlOut(BaseModel):
@@ -291,6 +309,8 @@ class HiraEntryRecommendedControlOut(BaseModel):
     responsibleId: str | None
     status: str
     capaId: str | None
+    evidenceAttached: bool = False
+    documentReference: str | None = None
 
 
 class HiraEntryRegulationRefOut(BaseModel):
@@ -305,7 +325,11 @@ class HiraEntryHazardCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
     hazardId: str
     contextualDescription: str | None = None
+    # Required in practice on the create path — enforced in the router so the
+    # 422 can name the offending hazard rather than a bare field error.
     consequence: str | None = None
+    regulationRef: str | None = None
+    regulationSection: str | None = None
 
 
 class HiraEntryCreate(BaseModel):
@@ -318,7 +342,13 @@ class HiraEntryCreate(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    studyId: str
+    # The study is identified by the URL path (POST /studies/{study_id}/entries).
+    # This was required in the body as well, so every create from the UI — which
+    # correctly does not duplicate a path param in the payload — failed request
+    # validation before reaching the handler. Optional and ignored: the router
+    # always uses the path value, so a stale or mismatched body value can never
+    # file an entry against the wrong study.
+    studyId: str | None = None
     sequenceNumber: int | None = None  # auto-assigned by router if omitted
     groupLabel: str | None = None
 
@@ -365,6 +395,24 @@ class HiraEntryUpdate(BaseModel):
     residualLikelihoodRationale: str | None = None
     residualSeverityRationale: str | None = None
     residualAcceptanceRationale: str | None = None
+    # True  => residual is derived from the existing controls (server computes L/S).
+    # False => manual override; the residualLikelihood/SeverityId above are used.
+    residualAutoCalculated: bool | None = None
+
+    # ALARP demonstration (tolerable-region cost-benefit test). Status,
+    # region and sign-off are computed server-side, never patched directly.
+    alarpFurtherControlsConsidered: bool | None = None
+    alarpFurtherControlsDescription: str | None = None
+    alarpRiskReductionBenefit: str | None = None
+    alarpCostBand: str | None = None
+    alarpGrosslyDisproportionate: bool | None = None
+    alarpJustification: str | None = None
+
+    # Target (forecast) risk — projected residual after recommended controls.
+    # Risk score/level/color + ALARP region are computed server-side.
+    targetLikelihoodId: str | None = None
+    targetSeverityId: str | None = None
+    targetRationale: str | None = None
 
     personsEmployees: int | None = None
     personsContractors: int | None = None
@@ -445,6 +493,32 @@ class HiraEntryOut(BaseModel):
     residualRiskColor: str | None
     residualAcceptable: bool | None
     residualAcceptanceRationale: str | None
+    residualAutoCalculated: bool | None = None
+    initialAlarpRegion: str | None = None
+    residualAlarpRegion: str | None = None
+    alarpStatus: str | None = None
+    alarpFurtherControlsConsidered: bool | None = None
+    alarpFurtherControlsDescription: str | None = None
+    alarpRiskReductionBenefit: str | None = None
+    alarpCostBand: str | None = None
+    alarpGrosslyDisproportionate: bool | None = None
+    alarpJustification: str | None = None
+    alarpDemonstratedById: str | None = None
+    alarpDemonstratedAt: datetime | None = None
+    targetLikelihoodId: str | None = None
+    targetLikelihoodScore: int | None = None
+    targetSeverityId: str | None = None
+    targetSeverityScore: int | None = None
+    targetRiskScore: int | None = None
+    targetRiskLevel: str | None = None
+    targetRiskColor: str | None = None
+    targetAlarpRegion: str | None = None
+    targetRationale: str | None = None
+    unacceptableOverrideById: str | None = None
+    unacceptableOverrideAt: datetime | None = None
+    unacceptableOverrideJustification: str | None = None
+    unacceptableOverrideExpiresAt: datetime | None = None
+    unacceptableOverrideActive: bool = False
     triggersTrainingProgramIds: list[Any] | None
     triggersInspectionTypeIds: list[Any] | None
     influencesPtwRiskLevel: bool
@@ -487,6 +561,15 @@ class HiraEntryListItem(BaseModel):
     residualRiskScore: int | None = None
     residualRiskColor: str | None
     residualAcceptable: bool | None
+    initialAlarpRegion: str | None = None
+    residualAlarpRegion: str | None = None
+    alarpStatus: str | None = None
+    targetRiskLevel: str | None = None
+    targetRiskScore: int | None = None
+    targetRiskColor: str | None = None
+    targetAlarpRegion: str | None = None
+    unacceptableOverrideActive: bool = False
+    unacceptableOverrideExpiresAt: datetime | None = None
     status: str
     lastReviewedAt: datetime | None
     nextReviewDue: datetime | None
@@ -557,6 +640,8 @@ class HiraEntryRecommendedControlReplaceItem(BaseModel):
     responsibleId: str | None = None
     status: str = "PROPOSED"
     capaId: str | None = None
+    evidenceAttached: bool = False
+    documentReference: str | None = None
 
 
 class HiraEntryRecommendedControlReplaceRequest(BaseModel):
@@ -736,6 +821,8 @@ class HiraEntryHazardReplaceItem(BaseModel):
     potentialHarm: list[Any] | None = None
     affectedPersons: list[Any] | None = None
     consequence: str | None = None
+    regulationRef: str | None = None
+    regulationSection: str | None = None
     sortOrder: int = 0
 
 
@@ -773,7 +860,17 @@ class HiraEntryTransitionRequest(BaseModel):
     reason: str | None = None
 
 
+class HiraUnacceptableOverrideRequest(BaseModel):
+    """Elevated, time-bounded authorisation to APPROVE an entry whose residual
+    risk sits in the Unacceptable ALARP region. Requires HIRA.OVERRIDE_UNACCEPTABLE."""
+
+    model_config = ConfigDict(extra="ignore")
+    justification: str = Field(min_length=10, description="Why the Unacceptable residual is being accepted despite ALARP")
+    expiresInDays: int = Field(default=90, ge=1, le=365, description="Days until the override auto-flags for re-review")
+
+
 __all__ = [
+    "HiraUnacceptableOverrideRequest",
     "RiskMatrixOut",
     "RiskMatrixLikelihoodOut",
     "RiskMatrixSeverityOut",

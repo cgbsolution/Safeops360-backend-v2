@@ -355,6 +355,10 @@ async def record_test(cid: str, body: S.TestCreate, user: User = Depends(get_cur
         await db.flush()
         t.deficiencyId = d.id
     await svc.recompute_control_ratings(db, c)
+    # A control going deficient must flag every risk it mitigates for reassessment
+    # (and clear the flag when it recovers) — the risk↔control↔residual chain.
+    from app.services.erm import sync_control_alerts as _sync_control_alerts
+    await _sync_control_alerts(db)
     await db.commit()
     await db.refresh(t)
     o = S.TestOut.model_validate(t)
@@ -854,7 +858,14 @@ async def reconcile_claim_loss(clid: str, user: User = Depends(get_current_user)
 @router.get("/insurance/coverage-gap", response_model=list[S.CoverageGapOut])
 async def list_coverage_gaps(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "INSURANCE.READ")
-    rows = (await db.execute(select(CoverageGapAssessment).where(CoverageGapAssessment.isDeleted.is_(False)).order_by(CoverageGapAssessment.reviewDate.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(
+            select(CoverageGapAssessment)
+            .where(CoverageGapAssessment.isDeleted.is_(False))
+            .order_by(CoverageGapAssessment.createdAt.desc(), CoverageGapAssessment.id.desc())
+        )
+    ).scalars().all()
     names = await _names(db, [r.reviewedBy for r in rows])
     out = []
     for r in rows:
@@ -984,7 +995,7 @@ async def risk_tier3_context(rid: str, user: User = Depends(get_current_user), d
                 has_primary = True
                 if c.currentOperatingRating == "DEFICIENT":
                     primary_deficient = True
-            controls_out.append({"controlCode": c.controlCode, "name": c.name, "mitigationStrength": m.mitigationStrength, "operatingRating": c.currentOperatingRating})
+            controls_out.append({"controlId": c.id, "controlCode": c.controlCode, "name": c.name, "mitigationStrength": m.mitigationStrength, "operatingRating": c.currentOperatingRating})
     policies_out, verdict = [], "NOT_ASSESSED"
     if (await can(db, user.id, "INSURANCE.READ", PermissionContext())).allowed:
         pols = (await db.execute(select(InsurancePolicy).where(InsurancePolicy.isDeleted.is_(False)))).scalars().all()

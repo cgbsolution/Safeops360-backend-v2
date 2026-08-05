@@ -36,14 +36,17 @@ from app.models.flra import FLRA, FLRAStatus
 from app.models.permit import (
     Permit,
     PermitCrewMember,
+    PermitEvidenceAction,
     PermitExtension,
     PermitGasTestReading,
     PermitStatus,
     PermitSuspension,
 )
 from app.models.user import User
+from app.schemas.permit import PtwEvidenceInput
 from app.services.gas_test import get_refresh_status, record_gas_reading
 from app.services.permissions import PermissionContext, can, get_user_role_codes
+from app.services.ptw_evidence import EvidenceError, record_action_evidence
 
 router = APIRouter(prefix="/api/ptw", tags=["ptw-active"])
 
@@ -80,23 +83,29 @@ class SuspendPayload(BaseModel):
     reason: SuspensionReason
     reasonDetail: str | None = None
     reFlraRequired: bool = True
+    # Closed-loop rebuild: suspension is a lifecycle action → field evidence
+    # (GPS + signature per EVIDENCE_POLICY) is required.
+    evidence: PtwEvidenceInput | None = None
 
 
 class ResumePayload(BaseModel):
     model_config = ConfigDict(extra="ignore")
     resumptionConditions: str | None = None
+    evidence: PtwEvidenceInput | None = None
 
 
 class ExtensionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     newValidTo: datetime
     reason: str = Field(min_length=5)
+    evidence: PtwEvidenceInput | None = None
 
 
 class ExtensionDecision(BaseModel):
     model_config = ConfigDict(extra="ignore")
     decision: Literal["APPROVED", "REJECTED"]
     approverComments: str | None = None
+    evidence: PtwEvidenceInput | None = None
 
 
 class CrewAddPayload(BaseModel):
@@ -110,26 +119,36 @@ class CrewRemovePayload(BaseModel):
     reason: str = Field(min_length=1)
 
 
-class ReturnPayload(BaseModel):
-    """Receiver returns the permit at end of work."""
-
-    model_config = ConfigDict(extra="ignore")
-    isolationsRestored: bool
-    workAreaClean: bool
-    notes: str | None = None
-    photos: list[str] | None = None  # PermitAttachment ids
-
-
-class SiteVerifyPayload(BaseModel):
-    """Issuer / Safety Officer post-walk verification."""
-
-    model_config = ConfigDict(extra="ignore")
-    checklist: dict[str, bool]
-    photos: list[str] | None = None
-    notes: str | None = None
-
-
 # ─── Helpers ──────────────────────────────────────────────────────────
+
+
+async def _evidence_or_422(
+    db: AsyncSession,
+    *,
+    permit: Permit,
+    action: PermitEvidenceAction,
+    actor_id: str,
+    ev: PtwEvidenceInput | None,
+    comments: str | None = None,
+) -> None:
+    """Validate + persist the field-evidence row; HTTP 422 with the full
+    missing-element list when the action's policy isn't met."""
+    try:
+        await record_action_evidence(
+            db,
+            permit=permit,
+            action=action,
+            actor_id=actor_id,
+            gps_latitude=ev.gpsLatitude if ev else None,
+            gps_longitude=ev.gpsLongitude if ev else None,
+            gps_accuracy_meters=ev.gpsAccuracyMeters if ev else None,
+            signature_image=ev.signatureImageBase64 if ev else None,
+            declaration_text=ev.declarationText if ev else None,
+            comments=comments,
+            photo_attachment_ids=ev.photoAttachmentIds if ev else None,
+        )
+    except EvidenceError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
 
 
 async def _load_permit_or_403(
@@ -250,6 +269,15 @@ async def suspend_active(
             f"Only ACTIVE permits can be suspended (current status: {permit.status.value}).",
         )
 
+    await _evidence_or_422(
+        db,
+        permit=permit,
+        action=PermitEvidenceAction.SUSPEND,
+        actor_id=user.id,
+        ev=payload.evidence,
+        comments=payload.reasonDetail or payload.reason,
+    )
+
     now = datetime.now(timezone.utc)
     susp = PermitSuspension(
         permitId=permit_id,
@@ -263,6 +291,18 @@ async def suspend_active(
     permit.suspendedAt = now
     permit.suspendedReason = payload.reasonDetail or payload.reason
     permit.isCurrentlySuspended = True
+    # Daily Brief outbox: ptw.suspended → overlapping-permit impact (CRITICAL)
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_SUSPENDED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "ACTIVE", "to": "SUSPENDED", "reason": payload.reasonDetail or payload.reason},
+    )
     await db.flush()
     return {"ok": True, "suspensionId": susp.id, "reFlraRequired": payload.reFlraRequired}
 
@@ -280,6 +320,15 @@ async def resume_active(
             status.HTTP_400_BAD_REQUEST,
             f"Only SUSPENDED permits can be resumed (current status: {permit.status.value}).",
         )
+
+    await _evidence_or_422(
+        db,
+        permit=permit,
+        action=PermitEvidenceAction.RESUME,
+        actor_id=user.id,
+        ev=payload.evidence,
+        comments=payload.resumptionConditions,
+    )
 
     open_susp = (
         await db.execute(
@@ -321,6 +370,17 @@ async def resume_active(
     permit.suspendedAt = None
     permit.suspendedReason = None
     permit.isCurrentlySuspended = False
+    from app.services import events as domain_events
+    domain_events.emit(
+        db,
+        event_type=domain_events.PTW_RESUMED,
+        entity_type="Permit",
+        entity_id=permit.id,
+        entity_ref=permit.number,
+        site_id=permit.plantId,
+        actor_id=user.id,
+        payload={"from": "SUSPENDED", "to": "ACTIVE", "reFlraEnforced": re_flra_required},
+    )
     await db.flush()
     return {"ok": True, "reFlraEnforced": re_flra_required}
 
@@ -352,6 +412,16 @@ async def request_extension(
             status.HTTP_400_BAD_REQUEST,
             "newValidTo must be later than the current validTo.",
         )
+
+    await _evidence_or_422(
+        db,
+        permit=permit,
+        action=PermitEvidenceAction.EXTEND,
+        actor_id=user.id,
+        ev=payload.evidence,
+        comments=f"Extension requested to {new_to.isoformat()}: {payload.reason}",
+    )
+
     # Cap at 8h beyond original cap per type (caller-side cap)
     ext = PermitExtension(
         permitId=permit_id,
@@ -391,6 +461,15 @@ async def decide_extension(
             status.HTTP_400_BAD_REQUEST, f"Extension is already {ext.status}."
         )
 
+    await _evidence_or_422(
+        db,
+        permit=permit,
+        action=PermitEvidenceAction.EXTEND,
+        actor_id=user.id,
+        ev=payload.evidence,
+        comments=f"Extension {payload.decision.lower()}: {payload.approverComments or ''}".strip(),
+    )
+
     now = datetime.now(timezone.utc)
     ext.approvedAt = now
     ext.approvedById = user.id
@@ -399,6 +478,18 @@ async def decide_extension(
 
     if payload.decision == "APPROVED":
         permit.validTo = ext.newValidTo
+        # Daily Brief outbox: an approved extension is a permit modification
+        from app.services import events as domain_events
+        domain_events.emit(
+            db,
+            event_type=domain_events.PTW_MODIFIED,
+            entity_type="Permit",
+            entity_id=permit.id,
+            entity_ref=permit.number,
+            site_id=permit.plantId,
+            actor_id=user.id,
+            payload={"fields": ["validTo"], "reason": f"validity extended to {ext.newValidTo.isoformat()}"},
+        )
     await db.flush()
     return {"ok": True, "status": ext.status}
 
@@ -419,6 +510,16 @@ async def add_crew(
             status.HTTP_400_BAD_REQUEST,
             f"Cannot edit crew on a {permit.status.value} permit.",
         )
+
+    # Safety-roster gate — a worker under an open deroster review, or a
+    # confirmed one, cannot join a permit crew. BLOCKING, unlike the PPE
+    # snapshot below: PPE is re-checked at activation, but nothing downstream
+    # re-checks a safety hold, so this is the enforcement point.
+    from app.services import roster_gate
+
+    _gate = await roster_gate.for_user(db, payload.userId)
+    if not _gate.allowed:
+        raise HTTPException(status.HTTP_409_CONFLICT, _gate.detail)
 
     # PPE snapshot for the joining member (PPE-01 Pass 2). Non-blocking —
     # the re-FLRA + activation gate enforce PPE before work resumes.
@@ -483,126 +584,19 @@ async def add_crew(
     return {"ok": True, "reFlraRequired": True}
 
 
-# ─── Return + Site Verification ────────────────────────────────────────
-
-
-@router.post("/{permit_id}/active/return")
-async def return_permit(
-    permit_id: str,
-    payload: ReturnPayload,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    """Receiver hands the permit back at end of work. Records that
-    isolations were restored and the work area is clean. Permit stays
-    ACTIVE until site-verify + closure complete; the workflow's CLOSURE
-    step now becomes executable."""
-    permit = await _load_permit_or_403(db, permit_id, user, "PTW.UPDATE")
-    if permit.receiverId is not None and permit.receiverId != user.id:
-        # Only the named receiver can return. HSE/Admin can override.
-        role_codes = await get_user_role_codes(db, user.id)
-        if not any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes):
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                "Only the named receiver can return the permit.",
-            )
-    if permit.status not in {PermitStatus.ACTIVE, PermitStatus.SUSPENDED}:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"Cannot return a {permit.status.value} permit.",
-        )
-    if permit.returnedAt is not None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Permit has already been returned.",
-        )
-    if not payload.isolationsRestored:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Confirm isolations are restored before returning.",
-        )
-    if not payload.workAreaClean:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Confirm work area is clean before returning.",
-        )
-
-    # Mark every isolation as restored (audit row) — caller may have already
-    # done this individually but this catches the closure-ready state.
-    from app.models.permit import PermitIsolation
-
-    open_isolations = (
-        await db.execute(
-            select(PermitIsolation)
-            .where(PermitIsolation.permitId == permit_id)
-            .where(PermitIsolation.restoredAt.is_(None))
-        )
-    ).scalars().all()
-    now = datetime.now(timezone.utc)
-    for iso in open_isolations:
-        iso.restoredAt = now
-        iso.restoredById = user.id
-
-    permit.returnedAt = now
-    permit.returnedById = user.id
-    permit.returnNotes = payload.notes
-    permit.returnPhotos = payload.photos
-    await db.flush()
-    return {
-        "ok": True,
-        "returnedAt": now.isoformat(),
-        "isolationsAutoRestored": len(open_isolations),
-    }
-
-
-@router.post("/{permit_id}/active/site-verify")
-async def site_verify(
-    permit_id: str,
-    payload: SiteVerifyPayload,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    """Issuer / Safety Officer / Plant Head walks the area after return
-    and records a checklist + photos. Closure cannot proceed without
-    this step."""
-    permit = await _load_permit_or_403(db, permit_id, user, "PTW.UPDATE")
-    role_codes = await get_user_role_codes(db, user.id)
-    if not any(
-        r in {"PERMIT_ISSUER", "SAFETY_OFFICER", "PLANT_HEAD", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"}
-        for r in role_codes
-    ):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Only Issuer / Safety Officer / Plant Head / HSE / Admin can site-verify.",
-        )
-    if permit.returnedAt is None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Receiver must return the permit before site verification.",
-        )
-    if permit.siteVerifiedAt is not None:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Site has already been verified for this permit.",
-        )
-
-    # Reject if any required checklist item failed
-    failed = [k for k, v in payload.checklist.items() if not v]
-    if failed:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            (
-                f"Checklist items not satisfied: {', '.join(failed)}. "
-                "Re-walk the site or escalate to HSE before closing."
-            ),
-        )
-
-    permit.siteVerifiedAt = datetime.now(timezone.utc)
-    permit.siteVerifiedById = user.id
-    permit.siteVerificationChecklist = payload.checklist
-    permit.siteVerificationPhotos = payload.photos
-    await db.flush()
-    return {"ok": True, "siteVerifiedAt": permit.siteVerifiedAt.isoformat()}
+# ─── Return + Site Verification — SUPERSEDED (closed-loop rebuild) ──────
+#
+# The legacy `POST /{id}/active/return` and `POST /{id}/active/site-verify`
+# endpoints are replaced by the evidence-carrying pair in ptw_lifecycle.py:
+#
+#   POST /api/ptw/{id}/complete   — Work Completed declaration: structured
+#                                   outcome enum + restoration confirmations
+#                                   + GPS/photo/signature evidence
+#   POST /api/ptw/{id}/handback   — Handback inspection: checklist + evidence
+#
+# Both old routes returned dangling photo ids into a table that was never
+# wired; the new flow uses real PermitAttachment uploads. The single
+# first-party web client was migrated in the same change.
 
 
 @router.delete("/{permit_id}/active/crew/{crew_id}")

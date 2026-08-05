@@ -77,6 +77,16 @@ EXTRA_PERMISSIONS = [
 ]
 
 
+# A PTW names its Receiver as a free choice of User — no role restriction is
+# applied at creation. The receiver-acknowledgement step is an ASSIGNEE_TASK,
+# so workflow_engine._rbac_gate demands PTW.EXECUTE from whoever is named.
+# Without this grant the step is unreachable for every role except
+# HSE_MANAGER, and no permit can ever be activated or closed.
+# OWN_RECORDS is the correct scope: the engine already enforces an exact
+# assignee match, and /api/ptw/{id}/accept re-checks receiverId == user.id,
+# so this grants nothing beyond acting on a task you were personally named on.
+PTW_RECEIVER_EXECUTE = {"module": "PTW", "actions": ["EXECUTE"], "scope": "OWN_RECORDS"}
+
 # scope: ALL_PLANTS / OWN_PLANT / OWN_DEPARTMENT / OWN_RECORDS
 ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     "WORKER": [
@@ -85,9 +95,12 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_RECORDS"},
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        # Audit & Compliance — auditee: read routed audits + respond on own checkpoints.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ", "UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "CONTRACTOR_WORKMAN": [
         {"module": "SKILL_MATRIX", "actions": ["READ"], "scope": "OWN_RECORDS"},
@@ -96,6 +109,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_RECORDS"},
         {"module": "FLRA", "actions": ["READ", "EXECUTE"], "scope": "OWN_RECORDS"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_RECORDS"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_RECORDS"},
     ],
     "STORE_KEEPER": [
@@ -108,15 +122,20 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "FLRA", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_DEPARTMENT"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        # Auditee (audits are plant-scoped): view + respond to own findings.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "PERMIT_ISSUER": [
         {"module": "OBSERVATION", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
         {"module": "PTW", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "FLRA", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
     ],
@@ -125,12 +144,23 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_PLANT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
         {"module": "PTW", "actions": ["READ", "APPROVE"], "scope": "OWN_PLANT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": ["READ", "VERIFY"], "scope": "OWN_PLANT"},
         {"module": "PPE", "actions": ["READ", "CREATE", "UPDATE", "EXPORT", "ISSUE", "INSPECT", "VERIFY", "RETIRE_APPROVE"], "scope": "OWN_PLANT"},
+        # Auditee: view plant audits + respond to findings routed to them (the
+        # service owner-guard restricts UPDATE to their own checkpoints).
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "HSE_MANAGER": [
-        {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
+        # View / edit / delete of raised records are elevated to ALL_PLANTS so HSE
+        # leadership can act on any originator's record group-wide (any plant).
+        # The workflow verbs (approve/execute/verify/close) + create/export stay
+        # OWN_PLANT — cross-plant workflow ownership sits with CORPORATE_HSE.
+        {"module": m, "actions": ["READ", "UPDATE", "DELETE"], "scope": "ALL_PLANTS"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
+    ] + [
+        {"module": m, "actions": ["CREATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT", "PTW", "FLRA"]
     ] + [
         {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"},
@@ -144,6 +174,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]
     ] + [
         {"module": "PTW", "actions": ["READ", "APPROVE", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "TRAINING", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "INSPECTION", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
@@ -181,10 +212,15 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_DEPARTMENT"},
         {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_DEPARTMENT"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_DEPARTMENT"},
+        PTW_RECEIVER_EXECUTE,
+        # Auditee: view plant audits + respond to own findings.
+        {"module": "AUDIT_COMPLIANCE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        {"module": "AUDIT_COMPLIANCE", "actions": ["UPDATE"], "scope": "OWN_RECORDS"},
     ],
     "MAINTENANCE_HEAD": [
         {"module": "INSPECTION", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_PLANT"},
     ],
     "ENVIRONMENT_MANAGER": [
@@ -193,6 +229,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     ],
     "CONTRACTOR_COORDINATOR": [
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
+        PTW_RECEIVER_EXECUTE,
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
         {"module": "EPC", "actions": ["CREATE", "READ", "UPDATE", "INDUCTION_CONDUCT"], "scope": "OWN_PLANT"},
     ],

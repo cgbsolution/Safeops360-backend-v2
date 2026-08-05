@@ -1,7 +1,16 @@
 from functools import lru_cache
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load `.env` into the process environment as early as possible (import-time).
+# pydantic-settings reads `.env` into the Settings object, but several
+# best-effort integrations (SMTP email, SMS providers) read raw `os.getenv`.
+# Without this, those credentials never reach `os.getenv` and delivery is
+# silently skipped even when `.env` is fully configured. `override=False`
+# keeps real OS env vars (prod/containers) authoritative over `.env`.
+load_dotenv(override=False)
 
 
 class Settings(BaseSettings):
@@ -9,12 +18,6 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     log_level: str = "INFO"
-
-    # CAMS dual-mode packaging (§12). When true, the CAMS provider layer forces
-    # the bundled implementations (CAMS-owned obligations register, lite asset
-    # register, shipped RCA library) instead of the platform modules — the same
-    # codebase ships standalone and integrated with no fork.
-    cams_standalone: bool = False
 
     database_url: str
     database_url_sync: str | None = None
@@ -28,6 +31,57 @@ class Settings(BaseSettings):
     supabase_incident_bucket: str = "incident-attachments"
 
     cors_origins: str = "http://localhost:3000"
+
+    # ── Module Entitlement & Licensing System ──────────────────────────────
+    # Path to the signed .lic file. Offline-validated locally; no phone-home.
+    # When unset, the validator looks for `licence.lic` in the backend root.
+    # NOTE: this only tells the app WHERE the licence is — it can never GRANT
+    # entitlements. Only the signed licence does (build prompt §5.3).
+    licence_file_path: str | None = None
+    # Alternative to the file: the full signed licence token, supplied via the
+    # LICENCE_TOKEN env var. Robust for cloud/container backends with an
+    # ephemeral filesystem (Vercel/Dokploy) where an uploaded file wouldn't
+    # survive a restart. The file (if present) takes precedence.
+    licence_token: str | None = None
+    # Days before expiry that flip the status to EXPIRING_SOON (banner window).
+    licence_warn_days: int = 14
+    # Re-validate the licence on this cadence (seconds). Catches expiry roll-over
+    # and clock-tamper between boots without a restart.
+    licence_recheck_seconds: int = 3600
+    # P2-1 background scheduler. Default off (opt-in) so a shared dev DB isn't
+    # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
+    scheduler_enabled: bool = False
+
+    # ─── PTW closed-loop: FLRA policy ────────────────────────────────────
+    # FLRA is an optional sub-flow per permit (closed-loop rebuild). Instance-
+    # level config matches the per-customer-instance deployment model:
+    #   PTW_FLRA_REQUIRED_DEFAULT=true       → every permit requires an FLRA
+    #   PTW_FLRA_REQUIRED_TYPES=HOT_WORK,CONFINED_SPACE
+    #                                        → only these types require it
+    # The resolved value is snapshotted onto Permit.flraRequired at creation.
+    ptw_flra_required_default: bool = False
+    ptw_flra_required_types: str = ""
+
+    def ptw_flra_required_for(self, permit_type: str) -> bool:
+        types = {t.strip().upper() for t in self.ptw_flra_required_types.split(",") if t.strip()}
+        if types:
+            return permit_type.upper() in types
+        return self.ptw_flra_required_default
+
+    # Security: echo the password-reset OTP back in the forgot-password response
+    # for QA when there is no email gateway. OFF by default and must be opted in
+    # explicitly — so even a misconfigured APP_ENV can never leak an OTP. Never
+    # enable in any internet-reachable environment.
+    expose_dev_otp: bool = False
+
+    # ── Email (SMTP) ────────────────────────────────────────────────────────
+    # Typed access to the same values `.env` exposes. The best-effort email
+    # sender prefers these (falls back to os.getenv for backwards-compat).
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_pass: str | None = None
+    email_from: str | None = None
 
     # AI agents (Anthropic Claude). Optional — when unset, the
     # workflow-rule agents (Pattern A: triage / lessons) log a warning

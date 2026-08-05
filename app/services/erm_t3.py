@@ -20,7 +20,13 @@ from app.models.erm_t3 import (
 )
 from app.models.user import User
 
-_OPEN_CAPA = ("DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS", "PENDING_VERIFICATION")
+# Re-exported so the platform has exactly ONE definition of "these two parties
+# must be different people". CAMS auditor independence (docs/cams/09 §2.1) is
+# built on the same primitive; ERM T3 was the first implementation and this
+# stays the public name its callers use.
+from app.services.independence import segregation_ok  # noqa: F401
+
+_OPEN_CAPA =("DRAFT", "SUBMITTED", "UNDER_RCA", "ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS", "PENDING_VERIFICATION")
 DEFICIENT_CONCLUSIONS = ("DEFICIENT", "SIGNIFICANT_DEFICIENCY", "MATERIAL_WEAKNESS")
 CAPA_REQUIRED_SEVERITY = ("SIGNIFICANT_DEFICIENCY", "MATERIAL_WEAKNESS")
 
@@ -44,9 +50,6 @@ async def user_name_map(db: AsyncSession, ids) -> dict[str, str]:
 
 
 # ── Controls ───────────────────────────────────────────────────────────────────
-def segregation_ok(tester_id: str, owner_id: str) -> bool:
-    """A control cannot be tested by its owner (the auditor's first check)."""
-    return bool(tester_id) and tester_id != owner_id
 
 
 def requires_capa(severity: str) -> bool:

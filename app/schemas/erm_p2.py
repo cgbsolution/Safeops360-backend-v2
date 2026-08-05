@@ -21,6 +21,7 @@ class MetricCatalogEntry(BaseModel):
     unit: str
     direction: str
     frequency: str
+    indicatorType: str = "LAGGING"
     previewValue: float | None = None
 
 
@@ -36,6 +37,7 @@ class KriUpsert(BaseModel):
     linkedRiskIds: list[str] = []
     unit: str
     direction: Literal["HIGHER_IS_WORSE", "LOWER_IS_WORSE"] = "HIGHER_IS_WORSE"
+    indicatorType: Literal["LEADING", "LAGGING", "COINCIDENT"] = "LAGGING"
     frequency: Literal["WEEKLY", "MONTHLY", "QUARTERLY"] = "MONTHLY"
     feedType: Literal["MANUAL", "MODULE_FED", "API"] = "MANUAL"
     metricProviderKey: str | None = None
@@ -60,6 +62,7 @@ class KriOut(BaseModel):
     linkedRiskCount: int = 0
     unit: str
     direction: str
+    indicatorType: str = "LAGGING"
     frequency: str
     feedType: str
     metricProviderKey: str | None = None
@@ -410,7 +413,8 @@ class CalibrationRow(BaseModel):
     residualBand: str | None = None
     actualNetLoss12m: float
     lossEventCount: int
-    flag: str | None = None  # UNDERSCORED | WATCH | null
+    flag: str | None = None  # UNDERSCORED | WATCH | MITIGATION_INEFFECTIVE | null
+    hasClosedMitigation: bool = False
 
 
 class LossAnalytics(BaseModel):

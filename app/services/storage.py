@@ -42,6 +42,52 @@ def build_storage_path(*, incident_id: str, category: str, file_name: str) -> st
     return f"incidents/{incident_id}/{category.lower()}/{short_id}-{safe}"
 
 
+def build_risk_storage_path(*, risk_id: str, category: str, file_name: str) -> str:
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"risks/{risk_id}/{category.lower()}/{short_id}-{safe}"
+
+
+def build_control_storage_path(*, control_id: str, category: str, file_name: str) -> str:
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"controls/{control_id}/{category.lower()}/{short_id}-{safe}"
+
+
+def build_permit_storage_path(*, permit_id: str, category: str, file_name: str) -> str:
+    """PTW closed-loop attachments (drawings, action-evidence photos,
+    return/verification photos)."""
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"permits/{permit_id}/{category.lower()}/{short_id}-{safe}"
+
+
+def build_moc_storage_path(*, moc_id: str, category: str, file_name: str) -> str:
+    """MOC supporting documents (drawings, P&IDs, vendor specs, risk docs)."""
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"moc/{moc_id}/{category.lower()}/{short_id}-{safe}"
+
+
+def build_evidence_storage_path(
+    *, entity_type: str, entity_id: str, category: str, file_name: str
+) -> str:
+    """Generic path for the shared Evidence Attachment layer (Stream B §5).
+    One builder for every attachable entity, replacing the per-parent
+    build_*_storage_path clones for new surfaces:
+        evidence/{entityType}/{entityId}/{category}/{shortid}-{safe}
+    """
+    safe_type = re.sub(r"[^A-Za-z0-9_-]", "_", entity_type)[:40]
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80]
+    short_id = secrets.token_hex(4)
+    return f"evidence/{safe_type}/{entity_id}/{category.lower()}/{short_id}-{safe}"
+
+
 def create_signed_upload_url(storage_path: str) -> dict[str, str]:
     """60-second window for the browser to PUT directly. Defensive against
     different supabase-py versions that have used `signed_url` (snake_case)
@@ -92,3 +138,29 @@ def delete_storage_object(storage_path: str) -> None:
     res = client.storage.from_(settings.supabase_incident_bucket).remove([storage_path])
     if isinstance(res, dict) and res.get("error"):
         raise RuntimeError(f"deleteStorageObject failed: {res['error']}")
+
+
+def download_object(storage_path: str) -> bytes:
+    """Server-side read (transcription pipeline needs the raw audio bytes)."""
+    client = _get_client()
+    try:
+        return client.storage.from_(settings.supabase_incident_bucket).download(storage_path)
+    except Exception as e:
+        raise RuntimeError(f"Supabase download failed for path '{storage_path}': {e}") from e
+
+
+def upload_object(storage_path: str, data: bytes, content_type: str) -> None:
+    """Server-side upload (chunked-upload assembly path — Guided Field Capture).
+    The browser normally PUTs to a signed URL; here the backend has already
+    assembled the bytes, so it pushes directly with the service-role client.
+    file_options values must be strings (supabase-py quirk)."""
+    client = _get_client()
+    try:
+        client.storage.from_(settings.supabase_incident_bucket).upload(
+            storage_path, data, {"content-type": content_type, "upsert": "true"}
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Supabase upload failed for bucket '{settings.supabase_incident_bucket}', "
+            f"path '{storage_path}': {e}"
+        ) from e

@@ -114,48 +114,40 @@ async def capa_avg_closure_days(db: AsyncSession, period_end: datetime) -> float
 
 # ── Audit-based ─────────────────────────────────────────────────────────────
 async def audit_nc_rate(db: AsyncSession, period_end: datetime) -> float | None:
-    """Non-conformances per conducted audit over the last 90 days — sourced from
-    the centralised CAMS engine (TC-14: CAMS feeds the ERM KRI). Counts every
-    audit AND inspection (one engine), so the KRI reflects the whole programme."""
     from datetime import timedelta
 
-    from app.models.cams import CamsEngagement, CamsFinding
+    from app.models.audit_compliance import AuditCheckpointResponse, ComplianceAudit
 
     start = period_end - timedelta(days=90)
-    conducted = ("FIELDWORK_COMPLETE", "FINDINGS_REVIEW", "REPORT_ISSUED", "CLOSED")
-    eng_ids = (
+    audits = (
         await db.execute(
-            select(CamsEngagement.id)
-            .where(CamsEngagement.isDeleted.is_(False))
-            .where(CamsEngagement.status.in_(conducted))
-            .where(CamsEngagement.conductedDate >= start)
-            .where(CamsEngagement.conductedDate <= period_end)
+            select(func.count()).select_from(ComplianceAudit)
+            .where(ComplianceAudit.scheduledDate >= start)
+            .where(ComplianceAudit.scheduledDate <= period_end)
         )
-    ).scalars().all()
-    if not eng_ids:
+    ).scalar() or 0
+    if audits <= 0:
         return None
     ncs = (
         await db.execute(
-            select(func.count()).select_from(CamsFinding)
-            .where(CamsFinding.engagementId.in_(list(eng_ids)))
-            .where(CamsFinding.isDeleted.is_(False))
-            .where(CamsFinding.severity.in_(("MINOR_NC", "MAJOR_NC", "CRITICAL_NC")))
+            select(func.count()).select_from(AuditCheckpointResponse)
+            .join(ComplianceAudit, ComplianceAudit.id == AuditCheckpointResponse.auditId)
+            .where(AuditCheckpointResponse.overallStatus.in_(("partial", "fail")))
+            .where(ComplianceAudit.scheduledDate >= start)
+            .where(ComplianceAudit.scheduledDate <= period_end)
         )
     ).scalar() or 0
-    return round(ncs / len(eng_ids), 1)
+    return round(ncs / audits, 1)
 
 
 async def audit_overdue(db: AsyncSession, period_end: datetime) -> float | None:
-    """Scheduled CAMS engagements past their planned date but not yet conducted
-    (TC-14: CAMS feeds the ERM KRI)."""
-    from app.models.cams import CamsEngagement
+    from app.models.audit_compliance import ComplianceAudit
 
     n = (
         await db.execute(
-            select(func.count()).select_from(CamsEngagement)
-            .where(CamsEngagement.isDeleted.is_(False))
-            .where(CamsEngagement.plannedDate < period_end)
-            .where(CamsEngagement.status.in_(("PLANNED", "SCHEDULED", "IN_PROGRESS")))
+            select(func.count()).select_from(ComplianceAudit)
+            .where(ComplianceAudit.scheduledDate < period_end)
+            .where(ComplianceAudit.status.notin_(("completed", "closed")))
         )
     ).scalar() or 0
     return float(n)
@@ -218,6 +210,55 @@ async def loss_net_quarter(db: AsyncSession, period_end: datetime) -> float | No
     return round(float(total) / 100_000.0, 1)  # ₹ → ₹ Lakh
 
 
+# ── Safety Culture (auto-fed KRIs — the structural differentiator) ───────────
+async def _culture_profile_avg(db: AsyncSession, column) -> float | None:
+    from app.models.safety_culture import CultureMaturityProfile
+
+    avg = (
+        await db.execute(select(func.avg(column)).select_from(CultureMaturityProfile))
+    ).scalar()
+    return round(float(avg), 1) if avg is not None else None
+
+
+async def culture_maturity_score(db: AsyncSession, period_end: datetime) -> float | None:
+    from app.models.safety_culture import CultureMaturityProfile
+
+    return await _culture_profile_avg(db, CultureMaturityProfile.stageScore)
+
+
+async def culture_bbs_quality(db: AsyncSession, period_end: datetime) -> float | None:
+    from app.models.safety_culture import CultureMaturityProfile
+
+    return await _culture_profile_avg(db, CultureMaturityProfile.bbsQualityIndex)
+
+
+async def culture_leadership_compliance(db: AsyncSession, period_end: datetime) -> float | None:
+    from app.models.safety_culture import CultureMaturityProfile
+
+    return await _culture_profile_avg(db, CultureMaturityProfile.leadershipEngagement)
+
+
+async def culture_perception_composite(db: AsyncSession, period_end: datetime) -> float | None:
+    """Enterprise mean of the latest published (threshold-met) perception index
+    per site."""
+    from app.models.safety_culture import PerceptionIndexSnapshot
+
+    rows = (
+        await db.execute(
+            select(PerceptionIndexSnapshot.plantId, PerceptionIndexSnapshot.compositeScore, PerceptionIndexSnapshot.period)
+            .where(PerceptionIndexSnapshot.thresholdMet.is_(True))
+            .order_by(PerceptionIndexSnapshot.plantId, PerceptionIndexSnapshot.period.desc())
+        )
+    ).all()
+    latest_by_plant: dict[str, float] = {}
+    for pid, score, _period in rows:
+        if pid not in latest_by_plant:
+            latest_by_plant[pid] = float(score)
+    if not latest_by_plant:
+        return None
+    return round(sum(latest_by_plant.values()) / len(latest_by_plant), 1)
+
+
 @dataclass(frozen=True)
 class MetricProvider:
     key: str
@@ -227,27 +268,36 @@ class MetricProvider:
     direction: str
     frequency: str
     compute: Callable[[AsyncSession, datetime], Awaitable[float | None]]
+    # LEADING = warns before the loss event (near-misses, training currency, overdue
+    # actions); LAGGING = measures harm already done (LTIFR, realised loss).
+    indicator_type: str = "LAGGING"
 
 
 METRIC_PROVIDERS: dict[str, MetricProvider] = {
     p.key: p
     for p in [
-        MetricProvider("incident.ltifr_12m", "Incident Investigation", "LTIFR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", ltifr_12m),
-        MetricProvider("incident.trir_12m", "Incident Investigation", "TRIR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", trir_12m),
-        MetricProvider("incident.near_miss_ratio", "Safety Observation", "Near-miss : incident ratio", "ratio", "LOWER_IS_WORSE", "MONTHLY", near_miss_ratio),
-        MetricProvider("capa.overdue_pct", "CAPA Universal", "% CAPA items overdue", "%", "HIGHER_IS_WORSE", "MONTHLY", capa_overdue_pct),
-        MetricProvider("capa.avg_closure_days", "CAPA Universal", "Average CAPA closure days", "days", "HIGHER_IS_WORSE", "QUARTERLY", capa_avg_closure_days),
-        MetricProvider("audit.nc_rate", "Audit Management", "Non-conformances per audit", "NCs/audit", "HIGHER_IS_WORSE", "QUARTERLY", audit_nc_rate),
-        MetricProvider("audit.overdue_audits", "Audit Management", "Overdue scheduled audits", "count", "HIGHER_IS_WORSE", "MONTHLY", audit_overdue),
-        MetricProvider("training.competency_currency_pct", "Skill Matrix", "% safety-critical competencies current", "%", "LOWER_IS_WORSE", "MONTHLY", competency_currency_pct),
-        MetricProvider("compliance.overdue_obligations", "Compliance Register", "Overdue statutory obligations", "count", "HIGHER_IS_WORSE", "MONTHLY", compliance_overdue_obligations),
-        MetricProvider("loss.net_loss_quarter", "Loss Event DB", "Net loss — current quarter", "₹ Lakh", "HIGHER_IS_WORSE", "QUARTERLY", loss_net_quarter),
+        MetricProvider("incident.ltifr_12m", "Incident Investigation", "LTIFR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", ltifr_12m, "LAGGING"),
+        MetricProvider("incident.trir_12m", "Incident Investigation", "TRIR — rolling 12 months", "per mn manhours", "HIGHER_IS_WORSE", "MONTHLY", trir_12m, "LAGGING"),
+        MetricProvider("incident.near_miss_ratio", "Safety Observation", "Near-miss : incident ratio", "ratio", "LOWER_IS_WORSE", "MONTHLY", near_miss_ratio, "LEADING"),
+        MetricProvider("capa.overdue_pct", "CAPA Universal", "% CAPA items overdue", "%", "HIGHER_IS_WORSE", "MONTHLY", capa_overdue_pct, "LEADING"),
+        MetricProvider("capa.avg_closure_days", "CAPA Universal", "Average CAPA closure days", "days", "HIGHER_IS_WORSE", "QUARTERLY", capa_avg_closure_days, "LEADING"),
+        MetricProvider("audit.nc_rate", "Audit Management", "Non-conformances per audit", "NCs/audit", "HIGHER_IS_WORSE", "QUARTERLY", audit_nc_rate, "COINCIDENT"),
+        MetricProvider("audit.overdue_audits", "Audit Management", "Overdue scheduled audits", "count", "HIGHER_IS_WORSE", "MONTHLY", audit_overdue, "LEADING"),
+        MetricProvider("training.competency_currency_pct", "Skill Matrix", "% safety-critical competencies current", "%", "LOWER_IS_WORSE", "MONTHLY", competency_currency_pct, "LEADING"),
+        MetricProvider("compliance.overdue_obligations", "Compliance Register", "Overdue statutory obligations", "count", "HIGHER_IS_WORSE", "MONTHLY", compliance_overdue_obligations, "LEADING"),
+        MetricProvider("loss.net_loss_quarter", "Loss Event DB", "Net loss — current quarter", "₹ Lakh", "HIGHER_IS_WORSE", "QUARTERLY", loss_net_quarter, "LAGGING"),
+        # Safety Culture — auto-fed from the Safety Culture Management module.
+        MetricProvider("culture.maturity_score", "Safety Culture", "Culture maturity score (enterprise mean)", "0-100", "LOWER_IS_WORSE", "MONTHLY", culture_maturity_score, "LEADING"),
+        MetricProvider("culture.bbs_quality", "Safety Culture", "BBS observation quality index", "0-100", "LOWER_IS_WORSE", "MONTHLY", culture_bbs_quality, "LEADING"),
+        MetricProvider("culture.leadership_compliance", "Safety Culture", "Leadership engagement — walk compliance", "0-100", "LOWER_IS_WORSE", "MONTHLY", culture_leadership_compliance, "LEADING"),
+        MetricProvider("culture.perception_composite", "Safety Culture", "Worker safety perception index", "0-100", "LOWER_IS_WORSE", "QUARTERLY", culture_perception_composite, "LEADING"),
     ]
 }
 
 
 def catalogue() -> list[dict]:
     return [
-        {"key": p.key, "sourceModule": p.source_module, "label": p.label, "unit": p.unit, "direction": p.direction, "frequency": p.frequency}
+        {"key": p.key, "sourceModule": p.source_module, "label": p.label, "unit": p.unit,
+         "direction": p.direction, "frequency": p.frequency, "indicatorType": p.indicator_type}
         for p in METRIC_PROVIDERS.values()
     ]

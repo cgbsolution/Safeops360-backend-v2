@@ -33,7 +33,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models._base import Base, IdMixin
+from app.models._base import Base, IdMixin, SoftDeleteMixin
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ class CapaVerificationMethod(Base, IdMixin):
 # ─────────────────────────────────────────────────────────────────────
 
 
-class Capa(Base, IdMixin):
+class Capa(Base, IdMixin, SoftDeleteMixin):
     __tablename__ = "Capa"
 
     capaNumber: Mapped[str] = mapped_column(String, unique=True, nullable=False)

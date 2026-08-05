@@ -39,7 +39,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.equipment import Equipment, Inspection
 from app.models.epc import ContractorCompany
+from app.models.masters import Department
 from app.models.near_miss import NearMiss
+from app.models.plant import Plant
 from app.models.permit import Permit
 
 
@@ -195,11 +197,21 @@ async def _rule_high_potential_tbt(db: AsyncSession, nm: NearMiss) -> dict[str, 
     # Audit-only record — Training module doesn't have a public "spawn TBT" API
     # in this codebase; the brief calls for one. We store the directive on
     # closureTriggers so the responsible supervisor sees it in Related Items.
+    #
+    # The audience is named, not id'd: a supervisor reading "TBT recommended
+    # for cmq42hc7b…" in Related Items learns nothing about who to gather.
+    audience = None
+    if nm.departmentId:
+        dept = await db.get(Department, nm.departmentId)
+        audience = dept.name if dept else None
+    if audience is None and nm.plantId:
+        plant = await db.get(Plant, nm.plantId)
+        audience = plant.name if plant else None
     return _entry(
         "rule_high_potential_tbt",
         "High Potential → Toolbox Talk",
         fired=True,
-        reason=f"{sev} potential severity — TBT recommended for {nm.departmentId or nm.plantId}",
+        reason=f"{sev} potential severity — TBT recommended for {audience or 'the affected team'}",
         spawned_type="TBT_REQUEST",
         data={
             "topic": f"Lessons from near miss {nm.number}",

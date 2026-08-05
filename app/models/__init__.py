@@ -27,10 +27,42 @@ from app.models.capa import (
     CapaSubCategory,
     CapaVerificationMethod,
 )
+from app.models.assurance import (
+    DisciplineOwner,
+    EngagementCompetenceSnapshot,
+    EngagementMeeting,
+    IndependenceWaiver,
+    ReportErratum,
+)
+from app.models.cams_completion import (
+    AuditFinding,
+    CheckpointTranslation,
+    EvidencePackJob,
+    NotificationPreference,
+    SupplierAuditLink,
+)
+from app.models.supplier_portal import (
+    SupplierPortalAccessLog,
+    SupplierPortalSubmission,
+    SupplierPortalToken,
+)
+from app.models.programme import (
+    AuditProgramme,
+    DisciplineHazardMap,
+    ProgrammeAmendment,
+    ProgrammeCycle,
+    ProgrammeRecommendation,
+    ProgrammeReview,
+    ProgrammeScopeUnit,
+    ProgrammeSlot,
+    SlotScopeUnit,
+)
 from app.models.audit_compliance import (
     AuditCheckpointLibrary,
     AuditCheckpointResponse,
+    AuditReport,
     AuditTemplate,
+    CheckpointInteraction,
     ComplianceAudit,
 )
 from app.models.cams import (
@@ -110,6 +142,26 @@ from app.models.erm_t3 import (
     VendorProfile,
     VendorScoringConfig,
 )
+from app.models.erm_attachments import ControlAttachment, RiskAttachment
+from app.models.notification import Notification
+from app.models.factory import (
+    Building,
+    FactoryCertification,
+    FactoryComplianceSnapshot,
+    FactoryContact,
+    FactoryEnvPeriod,
+    FactoryProfile,
+    ProductionProcess,
+    SocialComplianceProfile,
+    WorkforceComposition,
+)
+from app.models.factory_ext import (
+    FactoryEquipment,
+    FactoryEquipmentInspection,
+    FactoryLifecycleEvent,
+    HazardousMaterial,
+    RegulatoryRegistration,
+)
 from app.models.flra import FLRA, FLRACrewSignature, FLRAStatus, FLRATeamMember
 from app.models.eai import (
     EaiAspect,
@@ -159,6 +211,17 @@ from app.models.incident import (
     IncidentStatus,
     IncidentType,
 )
+from app.models.incident_intel import (
+    CompetencyMapping,
+    GoldenThreadLink,
+    PlantCostConfig,
+    StatutoryFormInstance,
+    StatutoryTemplate,
+    WhatsappInboundLog,
+    WhatsappSender,
+    WhatsappTemplate,
+)
+from app.models.licensing import FactoryModuleEntitlement, LicenceInstallation
 from app.models.manhours import Manhours
 from app.models.masters import Department, MasterItem
 from app.models.epc import (
@@ -188,13 +251,42 @@ from app.models.observation import (
     ObservationType,
     Severity,
 )
+from app.models.observation_sla import (
+    ObservationCategoryGroup,
+    ObservationDeroster,
+    ObservationDerosterConfig,
+    ObservationDerosterEvent,
+    ObservationSlaConfig,
+    ObservationTargetDateHistory,
+    ObservationWorkerInvolved,
+)
+from app.models.observation_severity import (
+    AreaHazardTier,
+    SeverityMatrixRule,
+    SeverityOverrideLog,
+)
 from app.models.permit import (
     Permit,
+    PermitActionEvidence,
+    PermitAttachment,
     PermitCrewMember,
+    PermitEvidenceAction,
+    PermitOutcome,
     PermitStatus,
     PermitType,
 )
 from app.models.plant import Area, Plant
+from app.models.safety_culture import (
+    CultureMaturityProfile,
+    CultureMaturitySnapshot,
+    CultureObservationClosure,
+    CultureObserverIntegrity,
+    LeadershipWalk,
+    PerceptionIndexSnapshot,
+    PerceptionSurveyResponse,
+    PerceptionSurveyTemplate,
+    RecognitionEntry,
+)
 from app.models.ppe import (
     PpeBatch,
     PpeInspection,
@@ -243,8 +335,32 @@ __all__ = [
     "AgentToolCall",
     "AuditCheckpointLibrary",
     "AuditCheckpointResponse",
+    "AuditReport",
     "AuditTemplate",
+    "CheckpointInteraction",
     "ComplianceAudit",
+    "DisciplineOwner",
+    "EngagementCompetenceSnapshot",
+    "EngagementMeeting",
+    "IndependenceWaiver",
+    "ReportErratum",
+    "AuditProgramme",
+    "AuditFinding",
+    "CheckpointTranslation",
+    "EvidencePackJob",
+    "NotificationPreference",
+    "SupplierAuditLink",
+    "SupplierPortalAccessLog",
+    "SupplierPortalSubmission",
+    "SupplierPortalToken",
+    "DisciplineHazardMap",
+    "ProgrammeAmendment",
+    "ProgrammeCycle",
+    "ProgrammeRecommendation",
+    "ProgrammeReview",
+    "ProgrammeScopeUnit",
+    "ProgrammeSlot",
+    "SlotScopeUnit",
     "Anomaly",
     "Area",
     "Capa",
@@ -282,6 +398,20 @@ __all__ = [
     "CamsTemplateQuestion",
     "CamsTemplateSection",
     "Equipment",
+    "Building",
+    "FactoryProfile",
+    "FactoryCertification",
+    "FactoryComplianceSnapshot",
+    "FactoryContact",
+    "FactoryEnvPeriod",
+    "SocialComplianceProfile",
+    "ProductionProcess",
+    "WorkforceComposition",
+    "FactoryEquipment",
+    "FactoryEquipmentInspection",
+    "FactoryLifecycleEvent",
+    "HazardousMaterial",
+    "RegulatoryRegistration",
     "BcExercise",
     "BusinessProcess",
     "CallTree",
@@ -326,6 +456,9 @@ __all__ = [
     "RollupLinkage",
     "RollupRule",
     "ScoringMatrixConfig",
+    "RiskAttachment",
+    "ControlAttachment",
+    "Notification",
     "FLRA",
     "FLRACrewSignature",
     "FLRAStatus",
@@ -354,6 +487,8 @@ __all__ = [
     "IncidentType",
     "Inspection",
     "InstanceStatus",
+    "FactoryModuleEntitlement",
+    "LicenceInstallation",
     "Manhours",
     "NearMiss",
     "NearMissStatus",
@@ -364,10 +499,23 @@ __all__ = [
     "ObservationType",
     "Permission",
     "Permit",
+    "PermitActionEvidence",
+    "PermitAttachment",
     "PermitCrewMember",
+    "PermitEvidenceAction",
+    "PermitOutcome",
     "PermitStatus",
     "PermitType",
     "Plant",
+    "CultureMaturityProfile",
+    "CultureMaturitySnapshot",
+    "CultureObservationClosure",
+    "CultureObserverIntegrity",
+    "LeadershipWalk",
+    "PerceptionIndexSnapshot",
+    "PerceptionSurveyResponse",
+    "PerceptionSurveyTemplate",
+    "RecognitionEntry",
     "PpeBatch",
     "PpeInspection",
     "PpeIssuance",

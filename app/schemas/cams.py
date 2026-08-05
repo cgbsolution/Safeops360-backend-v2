@@ -36,6 +36,13 @@ class AuditTypeUpsert(BaseModel):
     defaultRecurrence: str | None = None
     requiresAssetRef: bool = False
     requiresAuditorCompetency: list[str] = []
+    # WP-49: the audit type is the configuration home.
+    #   scoringRules          per-type pass mark + critical gate (F-22)
+    #   regimeCode            buyer-regime vocabulary (WP-47)
+    #   competenceEnforcement WARN | BLOCK when an assignee lacks a competency
+    scoringRules: dict | None = None
+    regimeCode: str | None = None
+    competenceEnforcement: str = "WARN"
     standardRefs: list[str] = []
     isActive: bool = True
 
@@ -51,6 +58,13 @@ class AuditTypeOut(BaseModel):
     defaultRecurrence: str | None = None
     requiresAssetRef: bool
     requiresAuditorCompetency: list[str] = []
+    # WP-49: the audit type is the configuration home.
+    #   scoringRules          per-type pass mark + critical gate (F-22)
+    #   regimeCode            buyer-regime vocabulary (WP-47)
+    #   competenceEnforcement WARN | BLOCK when an assignee lacks a competency
+    scoringRules: dict | None = None
+    regimeCode: str | None = None
+    competenceEnforcement: str = "WARN"
     standardRefs: list[str] = []
     isActive: bool
     engagementCount: int = 0
@@ -141,9 +155,6 @@ class EngagementOut(BaseModel):
     findingCount: int = 0
     openFindingCount: int = 0
     ncCount: int = 0
-    # Non-blocking Skill-Matrix competency warnings for the lead auditor (§4
-    # enrichment; empty in standalone or when Skill Matrix is absent).
-    competencyWarnings: list[str] = []
     updatedAt: datetime | None = None
 
 
@@ -152,21 +163,6 @@ class EngagementListResponse(BaseModel):
     total: int
     statusCounts: dict[str, int] = {}
     typeCounts: dict[str, int] = {}
-
-
-class ConsumerInspectionCreate(BaseModel):
-    """§8 consumer entry point — a module (Fire / PPE / Pharma / EPC) launches an
-    inspection/audit through the shared engine, tagging its provenance."""
-    sourceModule: str = Field(min_length=2)
-    title: str = Field(min_length=3)
-    engagementType: EngagementTypeLit = "INSPECTION"
-    siteId: str | None = None
-    auditTypeId: str | None = None
-    templateId: str | None = None
-    standardRefs: list[str] = []
-    areaOrAssetRef: str | None = None
-    leadAuditorId: str | None = None
-    plannedDate: datetime | None = None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -445,13 +441,6 @@ class FindingListResponse(BaseModel):
     repeatCount: int = 0
 
 
-class RepeatDetectionOut(BaseModel):
-    """Result of the Analytics engine's repeat-finding recompute (§5.2.3)."""
-    scanned: int = 0
-    flagged: int = 0
-    windowDays: int = 365
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Analytics & Benchmarking (C-13)
 # ════════════════════════════════════════════════════════════════════════════
@@ -481,30 +470,6 @@ class ParetoRow(BaseModel):
     count: int
 
 
-class SnapshotCreate(BaseModel):
-    periodLabel: str = Field(min_length=2)   # "FY27-Q1"
-    periodStart: datetime | None = None
-    periodEnd: datetime | None = None
-    siteId: str | None = None
-    engagementType: EngagementTypeLit | None = None
-    standardRef: str | None = None
-
-
-class AnalyticsSnapshotOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: str
-    periodLabel: str
-    periodStart: datetime | None = None
-    periodEnd: datetime | None = None
-    scopeSiteId: str | None = None
-    scopeEngagementType: str | None = None
-    scopeStandardRef: str | None = None
-    metrics: dict[str, Any] = {}
-    snapshotHash: str | None = None
-    generatedAt: datetime | None = None
-    createdAt: datetime | None = None
-
-
 class AnalyticsOut(BaseModel):
     programme: dict[str, Any] = {}      # {planned, scheduled, inProgress, fieldworkComplete, reportIssued, closed, cancelled, overdue, total, completionRatePct}
     findingsBySeverity: dict[str, int] = {}
@@ -517,51 +482,6 @@ class AnalyticsOut(BaseModel):
     clauseConformance: list[ClauseConformanceRow] = []
     paretoByClause: list[ParetoRow] = []
     capaOverduePct: float = 0
-
-
-# ── Audit Programme (C-03) ────────────────────────────────────────────────────
-class ProgrammeCell(BaseModel):
-    auditTypeId: str
-    auditTypeName: str
-    standardRefs: list[str] = []
-    siteId: str | None = None
-    siteName: str | None = None
-    done: int = 0
-    planned: int = 0
-    total: int = 0
-    status: str  # DONE | PLANNED | GAP
-    lastConductedDate: datetime | None = None
-
-
-class ProgrammeOut(BaseModel):
-    sites: list[dict[str, Any]] = []
-    auditTypes: list[dict[str, Any]] = []
-    standards: list[str] = []
-    matrix: list[ProgrammeCell] = []
-    gaps: list[dict[str, Any]] = []
-    cellCount: int = 0
-    coveredCount: int = 0
-    coveragePct: float = 0
-
-
-# ── Board / Management-Review pack (C-15) ─────────────────────────────────────
-class BoardPackOut(BaseModel):
-    periodLabel: str
-    programme: dict[str, Any] = {}
-    programmeCoveragePct: float = 0
-    programmeGaps: list[dict[str, Any]] = []
-    findingsBySeverity: dict[str, int] = {}
-    repeatFindingRatePct: float = 0
-    openFindingCount: int = 0
-    avgClosureDays: float | None = None
-    clauseConformance: list[dict[str, Any]] = []
-    paretoByClause: list[dict[str, Any]] = []
-    benchmarkingBySite: list[dict[str, Any]] = []
-    bySourceModule: dict[str, int] = {}
-    capaOverduePct: float = 0
-    compliance: dict[str, Any] = {}
-    snapshotHash: str | None = None
-    generatedAt: datetime | None = None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -610,25 +530,6 @@ class ComplianceTrackerOut(BaseModel):
     openNcCount: int = 0
     statusCounts: dict[str, int] = {}
     rows: list[ObligationCoverageRow] = []
-    # Which register backs this deployment: "ERM" (integrated) or "CAMS_BUNDLED"
-    # (standalone). Proves graceful degradation at runtime (§5.1 / TC-15).
-    obligationsSource: str = "ERM"
-
-
-class RcaMethodOut(BaseModel):
-    code: str
-    name: str
-    description: str = ""
-
-
-class AssetOut(BaseModel):
-    id: str
-    code: str
-    name: str
-    category: str = ""
-    siteId: str | None = None
-    location: str = ""
-    source: str  # EQUIPMENT_MASTER | CAMS_LITE
 
 
 # ════════════════════════════════════════════════════════════════════════════

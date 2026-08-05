@@ -2,6 +2,22 @@
 
 Mirrors prisma/seed-workflows.ts. Run as:
   python -m app.seed.seed_workflows
+
+⚠  NOT SAFE ON A DATABASE WITH IN-FLIGHT WORK. upsert_definition() deletes
+   every WorkflowStep of an existing definition and re-inserts them, so each
+   step gets a NEW id. WorkflowInstance.currentStepId and WorkflowTask.stepId
+   are plain string columns with no foreign key, so nothing stops the write —
+   every running instance is silently orphaned and its record can no longer
+   advance. Use this only to seed a fresh database.
+
+   To change a definition that already has instances, mutate the step rows in
+   place (or edit it in Configuration → Workflows, which versions the change).
+   scripts/ptw_cold_work_4_step.py is a worked example of the in-place shape.
+
+⚠  This file and prisma/seed-workflows.ts have DIVERGED — the live database
+   carries the TypeScript seed's step names ("Originator Submits", "Issuer
+   Review", "Issuer Closes Permit") and roles, not the ones below. Reconcile
+   before running either against an existing environment.
 """
 
 from __future__ import annotations
@@ -15,6 +31,42 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import AsyncSessionLocal
 from app.models.workflow import StepType, WorkflowDefinition, WorkflowStep
+from app.services.workflow_engine import PTW_ACCEPT_STEP, PTW_FLRA_STEP
+
+# ─── PTW closed-loop receiver steps ────────────────────────────────────
+# The old combined "Receiver Acknowledges + FLRA" step is split into:
+#   1. FLRA & Crew Sign-off — CONDITIONAL sub-task, instantiated only when
+#      Permit.flraRequired is true (conditionExpr below; the engine's
+#      _find_next_applicable_step simply skips the step otherwise — the
+#      task is never created, not created-then-skipped).
+#   2. Receiver Accepts Permit — always required; a first-class signed act
+#      completed ONLY via POST /api/ptw/{id}/accept (GPS+photo+signature).
+# Step names MUST match workflow_engine.PTW_FLRA_STEP / PTW_ACCEPT_STEP.
+_FLRA_CONDITION = json.dumps(
+    {"version": 2, "combinator": "AND",
+     "rules": [{"field": "flraRequired", "operator": "=", "value": True}]}
+)
+
+
+def _ptw_receiver_steps(seq: int, sla: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "sequence": seq,
+            "stepType": "ASSIGNEE_TASK",
+            "name": PTW_FLRA_STEP,
+            "approverField": "RECEIVER",
+            "slaHours": sla,
+            "conditionExpr": _FLRA_CONDITION,
+        },
+        {
+            "sequence": seq + 1,
+            "stepType": "ASSIGNEE_TASK",
+            "name": PTW_ACCEPT_STEP,
+            "approverField": "RECEIVER",
+            "slaHours": sla,
+        },
+    ]
+
 
 # (module, recordType, name, description, steps[])
 DEFINITIONS: list[dict[str, Any]] = [
@@ -45,15 +97,19 @@ DEFINITIONS: list[dict[str, Any]] = [
         ],
     },
     {
+        # Cold work is the low-risk permit type: no Safety Officer gate. The
+        # chain is Originator → Issuer → receiver side → Closure, i.e. 4 steps
+        # in the common case (the FLRA sub-task is conditional and is not
+        # instantiated unless Permit.flraRequired). Keep it that way — the
+        # high-risk types below are where the extra approvals belong.
         "module": "PTW",
         "recordType": "GENERAL_COLD",
         "name": "PTW — Cold Work",
-        "description": "Issuer → Safety Officer → Receiver acknowledges + FLRA → Closure",
+        "description": "Issuer → [FLRA if required] → Receiver accepts → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
-            {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
-            {"sequence": 4, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 8},
+            *_ptw_receiver_steps(3, 8),
             {"sequence": 5, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
@@ -61,70 +117,84 @@ DEFINITIONS: list[dict[str, Any]] = [
         "module": "PTW",
         "recordType": "HOT_WORK",
         "name": "PTW — Hot Work (high-risk)",
-        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA → Closure",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
             {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
             {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
-            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 4},
-            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
     {
         "module": "PTW",
         "recordType": "CONFINED_SPACE",
         "name": "PTW — Confined Space",
-        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA + Gas Test → Closure",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts (+ gas test gate) → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
             {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
             {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
-            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA + Gas Test", "approverField": "RECEIVER", "slaHours": 4},
-            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
     {
         "module": "PTW",
         "recordType": "WORK_AT_HEIGHT",
         "name": "PTW — Work at Height",
-        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA → Closure",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
             {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
             {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
-            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 4},
-            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
     {
         "module": "PTW",
         "recordType": "EXCAVATION",
         "name": "PTW — Excavation",
-        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA → Closure",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
             {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
             {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
-            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 4},
-            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
     {
         "module": "PTW",
         "recordType": "ELECTRICAL_LOTO",
         "name": "PTW — Electrical / LOTO",
-        "description": "Issuer → Safety Officer → Plant Head → Receiver + FLRA → Closure",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts → Closure",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
             {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
             {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
             {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
-            {"sequence": 5, "stepType": "ASSIGNEE_TASK", "name": "Receiver Acknowledges + FLRA", "approverField": "RECEIVER", "slaHours": 4},
-            {"sequence": 6, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
+        ],
+    },
+    {
+        "module": "PTW",
+        "recordType": "LIFTING",
+        "name": "PTW — Lifting Operations",
+        "description": "Issuer → Safety Officer → Plant Head → [FLRA if required] → Receiver accepts → Closure",
+        "steps": [
+            {"sequence": 1, "stepType": "MAKER", "name": "Submitted"},
+            {"sequence": 2, "stepType": "CHECKER", "name": "Issuer Approval", "approverField": "ISSUER", "slaHours": 4},
+            {"sequence": 3, "stepType": "CHECKER", "name": "Safety Officer Approval", "approverRole": "SAFETY_OFFICER", "slaHours": 4},
+            {"sequence": 4, "stepType": "CHECKER", "name": "Plant Head Approval", "approverRole": "PLANT_HEAD", "slaHours": 4},
+            *_ptw_receiver_steps(5, 4),
+            {"sequence": 7, "stepType": "CLOSURE", "name": "Closure", "approverRole": "HSE_MANAGER"},
         ],
     },
     {
@@ -222,6 +292,10 @@ async def upsert_definition(db: AsyncSession, d: dict[str, Any]) -> str:
                 approverGroupRoles=s.get("approverGroupRoles"),
                 slaHours=s.get("slaHours"),
                 escalationRole=s.get("escalationRole"),
+                # Conditional steps (e.g. PTW's FLRA sub-task) — the engine
+                # skips the step entirely when the expression is false.
+                conditionExpr=s.get("conditionExpr"),
+                isOptional=bool(s.get("isOptional", False)),
             )
         )
     return definition_id

@@ -97,6 +97,24 @@ class FLRACreate(BaseModel):
     fitnessDeclarations: list[FitnessDeclarationInput] = []
 
 
+class FLRAUpdate(BaseModel):
+    """Edit an FLRA's core details while it is still IN_PROGRESS (before every
+    crew member has signed and it becomes COMPLETED). Hazard analysis, crew and
+    fitness declarations are managed by the wizard / sign flow, not here. All
+    fields optional — only keys sent are applied. Router enforces FLRA.UPDATE +
+    the IN_PROGRESS guard."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    location: str | None = Field(default=None, min_length=1)
+    jobDescription: str | None = Field(default=None, min_length=10)
+    specificLocation: str | None = None
+    areaCode: str | None = None
+    startTime: datetime | None = None
+    jobIsRoutine: bool | None = None
+    exitRoutesIdentified: str | None = None
+
+
 class FLRARedoRequest(BaseModel):
     reason: str = Field(min_length=5)
 

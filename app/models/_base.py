@@ -9,7 +9,7 @@ their cuid IDs — this only affects new inserts after the cutover.
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import Boolean, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -45,4 +45,20 @@ class IdMixin:
     id: Mapped[str] = mapped_column(String, primary_key=True, default=gen_id)
 
 
-__all__ = ["Base", "IdMixin", "TimestampMixin", "gen_id"]
+class SoftDeleteMixin:
+    """Governed-entity soft-delete columns. camelCase to match Prisma.
+
+    A governed entity is never hard-deleted (the ORM guard in
+    app.core.soft_delete blocks it); deletion sets these columns via
+    app.core.soft_delete.soft_delete(). Models that already declare
+    `isDeleted` inline only need the three audit columns added — use
+    apply-softdelete-ddl.ts for those rather than this mixin.
+    """
+
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deletedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deletedBy: Mapped[str | None] = mapped_column(String)
+    deletionReason: Mapped[str | None] = mapped_column(String)
+
+
+__all__ = ["Base", "IdMixin", "TimestampMixin", "SoftDeleteMixin", "gen_id"]

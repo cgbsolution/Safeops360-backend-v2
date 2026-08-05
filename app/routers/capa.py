@@ -69,8 +69,10 @@ from app.schemas.capa import (
 from app.services.permissions import (
     PermissionContext,
     can,
-    get_accessible_plants,
+    get_accessible_plants_for,
 )
+from app.services.capa_spawn import next_capa_number
+from app.services.user_directory import resolve_user_directory
 
 router = APIRouter(prefix="/api/capa", tags=["capa"])
 
@@ -195,7 +197,14 @@ async def list_capas(
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    accessible_plants = await get_accessible_plants(db, user.id)
+    # Scope the list to the CAPA.READ permission specifically — NOT the
+    # module-agnostic get_accessible_plants(), which would return "all plants"
+    # for anyone holding an ALL_PLANTS grant on an unrelated module (e.g. an
+    # HSE Manager with FACILITY=ALL_PLANTS but CAPA.READ=OWN_PLANT). Using the
+    # generic helper here surfaced cross-plant CAPAs in the list that the detail
+    # endpoint then denied with a 403 — so we keep the list consistent with the
+    # per-record can("CAPA.READ", …) check.
+    accessible_plants = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(Capa)
@@ -238,11 +247,10 @@ async def list_capas(
             )
         )
 
-    stmt = stmt.order_by(
-        Capa.closureTargetDate.asc().nullslast(),
-        Capa.severity.desc(),
-        Capa.createdAt.desc(),
-    ).limit(500)
+    # Newest-created first — platform-wide register convention. The previous
+    # due-date-then-severity ranking is a work-queue order; it belongs to the
+    # overdue views, not to the register a user lands on after raising a CAPA.
+    stmt = stmt.order_by(Capa.createdAt.desc(), Capa.id.desc()).limit(500)
     rows = (await db.execute(stmt)).scalars().all()
 
     # Name + category-code lookups
@@ -278,21 +286,27 @@ async def list_capas(
             d["daysOverdue"] = max(0, (now - ctd).days)
         items.append(CapaListItem(**d))
 
-    # Aggregate counts across the user's scope (not just filtered slice)
-    scope_q = select(Capa).where(Capa.plantId.in_(accessible_plants)) if accessible_plants else select(Capa)
+    # Aggregate counts across the user's scope (not just the filtered slice).
+    # These must honour the same plant scope as the row list above, otherwise
+    # the analytics strip leaks counts for plants the user cannot read.
+    # accessible_plants: None == unrestricted; [] == nothing (handled earlier).
+    def _scoped(stmt):
+        return stmt.where(Capa.plantId.in_(accessible_plants)) if accessible_plants else stmt
+
     cat_counts_rows = (
         await db.execute(
-            select(CapaSourceCategory.code, func.count(Capa.id))
-            .select_from(Capa)
-            .join(CapaSourceCategory, Capa.sourceCategoryId == CapaSourceCategory.id)
-            .group_by(CapaSourceCategory.code)
+            _scoped(
+                select(CapaSourceCategory.code, func.count(Capa.id))
+                .select_from(Capa)
+                .join(CapaSourceCategory, Capa.sourceCategoryId == CapaSourceCategory.id)
+            ).group_by(CapaSourceCategory.code)
         )
     ).all()
     state_counts_rows = (
-        await db.execute(select(Capa.state, func.count(Capa.id)).group_by(Capa.state))
+        await db.execute(_scoped(select(Capa.state, func.count(Capa.id))).group_by(Capa.state))
     ).all()
     sev_counts_rows = (
-        await db.execute(select(Capa.severity, func.count(Capa.id)).group_by(Capa.severity))
+        await db.execute(_scoped(select(Capa.severity, func.count(Capa.id))).group_by(Capa.severity))
     ).all()
 
     return CapaListResponse(
@@ -341,7 +355,35 @@ async def get_capa(
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    return CapaOut.model_validate(capa)
+    out = CapaOut.model_validate(capa)
+
+    # Resolve every user id this payload carries into a name + plant + role so
+    # the UI never renders a raw cuid (audit trail, ownership, action owners,
+    # contributors, comment authors, …).
+    user_ids: set[str | None] = {
+        capa.raisedByUserId,
+        capa.primaryOwnerUserId,
+        capa.createdByUserId,
+        capa.updatedByUserId,
+        capa.closedByUserId,
+        capa.detectedByUserId,
+        capa.rcaCompletedByUserId,
+        capa.verificationCompletedByUserId,
+        capa.stateChangedByUserId,
+        capa.departmentOwnerId,
+    }
+    for a in capa.actions:
+        user_ids.add(a.ownerUserId)
+        user_ids.add(a.approverUserId)
+    for c in capa.contributors:
+        user_ids.add(c.userId)
+    for at in capa.attachments:
+        user_ids.add(at.uploadedByUserId)
+    for cm in capa.comments:
+        user_ids.add(cm.authorUserId)
+
+    out.userDirectory = await resolve_user_directory(db, user_ids)
+    return out
 
 
 @router.post("", response_model=CapaOut, status_code=status.HTTP_201_CREATED)
@@ -378,16 +420,17 @@ async def create_capa(
             await db.execute(select(CapaSubCategory).where(CapaSubCategory.code == payload.subCategoryCode))
         ).scalar_one_or_none()
 
-    # Capa number — per D4: CAPA-{prefix}-YYYY-PLT-NNN
+    # Capa number — per D4: CAPA-{prefix}-YYYY-PLT-NNN. Uses the shared
+    # max()+1 helper (which scans soft-deleted rows too) so it never re-issues
+    # a number after a delete. The old count(rows)+1 collided on the capaNumber
+    # unique key whenever any CAPA in the sequence had been soft-deleted.
     year = datetime.now(timezone.utc).year
-    count = (
-        await db.execute(
-            select(func.count(Capa.id))
-            .where(Capa.plantId == payload.plantId)
-            .where(Capa.sourceCategoryId == category.id)
-        )
-    ).scalar_one() or 0
-    capa_number = f"CAPA-{category.prefix}-{year}-{plant.code}-{(count + 1):03d}"
+    capa_number = await next_capa_number(
+        db,
+        prefix=f"CAPA-{category.prefix}-{year}-{plant.code}-",
+        plant_id=payload.plantId,
+        category_id=category.id,
+    )
 
     # Apply SLA profile (severity-specific if available, else source default, else global)
     sla = (
@@ -523,7 +566,7 @@ async def dashboard_volume_by_source(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(CapaSourceCategory.code, CapaSourceCategory.name, func.count(Capa.id))
@@ -548,7 +591,7 @@ async def dashboard_state_distribution(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = select(Capa.state, func.count(Capa.id)).group_by(Capa.state)
     if accessible is not None:
@@ -568,7 +611,7 @@ async def dashboard_overdue(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     now = datetime.now(timezone.utc)
     base = (
@@ -607,7 +650,7 @@ async def dashboard_effectiveness(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     ago90 = datetime.now(timezone.utc) - timedelta(days=90)
     base = (
@@ -639,7 +682,7 @@ async def dashboard_top_root_causes(
     check = await can(db, user.id, "CAPA.READ", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(CapaRootCause.category, func.count(CapaRootCause.id))
@@ -682,7 +725,7 @@ async def list_patterns(
         if not check.allowed:
             raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
 
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
     ago180 = datetime.now(timezone.utc) - timedelta(days=180)
 
     # Already-confirmed groups
@@ -755,7 +798,7 @@ async def export_csv(
     check = await can(db, user.id, "CAPA.EXPORT", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
-    accessible = await get_accessible_plants(db, user.id)
+    accessible = await get_accessible_plants_for(db, user.id, "CAPA.READ")
 
     stmt = (
         select(Capa)
@@ -1016,19 +1059,39 @@ async def update_action(
 
     capa.updatedByUserId = user.id
 
-    # If all actions completed AND CAPA is ACTIONS_IN_PROGRESS, advance to PENDING_VERIFICATION
-    open_actions = (
+    # ── Keep the CAPA state in step with its actions ──────────────────
+    #
+    # Nothing in this router or the UI ever wrote ACTIONS_IN_PROGRESS, so a CAPA
+    # driven through the screens stopped dead at ACTIONS_PLANNED: the
+    # "all actions done" rule below only fired from ACTIONS_IN_PROGRESS, and the
+    # verification form only renders for ACTIONS_IN_PROGRESS or
+    # PENDING_VERIFICATION. Work could be planned, started and completed and the
+    # CAPA still could not be verified or closed. (Every ACTIONS_IN_PROGRESS row
+    # in this database arrived via a seed script, never through the app.)
+    #
+    # Two rules, both derived from the actions rather than from a button:
+    #   1. the first action to leave PROPOSED puts the CAPA in progress;
+    #   2. the last action to complete puts it up for verification.
+    now = datetime.now(timezone.utc)
+    counts = (
         await db.execute(
-            select(func.count())
+            select(
+                func.count(),
+                func.count().filter(CapaAction.status.notin_(("COMPLETED", "CANCELLED"))),
+            )
             .select_from(CapaAction)
             .where(CapaAction.capaId == capa_id)
-            .where(CapaAction.status != "COMPLETED")
-            .where(CapaAction.status != "CANCELLED")
         )
-    ).scalar_one() or 0
-    if open_actions == 0 and capa.state == "ACTIONS_IN_PROGRESS":
+    ).one()
+    total_actions, open_actions = counts[0] or 0, counts[1] or 0
+
+    if total_actions and open_actions == 0 and capa.state in ("ACTIONS_PLANNED", "ACTIONS_IN_PROGRESS"):
         capa.state = "PENDING_VERIFICATION"
-        capa.stateChangedAt = datetime.now(timezone.utc)
+        capa.stateChangedAt = now
+        capa.stateChangedByUserId = user.id
+    elif capa.state == "ACTIONS_PLANNED" and action.status in ("APPROVED", "IN_PROGRESS", "COMPLETED"):
+        capa.state = "ACTIONS_IN_PROGRESS"
+        capa.stateChangedAt = now
         capa.stateChangedByUserId = user.id
 
     await db.flush()

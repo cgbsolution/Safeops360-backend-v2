@@ -102,6 +102,8 @@ async def dashboard_overview(
                 cast(Observation.category, String).label("category"),
                 cast(Observation.status, String).label("status"),
                 Observation.description,
+                # Feed ordering key — see "Recent activity feed" below.
+                Observation.createdAt,
             )
             .where(Observation.date >= six_months_ago)
             .order_by(Observation.date.desc())
@@ -111,7 +113,13 @@ async def dashboard_overview(
 
     nm_rows = (
         await db.execute(
-            select(NearMiss.id, NearMiss.number, NearMiss.date, NearMiss.description)
+            select(
+                NearMiss.id,
+                NearMiss.number,
+                NearMiss.date,
+                NearMiss.description,
+                NearMiss.createdAt,
+            )
             .where(NearMiss.date >= six_months_ago)
             .order_by(NearMiss.date.desc())
             .limit(300)
@@ -141,6 +149,8 @@ async def dashboard_overview(
                 Incident.date,
                 cast(Incident.type, String).label("type"),
                 Incident.description,
+                # Feed ordering key — see "Recent activity feed" below.
+                Incident.createdAt,
             )
             .where(Incident.date >= twelve_months_ago)
             .order_by(Incident.date.desc())
@@ -193,7 +203,8 @@ async def dashboard_overview(
     obs_open = sum(1 for o in obs_rows if o.status != "CLOSED")
     obs_closed = sum(1 for o in obs_rows if o.status == "CLOSED")
     active_permits = sum(
-        1 for p in permit_rows if p.status in ("ACTIVE", "SAFETY_APPROVED")
+        1 for p in permit_rows
+        if p.status in ("ACTIVE", "ISSUED", "APPROVED", "SAFETY_APPROVED")
     )
 
     total_lti = sum(int(r[0] or 0) for r in manhours)
@@ -300,28 +311,41 @@ async def dashboard_overview(
     # --- Recent activity feed -------------------------------------------------
     # Each row carries `recordId` + `module` so the mobile dashboard can
     # deep-link directly to the matching detail screen on tap.
+    #
+    # "Recent" means recently ENTERED, not recently occurred — the platform-wide
+    # list convention. The rows above are ordered by event date for the KPI /
+    # trend maths, which is correct there; taking their first N for this feed
+    # would have shown the newest-*dated* records, so a record submitted today
+    # about last week's event never appeared. Re-sort by creation stamp instead.
+    #
+    # Caveat: the source queries are windowed on event date (6 / 12 months), so
+    # a record entered today about an event older than that window still won't
+    # appear here. That window is a deliberate analytics choice, left intact.
     feed: list[RecentActivityItem] = []
-    for o in obs_rows[:4]:
+    recent_obs = sorted(obs_rows, key=lambda r: r.createdAt, reverse=True)
+    recent_nm = sorted(nm_rows, key=lambda r: r.createdAt, reverse=True)
+    recent_incidents = sorted(incident_rows, key=lambda r: r.createdAt, reverse=True)
+    for o in recent_obs[:4]:
         desc = o.description or ""
         feed.append(
             RecentActivityItem(
                 type="Observation",
                 title=desc[:80] + ("…" if len(desc) > 80 else ""),
                 meta=o.number,
-                date=o.date,
+                date=o.createdAt,
                 tone="primary",
                 recordId=o.id,
                 module="OBSERVATION",
             )
         )
-    for n in nm_rows[:3]:
+    for n in recent_nm[:3]:
         desc = n.description or ""
         feed.append(
             RecentActivityItem(
                 type="Near Miss",
                 title=desc[:80] + ("…" if len(desc) > 80 else ""),
                 meta=n.number,
-                date=n.date,
+                date=n.createdAt,
                 tone="warning",
                 recordId=n.id,
                 module="NEAR_MISS",
@@ -340,14 +364,14 @@ async def dashboard_overview(
                 module="PTW",
             )
         )
-    for i in incident_rows[:2]:
+    for i in recent_incidents[:2]:
         desc = i.description or ""
         feed.append(
             RecentActivityItem(
                 type="Incident",
                 title=desc[:80],
                 meta=f"{i.number} · {_humanize(i.type)}",
-                date=i.date,
+                date=i.createdAt,
                 tone="danger",
                 recordId=i.id,
                 module="INCIDENT",

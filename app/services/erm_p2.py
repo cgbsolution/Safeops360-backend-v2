@@ -496,12 +496,27 @@ async def calibration(db: AsyncSession) -> list[dict[str, Any]]:
         )
     ).scalars().all()
     cats = {c.id: c.code for c in (await db.execute(select(RiskCategory))).scalars().all()}
+    # Risks with a CLOSED mitigation — a loss here means the mitigation was ineffective.
+    from app.models.capa import Capa
+
+    closed_treat = (
+        await db.execute(
+            select(Capa.sourceReferenceId)
+            .where(Capa.sourceTypeCode == "RISK_TREATMENT")
+            .where(Capa.state.in_(("CLOSED", "VERIFIED")))
+        )
+    ).scalars().all()
+    mitigated_risk_ids = {rid for rid in closed_treat if rid}
     out = []
     for r in risks:
         linked = [le for le in losses if r.id in (le.linkedRiskIds or [])]
         net = sum(le.netLossInr for le in linked)
         flag = None
-        if net >= 10_000_000 and r.residualBand in ("LOW", "MEDIUM"):
+        # A realised loss on a risk we believed mitigated is the sharpest calibration
+        # signal — the control/treatment didn't work. It takes priority.
+        if net > 0 and r.id in mitigated_risk_ids:
+            flag = "MITIGATION_INEFFECTIVE"
+        elif net >= 10_000_000 and r.residualBand in ("LOW", "MEDIUM"):
             flag = "UNDERSCORED"
         elif r.residualBand == "CRITICAL" and net == 0:
             flag = "WATCH"
@@ -509,6 +524,7 @@ async def calibration(db: AsyncSession) -> list[dict[str, Any]]:
             "riskId": r.id, "riskCode": r.riskCode, "title": r.title, "categoryCode": cats.get(r.categoryId),
             "residualScore": r.residualScore, "residualBand": r.residualBand,
             "actualNetLoss12m": net, "lossEventCount": len(linked), "flag": flag,
+            "hasClosedMitigation": r.id in mitigated_risk_ids,
         })
     out.sort(key=lambda x: (x["flag"] is None, -x["actualNetLoss12m"]))
     return out

@@ -32,19 +32,35 @@ def _env(*names: str) -> str | None:
 # ─── Email (SMTP / nodemailer-compatible) ────────────────────────────
 
 
-def _send_email_sync(to_addrs: list[str], subject: str, body: str) -> bool:
-    host = _env("SMTP_HOST")
-    user = _env("SMTP_USER")
-    password = _env("SMTP_PASS", "SMTP_PASSWORD")
-    sender = _env("EMAIL_FROM", "SMTP_USER", "FROM_EMAIL") or user
+def _send_email_sync(to_addrs: list[str], subject: str, body: str, html: str | None = None) -> bool:
+    # Prefer typed settings (loaded from `.env`), fall back to raw env vars so
+    # container deployments that only export OS env vars keep working.
+    try:
+        from app.core.config import get_settings
+
+        _s = get_settings()
+    except Exception:  # noqa: BLE001
+        _s = None
+    host = (getattr(_s, "smtp_host", None) if _s else None) or _env("SMTP_HOST")
+    user = (getattr(_s, "smtp_user", None) if _s else None) or _env("SMTP_USER")
+    password = (getattr(_s, "smtp_pass", None) if _s else None) or _env("SMTP_PASS", "SMTP_PASSWORD")
+    sender = (getattr(_s, "email_from", None) if _s else None) or _env("EMAIL_FROM", "SMTP_USER", "FROM_EMAIL") or user
     if not host or not user or not password or not sender or not to_addrs:
         print(
             f"[notify.email] skipped — SMTP not fully configured (host={bool(host)}, user={bool(user)})",
             file=sys.stderr,
         )
         return False
-    port = int(_env("SMTP_PORT") or 587)
-    msg = MIMEText(body, "plain", "utf-8")
+    port = int((getattr(_s, "smtp_port", None) if _s else None) or _env("SMTP_PORT") or 587)
+    if html:
+        # multipart/alternative: plain-text fallback + HTML (Daily Brief digest)
+        from email.mime.multipart import MIMEMultipart
+
+        msg: MIMEText | MIMEMultipart = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = sender if "<" in sender else f"SafeOps360 <{sender}>"
     msg["To"] = ", ".join(to_addrs)
@@ -64,12 +80,12 @@ def _send_email_sync(to_addrs: list[str], subject: str, body: str) -> bool:
         return False
 
 
-async def send_email(to_addrs: Iterable[str], subject: str, body: str) -> bool:
+async def send_email(to_addrs: Iterable[str], subject: str, body: str, html: str | None = None) -> bool:
     addrs = [a for a in to_addrs if a]
     if not addrs:
         return False
     # smtplib is sync — run in default thread pool to keep the event loop free.
-    return await asyncio.to_thread(_send_email_sync, addrs, subject, body)
+    return await asyncio.to_thread(_send_email_sync, addrs, subject, body, html)
 
 
 # ─── SMS (MSG91 first; Twilio fallback) ──────────────────────────────

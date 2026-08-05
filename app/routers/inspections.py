@@ -79,7 +79,13 @@ async def list_inspections(
         # Inspection has plant via Equipment — narrow by joining
         eq_ids_q = select(Equipment.id).where(Equipment.plantId.in_(plants))
         stmt = stmt.where(Inspection.equipmentId.in_(eq_ids_q))
-    rows = (await db.execute(stmt.order_by(Inspection.scheduledDate.desc()).limit(200))).scalars().all()
+    # Newest-created first — platform-wide register convention. A just-raised
+    # inspection leads even when scheduled for a past date.
+    rows = (
+        await db.execute(
+            stmt.order_by(Inspection.createdAt.desc(), Inspection.id.desc()).limit(200)
+        )
+    ).scalars().all()
     return {"items": [InspectionOut.model_validate(r) for r in rows], "total": len(rows)}
 
 

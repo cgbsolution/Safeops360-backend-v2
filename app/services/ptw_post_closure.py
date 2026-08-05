@@ -58,6 +58,11 @@ def _category_for_permit(permit_type: PermitType) -> ObservationCategory:
         PermitType.CONFINED_SPACE: ObservationCategory.CONFINED_SPACE,
         PermitType.WORK_AT_HEIGHT: ObservationCategory.WORK_AT_HEIGHT,
         PermitType.ELECTRICAL_LOTO: ObservationCategory.ELECTRICAL,
+        # LIFTING → MATERIAL_HANDLING: the native PG ObservationCategory enum has
+        # no LIFTING value, so writing it would fail the auto-observation insert
+        # on a triggered Lifting closure. MATERIAL_HANDLING is a valid DB value
+        # and the closest fit for lifting operations.
+        PermitType.LIFTING: ObservationCategory.MATERIAL_HANDLING,
         PermitType.EXCAVATION: ObservationCategory.OTHER,
         PermitType.GENERAL_COLD: ObservationCategory.OTHER,
     }.get(permit_type, ObservationCategory.OTHER)

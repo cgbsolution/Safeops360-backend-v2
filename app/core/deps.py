@@ -1,9 +1,10 @@
 from collections.abc import AsyncGenerator
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_context import AuditActor, set_actor
 from app.core.db import get_db
 from app.core.security import InvalidTokenError, safe_decode
 from app.models.user import User
@@ -13,6 +14,7 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
+    request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -28,6 +30,15 @@ async def get_current_user(
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+    # P1-1: stamp the audit actor for this request (same task → visible to the
+    # ORM audit-capture flush). Reason/correlation come from optional headers.
+    set_actor(AuditActor(
+        actor_id=user.id,
+        actor_type="USER",
+        actor_ip=request.client.host if request.client else None,
+        correlation_id=request.headers.get("x-correlation-id"),
+        reason=request.headers.get("x-audit-reason"),
+    ))
     return user
 
 

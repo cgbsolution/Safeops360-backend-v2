@@ -599,7 +599,14 @@ async def activate_crisis(body: S.CrisisActivate, user: User = Depends(get_curre
 @router.get("/bcm/crisis", response_model=list[S.CrisisListItem])
 async def list_crises(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "BCM.READ")
-    rows = (await db.execute(select(CrisisEvent).where(CrisisEvent.isDeleted.is_(False)).order_by(CrisisEvent.activatedAt.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(
+            select(CrisisEvent)
+            .where(CrisisEvent.isDeleted.is_(False))
+            .order_by(CrisisEvent.createdAt.desc(), CrisisEvent.id.desc())
+        )
+    ).scalars().all()
     plants = await _plants(db)
     names = await _names(db, [c.activatedBy for c in rows])
     out = []
@@ -762,7 +769,14 @@ async def _serialise_exercise(db, e, plants, names) -> S.ExerciseOut:
 @router.get("/bcm/exercises", response_model=S.ExerciseListResponse)
 async def list_exercises(estatus: str | None = Query(None, alias="status"), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "BCM.READ")
-    rows = (await db.execute(select(BcExercise).where(BcExercise.isDeleted.is_(False)).order_by(BcExercise.scheduledDate.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(
+            select(BcExercise)
+            .where(BcExercise.isDeleted.is_(False))
+            .order_by(BcExercise.createdAt.desc(), BcExercise.id.desc())
+        )
+    ).scalars().all()
     if estatus:
         rows = [e for e in rows if e.status == estatus]
     plants = await _plants(db)
@@ -901,6 +915,17 @@ async def list_scenarios(user: User = Depends(get_current_user), db: AsyncSessio
     await _require(db, user, "BCM.READ")
     rows = (await db.execute(select(Scenario).where(Scenario.isDeleted.is_(False)).order_by(Scenario.scenarioCode))).scalars().all()
     return [await _serialise_scenario(db, s) for s in rows]
+
+
+@router.get("/bcm/scenarios/{sid}", response_model=S.ScenarioOut)
+async def get_scenario(sid: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Single-scenario detail (the detail screen reads this). Was missing — a GET
+    to /bcm/scenarios/{sid} hit only the PATCH route → 405 Method Not Allowed."""
+    await _require(db, user, "BCM.READ")
+    s = await db.get(Scenario, sid)
+    if not s or s.isDeleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scenario not found")
+    return await _serialise_scenario(db, s)
 
 
 @router.post("/bcm/scenarios", response_model=S.ScenarioOut, status_code=201)

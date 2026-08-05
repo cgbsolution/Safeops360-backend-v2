@@ -79,6 +79,14 @@ async def can_ptw_transition_to_active(
     """Returns the full blocker list (or ok=True) for the receiver-step
     activation transition. Always read-only — safe from server components."""
 
+    # populate_existing is load-bearing, not a tidy-up. Session.get() returns
+    # an instance straight from the identity map when one is already there,
+    # and silently DROPS the loader options when it does — so workCrew /
+    # isolations stay unloaded and the reads below fire a lazy load, which
+    # raises MissingGreenlet under asyncio. Every caller reaches here with the
+    # permit already in the session (the /accept route loads it to check
+    # receiverId; the engine loads it in _sync_record_status), so without
+    # this flag the gate crashes on the common path rather than the rare one.
     permit = await db.get(
         Permit,
         permit_id,
@@ -86,6 +94,7 @@ async def can_ptw_transition_to_active(
             selectinload(Permit.workCrew),
             selectinload(Permit.isolations),
         ],
+        populate_existing=True,
     )
     status = PtwActivationGateStatus(ok=True)
 
@@ -125,7 +134,33 @@ async def can_ptw_transition_to_active(
             )
         )
 
-    # ─── 2. FLRA gate ─────────────────────────────────────────────────
+    # ─── 1b. Competency RE-CHECK at activation (P3-4) ─────────────────
+    # The competency gate fires at creation; a competency can expire between
+    # creation and activation. Re-run the live Skill-Matrix check now.
+    try:
+        from app.services.competency import check_competency_for_permit_type
+
+        ptype = permit.type.value if hasattr(permit.type, "value") else str(permit.type)
+        crew_ids = {getattr(c, "userId", None) or getattr(c, "workerId", None) for c in (permit.workCrew or [])}
+        crew_ids.add(getattr(permit, "receiverId", None))
+        for uid in [u for u in crew_ids if u]:
+            chk = await check_competency_for_permit_type(db, uid, ptype)
+            if chk is not None and not getattr(chk, "is_valid", getattr(chk, "valid", True)):
+                status.ok = False
+                status.blockers.append(GateBlocker(
+                    code="COMPETENCY_EXPIRED_AT_ACTIVATION",
+                    message=f"Crew member competency for {ptype} is no longer valid: "
+                            f"{getattr(chk, 'reason', 'expired or missing')}. Resolve before activation.",
+                ))
+    except Exception:
+        pass  # competency module absent → degrade gracefully (gate doesn't block on it)
+
+    # ─── 2. FLRA gate — CONDITIONAL (closed-loop rebuild) ─────────────
+    # FLRA is an optional sub-flow: it blocks activation only when the
+    # permit was created with flraRequired (instance config / wizard
+    # override, snapshotted on the row). When an FLRA exists anyway on a
+    # non-required permit, its state is still surfaced for the UI but
+    # never blocks.
     flra_stmt = (
         select(FLRA)
         .where(FLRA.permitId == permit_id)
@@ -135,15 +170,17 @@ async def can_ptw_transition_to_active(
         .limit(1)
     )
     flra = (await db.execute(flra_stmt)).scalar_one_or_none()
+    flra_required = bool(permit.flraRequired)
 
     if flra is None:
-        status.ok = False
-        status.blockers.append(
-            GateBlocker(
-                code="FLRA_MISSING",
-                message="A completed FLRA is required before activation. Crew must sign at the worksite.",
+        if flra_required:
+            status.ok = False
+            status.blockers.append(
+                GateBlocker(
+                    code="FLRA_MISSING",
+                    message="A completed FLRA is required before activation. Crew must sign at the worksite.",
+                )
             )
-        )
     else:
         status.flra_id = flra.id
         status.flra_number = flra.number
@@ -163,11 +200,13 @@ async def can_ptw_transition_to_active(
                 ).scalars().all()
                 names_by_id = {u.id: u.name for u in u_rows}
                 names = [names_by_id.get(s.userId, s.userId) for s in unsigned]
-                status.ok = False
+                if flra_required:
+                    status.ok = False
                 status.blockers.append(
                     GateBlocker(
                         code="FLRA_UNSIGNED",
                         message=f"FLRA awaiting sign-off from: {', '.join(names)}.",
+                        severity="ERROR" if flra_required else "WARN",
                     )
                 )
             if refused:
@@ -178,7 +217,8 @@ async def can_ptw_transition_to_active(
                 ).scalars().all()
                 names_by_id = {u.id: u.name for u in u_rows}
                 names = [names_by_id.get(s.userId, s.userId) for s in refused]
-                status.ok = False
+                if flra_required:
+                    status.ok = False
                 status.blockers.append(
                     GateBlocker(
                         code="FLRA_REFUSED",
@@ -186,6 +226,7 @@ async def can_ptw_transition_to_active(
                             f"Crew refused to sign: {', '.join(names)}. "
                             "Supervisor must replace them and re-do the FLRA."
                         ),
+                        severity="ERROR" if flra_required else "WARN",
                     )
                 )
 

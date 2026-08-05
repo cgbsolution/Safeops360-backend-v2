@@ -181,10 +181,16 @@ async def check_user_competencies(
         )
 
         if cert is not None:
-            # New TrainingCertificate path — use the state machine
-            if cert.status == "ACTIVE":
+            # New TrainingCertificate path — use the state machine.
+            # Normalise case: certificates are written with status "ACTIVE"
+            # by the app (model default) but some seed data persisted them
+            # lowercase ("active"). Comparing case-sensitively dropped those
+            # valid certs into the `else` branch below and wrongly blocked
+            # competent receivers with "unknown state (active)".
+            cert_status = (cert.status or "").upper()
+            if cert_status == "ACTIVE":
                 result.satisfied.append(program_code)
-            elif cert.status == "EXPIRING_SOON":
+            elif cert_status == "EXPIRING_SOON":
                 days_remaining: int | None = None
                 if cert.validTo is not None:
                     valid_to = cert.validTo
@@ -206,7 +212,7 @@ async def check_user_competencies(
                     )
                 )
                 result.satisfied.append(program_code)
-            elif cert.status == "EXPIRED":
+            elif cert_status == "EXPIRED":
                 result.ok = False
                 result.blockers.append(
                     CompetencyBlocker(
@@ -216,7 +222,7 @@ async def check_user_competencies(
                         message=f'"{program_name}" certificate expired on {cert.validTo.strftime("%d %b %Y") if cert.validTo else "—"}.',
                     )
                 )
-            elif cert.status == "LAPSED":
+            elif cert_status == "LAPSED":
                 result.ok = False
                 result.blockers.append(
                     CompetencyBlocker(
@@ -229,7 +235,7 @@ async def check_user_competencies(
                         ),
                     )
                 )
-            elif cert.status == "REVOKED":
+            elif cert_status == "REVOKED":
                 result.ok = False
                 result.blockers.append(
                     CompetencyBlocker(

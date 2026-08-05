@@ -31,6 +31,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -158,6 +159,39 @@ class EnterpriseRisk(Base, IdMixin):
     priorResidualScore: Mapped[int | None] = mapped_column(Integer)
     priorResidualBand: Mapped[str | None] = mapped_column(String)
 
+    # ── ADVANCED (CRO-grade) extension — see apply-erm-advanced-ddl.ts ──
+    inherentExpectedLossInr: Mapped[float | None] = mapped_column(Float)
+    inherentWorstLossInr: Mapped[float | None] = mapped_column(Float)
+    residualExpectedLossInr: Mapped[float | None] = mapped_column(Float)
+    residualWorstLossInr: Mapped[float | None] = mapped_column(Float)
+    targetExpectedLossInr: Mapped[float | None] = mapped_column(Float)
+
+    targetLikelihood: Mapped[int | None] = mapped_column(Integer)
+    targetImpact: Mapped[int | None] = mapped_column(Integer)
+    targetScore: Mapped[int | None] = mapped_column(Integer)
+    targetBand: Mapped[str | None] = mapped_column(String)
+    targetDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    targetRationale: Mapped[str | None] = mapped_column(Text)
+
+    controlEffectivenessPct: Mapped[float | None] = mapped_column(Float)
+    derivedResidualScore: Mapped[int | None] = mapped_column(Integer)
+    derivedResidualBand: Mapped[str | None] = mapped_column(String)
+    residualIsOverride: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    residualOverrideVariance: Mapped[int | None] = mapped_column(Integer)
+    controlAlert: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    controlAlertAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    bowtie: Mapped[dict | None] = mapped_column(JSON)
+    firstLineOwnerId: Mapped[str | None] = mapped_column(String)
+    secondLineOwnerId: Mapped[str | None] = mapped_column(String)
+    thirdLineAssurance: Mapped[str | None] = mapped_column(String)
+    kriAlert: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    kriAlertAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # I-04: LTI/CRITICAL incident at this risk's site flags it for review
+    incidentAlert: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    incidentAlertReason: Mapped[str | None] = mapped_column(Text)
+    incidentAlertAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     closureJustification: Mapped[str | None] = mapped_column(Text)
     acceptanceJustification: Mapped[str | None] = mapped_column(Text)
     acceptedBy: Mapped[str | None] = mapped_column(String)
@@ -213,6 +247,17 @@ class RiskAssessment(Base, IdMixin):
     totalScore: Mapped[int] = mapped_column(Integer, nullable=False)
     ratingBand: Mapped[str] = mapped_column(String, nullable=False)
 
+    # ── ADVANCED quantification ──
+    likelihoodPct: Mapped[float | None] = mapped_column(Float)
+    financialBestInr: Mapped[float | None] = mapped_column(Float)
+    financialExpectedInr: Mapped[float | None] = mapped_column(Float)
+    financialWorstInr: Mapped[float | None] = mapped_column(Float)
+    expectedLossInr: Mapped[float | None] = mapped_column(Float)
+    unexpectedLossInr: Mapped[float | None] = mapped_column(Float)
+    timeHorizon: Mapped[str | None] = mapped_column(String)
+    derivedFromControls: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    controlEffectivenessPct: Mapped[float | None] = mapped_column(Float)
+
     assessmentDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     assessedBy: Mapped[str] = mapped_column(String, nullable=False)
     rationale: Mapped[str] = mapped_column(Text, nullable=False)
@@ -234,6 +279,8 @@ class RiskLinkage(Base, IdMixin):
     targetRiskId: Mapped[str] = mapped_column(ForeignKey("EnterpriseRisk.id", ondelete="CASCADE"), nullable=False)
     linkageType: Mapped[str] = mapped_column(String, nullable=False)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    correlationStrength: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    impactFactor: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
     sourceRisk: Mapped[EnterpriseRisk] = relationship(foreign_keys=[sourceRiskId])
     targetRisk: Mapped[EnterpriseRisk] = relationship(foreign_keys=[targetRiskId])

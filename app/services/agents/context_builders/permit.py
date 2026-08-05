@@ -51,11 +51,15 @@ from app.models.user import User
 # We include the approval states because an approved-but-not-yet-active
 # permit is in the queue and the Issuer needs to be aware of it.
 _LIVE_STATUSES: tuple[PermitStatus, ...] = (
+    # Closed-loop states
+    PermitStatus.APPROVED,
+    PermitStatus.ISSUED,
+    PermitStatus.ACTIVE,
+    PermitStatus.SUSPENDED,
+    # Deprecated pre-rebuild intermediates (kept for old rows)
     PermitStatus.ISSUER_APPROVED,
     PermitStatus.SAFETY_APPROVED,
     PermitStatus.PLANT_HEAD_APPROVED,
-    PermitStatus.ACTIVE,
-    PermitStatus.SUSPENDED,
 )
 
 

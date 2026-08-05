@@ -30,6 +30,7 @@ from app.schemas.flra import (
     FLRAOut,
     FLRARedoRequest,
     FLRASignRequest,
+    FLRAUpdate,
     JobStepInput,
 )
 from app.services.flra_gate import maybe_complete_flra, resolve_crew_for_flra
@@ -94,7 +95,10 @@ async def list_flras(
         return {"items": [], "total": 0}
     else:
         stmt = stmt.where(FLRA.plantId.in_(plants))
-    rows = (await db.execute(stmt.order_by(FLRA.date.desc()).limit(100))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(stmt.order_by(FLRA.createdAt.desc(), FLRA.id.desc()).limit(100))
+    ).scalars().all()
     return {"items": [FLRAOut.model_validate(r) for r in rows], "total": len(rows)}
 
 
@@ -297,6 +301,49 @@ async def get_flra(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+    return FLRAOut.model_validate(flra)
+
+
+@router.patch("/{flra_id}", response_model=FLRAOut)
+async def update_flra(
+    flra_id: str,
+    payload: FLRAUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> FLRAOut:
+    """Edit an FLRA's core details while it is still IN_PROGRESS (before all
+    crew have signed and it becomes COMPLETED). Hazard analysis, crew and
+    fitness declarations are managed by the wizard / sign flow, not here.
+    Enforces FLRA.UPDATE + scope."""
+    flra = await db.get(FLRA, flra_id)
+    if flra is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "FLRA not found")
+    if flra.status != FLRAStatus.IN_PROGRESS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "An FLRA can only be edited while it is In Progress (current status: "
+            f"{flra.status.value.replace('_', ' ').title()}).",
+        )
+    record = {"leaderId": flra.leaderId}
+    result = await can(
+        db,
+        user.id,
+        "FLRA.UPDATE",
+        PermissionContext(record_id=flra.id, plant_id=flra.plantId, record=record),
+    )
+    if not result.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    data = payload.model_dump(exclude_unset=True)
+    for field in (
+        "location", "jobDescription", "specificLocation", "areaCode",
+        "startTime", "jobIsRoutine", "exitRoutesIdentified",
+    ):
+        if field in data:
+            setattr(flra, field, data[field])
+
+    await db.flush()
+    await db.refresh(flra)
     return FLRAOut.model_validate(flra)
 
 

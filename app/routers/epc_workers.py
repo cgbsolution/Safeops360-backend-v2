@@ -141,6 +141,10 @@ def _worker_dict(worker: ContractorWorker, active_mobilizations: int = 0) -> dic
             worker.currentMedicalValidUntil.isoformat() if worker.currentMedicalValidUntil else None
         ),
         "overallStatus": worker.overallStatus,
+        # Safety hold from the Observation deroster workflow — separate axis
+        # from overallStatus, which is the EPC employment state.
+        "rosterStatus": getattr(worker, "rosterStatus", "active") or "active",
+        "currentDerosterRef": getattr(worker, "currentDerosterRef", None),
         "biometricEnrolled": worker.biometricEnrolled,
         "activeMobilizations": active_mobilizations,
         "createdAt": worker.createdAt.isoformat() if worker.createdAt else None,
@@ -189,7 +193,12 @@ async def list_workers(
             ContractorWorker.fullName.ilike(pattern)
             | ContractorWorker.workerCode.ilike(pattern)
         )
-    workers = (await db.execute(stmt.order_by(ContractorWorker.fullName.asc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    workers = (
+        await db.execute(
+            stmt.order_by(ContractorWorker.createdAt.desc(), ContractorWorker.id.desc())
+        )
+    ).scalars().all()
 
     out: list[dict] = []
     for w in workers:
@@ -548,6 +557,12 @@ async def gate_status(
             else f"Worker status is {worker.overallStatus}"
         ),
     }
+
+    # i. safety_roster — Observation deroster hold (see epc_gate.py for why
+    # this is separate from the suspension check above).
+    from app.services import roster_gate
+
+    checks["safety_roster"] = roster_gate.for_person(worker).as_check()
 
     # h. contractor company status
     approved_statuses = {"approved", "conditionally_approved"}

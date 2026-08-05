@@ -604,7 +604,10 @@ async def list_schedules(
     if status_filter:
         stmt = stmt.where(TrainingSchedule.status == status_filter)
     rows = (
-        await db.execute(stmt.order_by(TrainingSchedule.startDate.desc()).limit(200))
+        # Newest-created first — platform-wide register convention.
+        await db.execute(
+            stmt.order_by(TrainingSchedule.createdAt.desc(), TrainingSchedule.id.desc()).limit(200)
+        )
     ).scalars().all()
     return {"items": [TrainingScheduleOut.model_validate(r) for r in rows], "total": len(rows)}
 
@@ -1552,7 +1555,10 @@ async def list_certificates(
         stmt = stmt.where(TrainingCertificate.status == status_filter)
 
     rows = (
-        await db.execute(stmt.order_by(TrainingCertificate.issuedAt.desc()).limit(500))
+        # Newest-created first — platform-wide register convention.
+        await db.execute(
+            stmt.order_by(TrainingCertificate.createdAt.desc(), TrainingCertificate.id.desc()).limit(500)
+        )
     ).scalars().all()
     return {
         "items": [TrainingCertificateOut.model_validate(c) for c in rows],
@@ -1822,7 +1828,12 @@ async def list_records(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     rows = (
-        await db.execute(select(TrainingRecord).order_by(TrainingRecord.date.desc()).limit(200))
+        # Newest-created first — platform-wide register convention.
+        await db.execute(
+            select(TrainingRecord)
+            .order_by(TrainingRecord.createdAt.desc(), TrainingRecord.id.desc())
+            .limit(200)
+        )
     ).scalars().all()
     return {"items": [TrainingRecordOut.model_validate(r) for r in rows], "total": len(rows)}
 

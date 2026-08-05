@@ -86,7 +86,8 @@ async def _load_user_snapshot(db: AsyncSession, user_id: str) -> _UserSnapshot:
     now = datetime.now(timezone.utc)
     user = await db.get(User, user_id)
     if user is None:
-        empty = _UserSnapshot(rows=[], role_codes=[], plant_id=None, department=None)
+        # Fail closed: a missing/deleted user has no permissions and no plants.
+        empty = _UserSnapshot(rows=[], role_codes=[], plant_id=None, plant_ids=set(), department=None)
         _CACHE[user_id] = empty
         return empty
 
@@ -172,6 +173,9 @@ _OWNER_FIELDS = (
     "employeeId",
     "uploadedById",
     "createdById",
+    "routedToUserId",
+    "assignedOwnerId",
+    "assignedAuditorId",
 )
 
 
@@ -285,6 +289,48 @@ async def get_accessible_plants(db: AsyncSession, user_id: str) -> list[str] | N
     if profile is None:
         return []
     return list(profile.plantIds) if profile.plantIds else []
+
+
+async def get_accessible_plants_for(
+    db: AsyncSession, user_id: str, permission_code: str
+) -> list[str] | None:
+    """Plant IDs the user may act in *for one specific permission*. None == unrestricted.
+
+    Differs from get_accessible_plants(): that one returns None (all plants) as
+    soon as the user holds ANY ALL_PLANTS grant on ANY module — which makes a
+    list endpoint broader than the per-record can(<permission_code>, …) check
+    that guards the detail endpoint. The two then disagree: the list shows rows
+    the detail later denies with a 403.
+
+    This variant looks only at the scope attached to `permission_code`, keeping
+    a list query consistent with can() for that same permission:
+      - ALL_PLANTS on this permission   → None (unrestricted)
+      - OWN_PLANT / OWN_DEPARTMENT      → the user's plant set
+      - OWN_RECORDS only                → the user's plant set (coarse; can()
+                                          still guards each individual record)
+      - permission absent               → [] (nothing visible)
+    """
+    rows = await _load_user_permissions(db, user_id)
+    matches = [r for r in rows if r.permission_code == permission_code]
+    if not matches:
+        return []
+    if any(m.scope == "ALL_PLANTS" for m in matches):
+        return None
+    profile = await _load_user_profile(db, user_id)
+    if profile is None:
+        return []
+    return list(profile.plantIds) if profile.plantIds else []
+
+
+async def permission_scopes(db: AsyncSession, user_id: str, permission_code: str) -> set[PermissionScope]:
+    """The scopes attached to one permission for this user (empty = not held).
+
+    Lets a list endpoint tell "plant-wide reader" from "only the records I am
+    party to" — a distinction get_accessible_plants_for() erases by design, it
+    returns the plant set for an OWN_RECORDS grant too. Without it a list is
+    broader than the can() check guarding the matching detail endpoint."""
+    rows = await _load_user_permissions(db, user_id)
+    return {r.scope for r in rows if r.permission_code == permission_code}
 
 
 async def get_user_role_codes(db: AsyncSession, user_id: str) -> list[str]:

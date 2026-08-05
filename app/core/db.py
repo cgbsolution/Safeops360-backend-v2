@@ -59,11 +59,22 @@ class Base(DeclarativeBase):
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, Any]:
-    """FastAPI dependency that yields a transactional session per request."""
+    """FastAPI dependency that yields a transactional session per request.
+
+    After the business commit, drains any audit events the ORM layer captured
+    during the request (P1-1). The drain uses a separate session, so an
+    audit-write failure never rolls back the business change.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
             await session.commit()
+            try:
+                from app.services.audit_log import drain_audit
+
+                await drain_audit(session)
+            except Exception:  # noqa: BLE001 — audit must never break the request
+                pass
         except Exception:
             await session.rollback()
             raise

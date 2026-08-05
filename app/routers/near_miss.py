@@ -166,7 +166,12 @@ async def list_near_misses(
         stmt = stmt.where(NearMiss.plantId.in_(plants))
     if read_check.matched_scope == "OWN_RECORDS":
         stmt = stmt.where(or_(NearMiss.reporterId == user.id, NearMiss.actionOwnerId == user.id))
-    rows = (await db.execute(stmt.order_by(NearMiss.date.desc()).limit(200))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(
+            stmt.order_by(NearMiss.createdAt.desc(), NearMiss.id.desc()).limit(200)
+        )
+    ).scalars().all()
     return {"items": [NearMissOut.model_validate(r) for r in rows], "total": len(rows)}
 
 
@@ -442,6 +447,17 @@ async def create_near_miss(
     # stays True for CRITICAL severity here so the workflow tracker UI
     # can show "will be promoted on Joint Review approval".
 
+    # Training & Competency Engine — stage a trigger event so the background
+    # resolver evaluates severity (SIF / potentialSeverity) + threshold rules.
+    # Best-effort SAVEPOINT — never blocks near-miss creation.
+    try:
+        async with db.begin_nested():
+            from app.services.training_engine import emit_training_trigger
+
+            await emit_training_trigger(db, "NEAR_MISS", nm)
+    except Exception as e:  # noqa: BLE001
+        print(f"Training trigger emit failed: {e}", file=sys.stderr)
+
     await db.refresh(nm)
     return NearMissOut.model_validate(nm)
 
@@ -683,6 +699,29 @@ async def update_near_miss(
         if target < datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target closure date cannot be in the past.")
         nm.targetDate = target
+
+    # ─── Core-detail edit ("edit while open"). The CLOSED guard above already
+    #     blocks edits on a finalised near miss; these apply the descriptive
+    #     fields a user would correct. ───
+    if payload.description is not None:
+        nm.description = payload.description
+    if payload.potentialSeverity is not None:
+        nm.potentialSeverity = payload.potentialSeverity
+    if payload.areaId is not None:
+        nm.areaId = payload.areaId or None
+    if payload.location is not None:
+        nm.location = payload.location or None
+    if payload.specificLocation is not None:
+        nm.specificLocation = payload.specificLocation or None
+    if payload.hazardCategory is not None:
+        nm.hazardCategory = payload.hazardCategory or None
+    if payload.energySource is not None:
+        nm.energySource = payload.energySource or None
+    if payload.activityBeingPerformed is not None:
+        nm.activityBeingPerformed = payload.activityBeingPerformed or None
+    if payload.immediateAction is not None:
+        nm.immediateAction = payload.immediateAction or None
+
     await db.flush()
     await db.refresh(nm)
     return NearMissOut.model_validate(nm)

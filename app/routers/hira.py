@@ -19,7 +19,7 @@ is seeded. Until then studies stay in DRAFT and can be edited freely.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from dateutil.relativedelta import relativedelta as _relativedelta
@@ -28,7 +28,7 @@ except ImportError:
     _HAS_RELATIVEDELTA = False
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, inspect as sa_inspect, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -52,6 +52,7 @@ from app.models.hira import (
     RiskMatrixLikelihood,
     RiskMatrixSeverity,
 )
+from app.models.permit import PermitType
 from app.models.plant import Plant
 from app.models.user import User
 from app.schemas.hira import (
@@ -75,6 +76,7 @@ from app.schemas.hira import (
     HiraEntryTransitionRequest,
     HiraEntryUpdate,
     HiraHazardOut,
+    HiraHazardPermitUpdate,
     HiraIntegrationEntry,
     HiraIntegrationForFlraResponse,
     HiraIntegrationForPtwResponse,
@@ -90,6 +92,7 @@ from app.schemas.hira import (
     HiraStudyOut,
     HiraStudyTransitionRequest,
     HiraStudyUpdate,
+    HiraUnacceptableOverrideRequest,
     HiraVersionOut,
     RiskMatrixOut,
 )
@@ -100,6 +103,348 @@ from app.services.permissions import (
 )
 
 router = APIRouter(prefix="/api/hira", tags=["hira"])
+
+# ─────────────────────────────────────────────────────────────────────
+# ALARP tolerability banding
+#
+# ALARP ("As Low As Reasonably Practicable") sorts risk into three
+# regions. The default maps the 4-level scale as agreed:
+#   CRITICAL         -> UNACCEPTABLE        (must be reduced; warn+justify)
+#   HIGH / MODERATE  -> TOLERABLE           (accept only if ALARP demonstrated)
+#   LOW              -> BROADLY_ACCEPTABLE   (no further action needed)
+# Per-matrix overrides live in RiskMatrix.alarpBands; this is the fallback.
+# ─────────────────────────────────────────────────────────────────────
+DEFAULT_ALARP_BANDS: dict[str, str] = {
+    "LOW": "BROADLY_ACCEPTABLE",
+    "MODERATE": "TOLERABLE",
+    "HIGH": "TOLERABLE",
+    "CRITICAL": "UNACCEPTABLE",
+}
+
+
+def _alarp_region(level: str | None, alarp_bands: dict | None) -> str | None:
+    """Map a risk level to its ALARP region via the matrix bands (or default)."""
+    if not level:
+        return None
+    bands = alarp_bands or DEFAULT_ALARP_BANDS
+    return bands.get(level) or DEFAULT_ALARP_BANDS.get(level, "TOLERABLE")
+
+
+def _alarp_demonstrated(entry: HiraEntry) -> bool:
+    """A tolerable-region residual is ALARP only when the cost-benefit test is
+    complete: further controls were considered, the residual reduction was
+    judged grossly disproportionate to the cost/effort, and it is justified."""
+    return bool(
+        entry.alarpFurtherControlsConsidered is not None
+        and entry.alarpGrosslyDisproportionate is True
+        and (entry.alarpJustification or "").strip()
+    )
+
+
+def _evaluate_alarp(entry: HiraEntry, region: str | None, threshold: str | None, user_id: str) -> None:
+    """Recompute ALARP status, sign-off and residualAcceptable from the entry's
+    current residual region + demonstration fields. Call AFTER residual L/S and
+    ALARP payload fields have been applied to the entry.
+
+    Enforcement is 'warn only': an UNACCEPTABLE residual is never hard-blocked
+    here — it is marked not-acceptable so the UI/register flag it and require a
+    documented acceptance rationale.
+    """
+    entry.residualAlarpRegion = region
+
+    if region is None:
+        entry.alarpStatus = None
+        return
+
+    if region == "BROADLY_ACCEPTABLE":
+        entry.alarpStatus = "NOT_REQUIRED"
+        region_ok = True
+    elif region == "TOLERABLE":
+        demonstrated = _alarp_demonstrated(entry)
+        entry.alarpStatus = "DEMONSTRATED" if demonstrated else "REQUIRED"
+        if demonstrated and entry.alarpDemonstratedAt is None:
+            entry.alarpDemonstratedById = user_id
+            entry.alarpDemonstratedAt = datetime.now(timezone.utc)
+        if not demonstrated:
+            # Clear a stale sign-off if the demonstration was walked back.
+            entry.alarpDemonstratedById = None
+            entry.alarpDemonstratedAt = None
+        region_ok = demonstrated
+    else:  # UNACCEPTABLE
+        entry.alarpStatus = "NOT_REQUIRED"
+        region_ok = False
+
+    # Legacy per-routine threshold remains a stricter-only secondary gate so
+    # existing policy (e.g. emergency activities capped at LOW) is preserved.
+    threshold_ok = True if not threshold else _acceptability_ok(entry.residualRiskLevel or "LOW", threshold)
+    entry.residualAcceptable = region_ok and threshold_ok
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Materiality — G21
+#
+# Before this, every edit to an entry on an APPROVED/ACTIVE study was treated
+# identically: new version + mandatory change reason, and the entry stayed
+# APPROVED regardless of what changed. That produced both failure modes at
+# once — approval fatigue on typo fixes, and residual-risk changes landing
+# under a stale approval with no re-sign-off.
+#
+# A change is MATERIAL when it moves the assessed risk or the decision that
+# justified accepting it:
+#   • initial or residual likelihood/severity/level changed (either mode —
+#     manual pick or auto-derived from controls)
+#   • the routine classification changed (it selects the acceptability
+#     threshold, so it can flip residualAcceptable on its own)
+#   • an ALARP *decision* flag changed (these drive alarpStatus, which drives
+#     residualAcceptable). The ALARP free-text fields are NOT material.
+#   • a hazard row was added/removed/re-scoped
+#   • an existing control's effectiveness changed, or the control set changed
+#   • a recommended control's status changed, or the proposal set changed
+#
+# Everything else — wording, rationales, target forecast, cross-module links,
+# evidence references — is MINOR: versioned and reason-stamped as before, but
+# it does not disturb the approval.
+# ─────────────────────────────────────────────────────────────────────
+
+# ALARP inputs that change the acceptability verdict rather than describing it.
+# The cost band feeds the grossly-disproportionate decision, so it is material;
+# the free-text benefit / justification are narrative and stay minor.
+_MATERIAL_ALARP_FLAGS = ("alarpFurtherControlsConsidered", "alarpGrosslyDisproportionate", "alarpCostBand")
+_MATERIAL_SCALAR_FIELDS = ("routine",) + _MATERIAL_ALARP_FLAGS
+
+MATERIAL_TRIGGER = "MATERIAL_REVISION"
+MINOR_TRIGGER = "MINOR_REVISION"
+
+# Entry statuses that represent a live approval which a material edit must
+# invalidate. IN_REVIEW is the existing status `POST /entries/{id}/approve`
+# already accepts — no new status value is introduced.
+_APPROVED_ENTRY_STATUSES = ("APPROVED", "ACTIVE")
+# Distinct from IN_REVIEW (never-yet-approved) so a withdrawn approval is
+# visible as such across the register, dashboards and Daily Brief.
+REAPPROVAL_STATUS = "PENDING_REAPPROVAL"
+# Statuses an approver may move to APPROVED via POST /entries/{id}/approve.
+_APPROVABLE_ENTRY_STATUSES = ("IN_REVIEW", "PENDING_REAPPROVAL")
+
+
+_SKIP_VERSION_DOC = (
+    "Set by a caller that has already archived a version for this same logical "
+    "save (the entry editor PATCHes first, then syncs hazards and controls). "
+    "Without it one Save produced up to four HiraVersion rows, each demanding "
+    "its own change reason. Defaults to false so a standalone API call is still "
+    "versioned."
+)
+
+
+async def _archive_version_number(db: AsyncSession, entry: HiraEntry) -> int:
+    """The number to file the outgoing state under, before `entry.versionNumber`
+    advances past it.
+
+    Model: `entry.versionNumber` is the number of the CURRENT live state, and
+    HiraVersion rows archive superseded states. So a change archives the current
+    state under `entry.versionNumber`, then the entry moves to n + 1.
+
+    Two handlers disagreed about this. `update_entry` filed under
+    `entry.versionNumber`; the control PUTs filed under `entry.versionNumber + 1`.
+    A single Save (PATCH then child PUTs) therefore produced numbers 1, 3, 4 …
+    and, once the entry's own counter caught up with a row that already existed,
+    every later save died on the `(entryId, versionNumber)` unique constraint —
+    a hard 500 with no way out through the UI.
+
+    Taking max(existing)+1 whenever the naive number is already taken makes this
+    collision-proof AND self-healing: entries left with a gap from the buggy
+    window start saving again without any data repair. Same fix shape as the
+    CAPA numbering count(*)+1 → max+1 change.
+    """
+    existing_max = (
+        await db.execute(
+            select(func.max(HiraVersion.versionNumber)).where(HiraVersion.entryId == entry.id)
+        )
+    ).scalar()
+    number = entry.versionNumber
+    if existing_max is not None and number <= existing_max:
+        number = existing_max + 1
+    return number
+
+
+def _entry_snapshot(entry: HiraEntry) -> dict:
+    """JSON-safe column-only snapshot of an entry for HiraVersion.snapshot.
+
+    Every previous call site built this from `entry.__dict__` filtered with
+    `not isinstance(v, list)`. That kept LOADED SCALAR RELATIONSHIPS — most
+    notably `entry.study`, which every one of these handlers eager-loads — and
+    json.dumps then blew up with "Object of type HiraStudy is not JSON
+    serializable". Versioned edits therefore 500'd outright, which is why
+    production held 22 HiraVersion rows and every one of them was
+    INITIAL_APPROVAL. Driving the snapshot off the mapper's column list can't
+    pick up a relationship at all.
+    """
+    snapshot = {}
+    for col in sa_inspect(HiraEntry).columns.keys():
+        value = getattr(entry, col, None)
+        snapshot[col] = value.isoformat() if hasattr(value, "isoformat") else value
+    return snapshot
+
+
+def _risk_fingerprint(entry: HiraEntry) -> tuple:
+    """The risk-bearing state of an entry, for before/after comparison.
+
+    Read AFTER the risk recomputation blocks have run, so it captures the
+    derived result whether the residual was hand-picked or auto-calculated
+    from controls.
+    """
+    return (
+        entry.initialLikelihoodScore,
+        entry.initialSeverityScore,
+        entry.initialRiskLevel,
+        entry.residualLikelihoodScore,
+        entry.residualSeverityScore,
+        entry.residualRiskLevel,
+    )
+
+
+def _material_scalars(entry: HiraEntry) -> dict:
+    return {f: getattr(entry, f, None) for f in _MATERIAL_SCALAR_FIELDS}
+
+
+def _classify_entry_change(
+    entry: HiraEntry,
+    before_fingerprint: tuple,
+    before_scalars: dict,
+    data: dict,
+) -> tuple[bool, list[str]]:
+    """Return (is_material, reasons) for an in-flight PATCH.
+
+    `data` still holds the not-yet-applied scalar fields, so material scalars
+    are compared payload-vs-current; risk fields are compared via the
+    fingerprint because they were already applied by the recompute blocks.
+    """
+    reasons: list[str] = []
+
+    after_fingerprint = _risk_fingerprint(entry)
+    if after_fingerprint != before_fingerprint:
+        labels = (
+            "initialLikelihoodScore",
+            "initialSeverityScore",
+            "initialRiskLevel",
+            "residualLikelihoodScore",
+            "residualSeverityScore",
+            "residualRiskLevel",
+        )
+        for label, old, new in zip(labels, before_fingerprint, after_fingerprint):
+            if old != new:
+                reasons.append(f"{label}: {old} → {new}")
+
+    for field in _MATERIAL_SCALAR_FIELDS:
+        if field in data and data[field] != before_scalars.get(field):
+            reasons.append(f"{field}: {before_scalars.get(field)} → {data[field]}")
+
+    return (bool(reasons), reasons)
+
+
+def _clear_unacceptable_override(entry: HiraEntry) -> None:
+    """Void any recorded Unacceptable-risk override. Called when the risk basis
+    moves (material change) — the prior authorisation covered a different
+    assessment and must not carry over."""
+    entry.unacceptableOverrideById = None
+    entry.unacceptableOverrideAt = None
+    entry.unacceptableOverrideJustification = None
+    entry.unacceptableOverrideExpiresAt = None
+
+
+def _apply_reapproval(entry: HiraEntry, is_material: bool) -> bool:
+    """Drop a live approval when a material change lands. Returns True if the
+    entry's status actually moved, so callers can report it.
+
+    Keyed on the ENTRY's approval state, not the study's: an entry can be
+    APPROVED while its study is still DRAFT, and that approval is just as real,
+    so a material edit must withdraw it either way (closes the study-status
+    hole). A material change also voids any Unacceptable-risk override — the
+    authorisation covered the previous assessment.
+    """
+    if not is_material:
+        return False
+    if entry.status not in _APPROVED_ENTRY_STATUSES:
+        return False
+    _clear_unacceptable_override(entry)
+    entry.status = REAPPROVAL_STATUS
+    return True
+
+
+def _resolve_change_trigger(explicit: str | None, is_material: bool) -> str:
+    """Honour an explicit trigger from a review/MOC-driven caller; otherwise
+    stamp the version with the classification we just computed instead of the
+    blanket 'CORRECTION' the editor used to hardcode."""
+    if explicit:
+        return explicit
+    return MATERIAL_TRIGGER if is_material else MINOR_TRIGGER
+
+
+def _control_effectiveness_fingerprint(controls) -> set:
+    """Identity + effectiveness of each existing control. A changed set OR a
+    changed effectiveness verdict is material; re-wording a description is not."""
+    return {
+        (c.hierarchy, (c.description or "").strip(), c.effectiveness)
+        for c in controls
+    }
+
+
+def _recommended_status_fingerprint(controls) -> set:
+    """Identity + status of each proposal. Status transitions (PROPOSED →
+    IMPLEMENTED, → REJECTED) are material; editing the rationale is not."""
+    return {
+        (c.hierarchy, (c.description or "").strip(), c.status)
+        for c in controls
+    }
+
+
+_PERMIT_TYPE_CODES = {t.value for t in PermitType}
+
+# Hazard category → the permit type a drafted PTW should default to. Only used
+# when the library hazard does not narrow it itself via permitTypes.
+_CATEGORY_PERMIT_DEFAULT = {
+    "confined_space": PermitType.CONFINED_SPACE.value,
+    "fire_explosion": PermitType.HOT_WORK.value,
+    "thermal": PermitType.HOT_WORK.value,
+    "height": PermitType.WORK_AT_HEIGHT.value,
+    "electrical": PermitType.ELECTRICAL_LOTO.value,
+}
+
+
+def _suggest_hazard_regulation(lib_hazard) -> tuple[str | None, str | None]:
+    """Best-effort (instrument, section) citation for a hazard row, derived
+    from the library hazard's regulatory columns.
+
+    Only a starting point: it is written once when the row is created and is
+    freely overridable afterwards. Ad-hoc hazards with no library row, and
+    library rows with none of these columns populated, yield (None, None) —
+    the user then types the citation themselves.
+
+    Order reflects what an Indian manufacturing auditor asks for first.
+    """
+    if lib_hazard is None:
+        return (None, None)
+    if lib_hazard.factoriesActSection:
+        return ("Factories Act 1948", lib_hazard.factoriesActSection)
+    if lib_hazard.isStandard:
+        return ("Indian Standard", lib_hazard.isStandard)
+    if lib_hazard.oshaStandard:
+        return ("OSHA", lib_hazard.oshaStandard)
+    if lib_hazard.isoReference:
+        return ("ISO", lib_hazard.isoReference)
+    return (None, None)
+
+
+def _hazard_fingerprint(hazards) -> set:
+    """Hazard identity + the two fields that define what the hazard means for
+    this activity. Adding, removing or re-scoping a hazard is material."""
+    return {
+        (
+            h.hazardId,
+            (h.contextualDescription or "").strip(),
+            (h.consequence or "").strip(),
+        )
+        for h in hazards
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -197,6 +542,41 @@ async def list_hazards(
     return [HiraHazardOut.model_validate(r) for r in rows]
 
 
+@router.patch("/hazards/{hazard_id}/permit-gate", response_model=HiraHazardOut)
+async def set_hazard_permit_gate(
+    hazard_id: str,
+    payload: HiraHazardPermitUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> HiraHazardOut:
+    """Flag a library hazard as permit-requiring, so entry rows built from it
+    surface the Create-PTW prompt. Library master data — gated on
+    HIRA.LIBRARY_MANAGE, the same permission the hazard configuration screen
+    is already listed under."""
+    check = await can(db, user.id, "HIRA.LIBRARY_MANAGE", PermissionContext())
+    if not check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+
+    hazard = await db.get(HiraHazard, hazard_id)
+    if hazard is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Hazard not found")
+
+    unknown = [t for t in (payload.permitTypes or []) if t not in _PERMIT_TYPE_CODES]
+    if unknown:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Unknown permit type(s): {', '.join(unknown)}",
+        )
+
+    hazard.requiresPermit = payload.requiresPermit
+    # Clearing the gate clears the type narrowing with it, so a re-enabled
+    # hazard never inherits a stale permit-type list.
+    hazard.permitTypes = (payload.permitTypes or None) if payload.requiresPermit else None
+    await db.flush()
+    await db.refresh(hazard)
+    return HiraHazardOut.model_validate(hazard)
+
+
 @router.get("/controls", response_model=list[HiraControlOut])
 async def list_controls(
     hierarchy: str | None = None,
@@ -257,7 +637,8 @@ async def list_studies(
     if department_id:
         stmt = stmt.where(HiraStudy.departmentId == department_id)
 
-    stmt = stmt.order_by(HiraStudy.status.asc(), HiraStudy.initiatedAt.desc()).limit(200)
+    # Newest-created first — platform-wide register convention.
+    stmt = stmt.order_by(HiraStudy.createdAt.desc(), HiraStudy.id.desc()).limit(200)
     rows = (await db.execute(stmt)).scalars().all()
 
     # Bulk-fetch team leader names + entry counts in one query each
@@ -526,6 +907,7 @@ async def get_study_detail(
                 "likelihoodLevels": matrix.likelihoodLevels,
                 "severityLevels": matrix.severityLevels,
                 "acceptableResidual": matrix.acceptableResidual,
+                "alarpBands": matrix.alarpBands or DEFAULT_ALARP_BANDS,
                 "controlHierarchyEnforced": matrix.controlHierarchyEnforced,
             }
             if matrix
@@ -624,6 +1006,18 @@ async def create_entry(
         "HIRA.UPDATE", user, db, plant_id=study.plantId, record_id=study.id
     )
 
+    # Every hazard on a NEW entry must state its consequence — validated before
+    # anything is written so a rejected entry leaves no partial row behind.
+    blank_consequences = [
+        h.hazardId for h in payload.hazards if not (h.consequence or "").strip()
+    ]
+    if blank_consequences:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Consequence is required for each hazard. Missing for hazardId(s): "
+            + ", ".join(blank_consequences),
+        )
+
     likelihood = await db.get(RiskMatrixLikelihood, payload.initialLikelihoodId)
     severity = await db.get(RiskMatrixSeverity, payload.initialSeverityId)
     if likelihood is None or severity is None:
@@ -638,6 +1032,8 @@ async def create_entry(
     cells_stmt = select(RiskMatrixCell).where(RiskMatrixCell.matrixId == study.riskMatrixId)
     cells = list((await db.execute(cells_stmt)).scalars().all())
     risk_score, risk_level, risk_color = _compute_risk(cells, likelihood.score, severity.score)
+    matrix = await db.get(RiskMatrix, study.riskMatrixId)
+    initial_region = _alarp_region(risk_level, matrix.alarpBands if matrix else None)
 
     # Auto-assign sequenceNumber atomically
     seq_result = await db.execute(
@@ -672,6 +1068,7 @@ async def create_entry(
         initialRiskScore=risk_score,
         initialRiskLevel=risk_level,
         initialRiskColor=risk_color,
+        initialAlarpRegion=initial_region,
         status="DRAFT",
         versionNumber=1,
         isCurrentVersion=True,
@@ -681,14 +1078,30 @@ async def create_entry(
     await db.flush()
     await db.refresh(entry)
 
-    # Save hazards with their consequence descriptions
+    # Save hazards with their consequence + regulatory citation. Where the
+    # client left the citation blank we seed it from the library hazard, so a
+    # standard hazard arrives already traceable; the user can overwrite it.
+    lib_by_id: dict[str, HiraHazard] = {}
+    if payload.hazards:
+        lib_rows = (
+            await db.execute(
+                select(HiraHazard).where(
+                    HiraHazard.id.in_([h.hazardId for h in payload.hazards])
+                )
+            )
+        ).scalars().all()
+        lib_by_id = {row.id: row for row in lib_rows}
+
     for idx, h in enumerate(payload.hazards):
+        suggested_ref, suggested_section = _suggest_hazard_regulation(lib_by_id.get(h.hazardId))
         db.add(
             HiraEntryHazard(
                 entryId=entry.id,
                 hazardId=h.hazardId,
                 contextualDescription=h.contextualDescription,
-                consequence=h.consequence,
+                consequence=(h.consequence or "").strip() or None,
+                regulationRef=(h.regulationRef or "").strip() or suggested_ref,
+                regulationSection=(h.regulationSection or "").strip() or suggested_section,
                 sortOrder=idx,
             )
         )
@@ -704,10 +1117,25 @@ async def create_entry(
             selectinload(HiraEntry.existingControls),
             selectinload(HiraEntry.recommendedControls),
             selectinload(HiraEntry.regulationRefs),
+            # HiraEntryOut declares `capas`; without it here Pydantic lazy-loads
+            # on an async session and the create 500s AFTER the row was written.
+            selectinload(HiraEntry.capas),
         )
     )
     entry = (await db.execute(stmt)).scalar_one()
-    return HiraEntryOut.model_validate(entry)
+
+    # Same hazard denormalisation get_entry does, so the created entry comes
+    # back in the shape the editor expects.
+    out = HiraEntryOut.model_validate(entry).model_dump()
+    for i, hz in enumerate(out["hazards"]):
+        src_hz = entry.hazards[i]
+        if src_hz.hazard is not None:
+            hz["hazardCode"] = src_hz.hazard.code
+            hz["hazardCategory"] = src_hz.hazard.category
+            hz["hazardName"] = src_hz.hazard.name
+            hz["hazardRequiresPermit"] = bool(src_hz.hazard.requiresPermit)
+            hz["hazardPermitTypes"] = src_hz.hazard.permitTypes or []
+    return HiraEntryOut(**out)
 
 
 @router.get("/entries/{entry_id}", response_model=HiraEntryOut)
@@ -749,6 +1177,8 @@ async def get_entry(
             hz["hazardCode"] = src_hz.hazard.code
             hz["hazardCategory"] = src_hz.hazard.category
             hz["hazardName"] = src_hz.hazard.name
+            hz["hazardRequiresPermit"] = bool(src_hz.hazard.requiresPermit)
+            hz["hazardPermitTypes"] = src_hz.hazard.permitTypes or []
     return HiraEntryOut(**out)
 
 
@@ -915,19 +1345,140 @@ def _acceptability_ok(level: str, threshold: str) -> bool:
     return order.index(level) <= order.index(threshold)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Residual-from-controls auto-calculation
+#
+# When an entry is in auto mode (residualAutoCalculated is True), the residual
+# likelihood/severity are DERIVED from the existing controls rather than being
+# hand-picked on the matrix. Each control removes a base number of scale-steps
+# from likelihood and/or severity depending on where it sits in the hierarchy,
+# scaled by how effective it is. Multiple controls on one axis get diminishing
+# returns (the strongest counts in full, the rest at half). Residual is floored
+# at 1 and can never exceed the initial score (controls can't increase risk).
+#
+# The frontend mirrors this exactly for a live preview — keep the two in sync:
+# see suggestResidualScores() in
+# safeops_360/src/app/(dashboard)/hira/[id]/entries/[entryId]/entry-editor.tsx
+# ─────────────────────────────────────────────────────────────────────
+
+# (likelihoodStep, severityStep) removed at full effectiveness, per hierarchy.
+CONTROL_REDUCTION: dict[str, tuple[int, int]] = {
+    "ELIMINATION": (4, 3),
+    "SUBSTITUTION": (2, 2),
+    "ENGINEERING": (2, 1),
+    "ADMINISTRATIVE": (1, 0),
+    "PPE": (0, 1),
+}
+EFFECTIVENESS_FACTOR: dict[str, float] = {
+    "EFFECTIVE": 1.0,
+    "PARTIALLY_EFFECTIVE": 0.6,
+    "NOT_VERIFIED": 0.3,
+    "INEFFECTIVE": 0.0,
+}
+# A control whose effectiveness hasn't been recorded yet is credited as
+# partially effective so simply adding it visibly moves the residual.
+DEFAULT_EFFECTIVENESS_FACTOR = 0.6
+
+
+def _axis_reduction(contribs: list[float]) -> int:
+    """Diminishing-returns aggregate of per-control reductions on one axis:
+    the strongest control counts in full, each additional one at half weight."""
+    xs = sorted((c for c in contribs if c > 0), reverse=True)
+    if not xs:
+        return 0
+    total = xs[0] + 0.5 * sum(xs[1:])
+    return int(total + 0.5)  # round half up (matches JS Math.floor(x + 0.5))
+
+
+def _suggest_residual_scores(
+    initial_l: int, initial_s: int, controls: list[HiraEntryControl]
+) -> tuple[int, int]:
+    """Derive (residualLikelihoodScore, residualSeverityScore) from the control set."""
+    l_contribs: list[float] = []
+    s_contribs: list[float] = []
+    for c in controls:
+        base = CONTROL_REDUCTION.get((c.hierarchy or "").upper())
+        if not base:
+            continue
+        if c.effectiveness:
+            factor = EFFECTIVENESS_FACTOR.get(c.effectiveness, DEFAULT_EFFECTIVENESS_FACTOR)
+        else:
+            factor = DEFAULT_EFFECTIVENESS_FACTOR
+        l_contribs.append(base[0] * factor)
+        s_contribs.append(base[1] * factor)
+    rl = max(1, initial_l - _axis_reduction(l_contribs))
+    rs = max(1, initial_s - _axis_reduction(s_contribs))
+    return rl, rs
+
+
+async def _load_matrix_scales(
+    db: AsyncSession, matrix_id: str
+) -> tuple[list[RiskMatrixCell], dict[int, RiskMatrixLikelihood], dict[int, RiskMatrixSeverity]]:
+    """Load the cells + score→row maps for a matrix, used to map derived scores
+    back to likelihood/severity ids and a risk cell."""
+    cells = list(
+        (await db.execute(select(RiskMatrixCell).where(RiskMatrixCell.matrixId == matrix_id))).scalars().all()
+    )
+    liks = {
+        l.score: l
+        for l in (
+            await db.execute(select(RiskMatrixLikelihood).where(RiskMatrixLikelihood.matrixId == matrix_id))
+        ).scalars().all()
+    }
+    sevs = {
+        s.score: s
+        for s in (
+            await db.execute(select(RiskMatrixSeverity).where(RiskMatrixSeverity.matrixId == matrix_id))
+        ).scalars().all()
+    }
+    return cells, liks, sevs
+
+
+def _apply_residual_from_controls(
+    entry: HiraEntry,
+    controls: list[HiraEntryControl],
+    cells: list[RiskMatrixCell],
+    likelihoods_by_score: dict[int, RiskMatrixLikelihood],
+    severities_by_score: dict[int, RiskMatrixSeverity],
+) -> None:
+    """Compute the derived residual and set the residual L/S (+ score/level/color)
+    on the entry. No-op if the derived scores can't be mapped to matrix rows."""
+    rl, rs = _suggest_residual_scores(
+        entry.initialLikelihoodScore, entry.initialSeverityScore, controls
+    )
+    lk = likelihoods_by_score.get(rl)
+    sv = severities_by_score.get(rs)
+    if lk is None or sv is None:
+        return
+    cell = next((c for c in cells if c.likelihoodScore == rl and c.severityScore == rs), None)
+    entry.residualLikelihoodId = lk.id
+    entry.residualLikelihoodScore = rl
+    entry.residualSeverityId = sv.id
+    entry.residualSeverityScore = rs
+    entry.residualRiskScore = cell.riskScore if cell else rl * rs
+    entry.residualRiskLevel = cell.riskLevel if cell else _derive_level(rl * rs)
+    entry.residualRiskColor = cell.colorHex if cell else None
+
+
 @router.patch("/entries/{entry_id}", response_model=HiraEntryOut)
 async def update_entry(
     entry_id: str,
     payload: HiraEntryUpdate,
     change_reason: str | None = Query(None, alias="changeReason"),
-    change_trigger: str = Query("CORRECTION", alias="changeTrigger"),
+    # No default: an explicit trigger (SCHEDULED_REVIEW, INCIDENT_REVIEW, MOC …)
+    # is honoured, and its absence means "classify this edit for me". The old
+    # "CORRECTION" default made every version indistinguishable.
+    change_trigger: str | None = Query(None, alias="changeTrigger"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> HiraEntryOut:
     stmt = (
         select(HiraEntry)
         .where(HiraEntry.id == entry_id)
-        .options(selectinload(HiraEntry.study))
+        .options(
+            selectinload(HiraEntry.study),
+            selectinload(HiraEntry.existingControls),
+        )
     )
     entry = (await db.execute(stmt)).scalar_one_or_none()
     if entry is None:
@@ -937,7 +1488,19 @@ async def update_entry(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
 
+    # Capture the risk-bearing state BEFORE any recompute mutates the entry.
+    # (The versioning block's "pre-edit snapshot" re-selects the same
+    # identity-mapped object, so it is already post-mutation for these fields
+    # and cannot be used for the comparison.)
+    before_fingerprint = _risk_fingerprint(entry)
+    before_scalars = _material_scalars(entry)
+
     data = payload.model_dump(exclude_unset=True)
+
+    # Matrix drives risk levels, the ALARP band map, and the legacy per-routine
+    # acceptable-residual threshold. Loaded once and reused below.
+    matrix = await db.get(RiskMatrix, entry.study.riskMatrixId)
+    alarp_bands = matrix.alarpBands if matrix else None
 
     # If initial L/S changed, recompute risk
     if "initialLikelihoodId" in data or "initialSeverityId" in data:
@@ -964,11 +1527,26 @@ async def update_entry(
         entry.initialRiskScore = cell.riskScore if cell else l.score * s.score
         entry.initialRiskLevel = cell.riskLevel if cell else _derive_level(l.score * s.score)
         entry.initialRiskColor = cell.colorHex if cell else None
+        entry.initialAlarpRegion = _alarp_region(entry.initialRiskLevel, alarp_bands)
         data.pop("initialLikelihoodId", None)
         data.pop("initialSeverityId", None)
 
-    # Residual recompute
-    if "residualLikelihoodId" in data or "residualSeverityId" in data:
+    # Residual mode — auto-calculated from controls, or manually overridden.
+    if "residualAutoCalculated" in data:
+        entry.residualAutoCalculated = data.pop("residualAutoCalculated")
+    auto_residual = entry.residualAutoCalculated is True
+
+    if auto_residual:
+        # Derive the residual from the entry's existing controls. Any residual
+        # L/S the client sent is ignored while in auto mode.
+        cells, liks_by_score, sevs_by_score = await _load_matrix_scales(db, entry.study.riskMatrixId)
+        _apply_residual_from_controls(
+            entry, list(entry.existingControls), cells, liks_by_score, sevs_by_score
+        )
+        data.pop("residualLikelihoodId", None)
+        data.pop("residualSeverityId", None)
+    # Manual residual recompute
+    elif "residualLikelihoodId" in data or "residualSeverityId" in data:
         # Only clear all residual fields if BOTH are explicitly set to None
         both_null = (
             "residualLikelihoodId" in data and data["residualLikelihoodId"] is None
@@ -986,6 +1564,11 @@ async def update_entry(
             entry.residualRiskLevel = None
             entry.residualRiskColor = None
             entry.residualAcceptable = None
+            # ALARP is moot with no residual — clear region, status and sign-off.
+            entry.residualAlarpRegion = None
+            entry.alarpStatus = None
+            entry.alarpDemonstratedById = None
+            entry.alarpDemonstratedAt = None
         elif l_id and s_id:
             l = await db.get(RiskMatrixLikelihood, l_id)
             s = await db.get(RiskMatrixSeverity, s_id)
@@ -1001,8 +1584,6 @@ async def update_entry(
                     .where(RiskMatrixCell.severityScore == s.score)
                 )
             ).scalar_one_or_none()
-            matrix = await db.get(RiskMatrix, entry.study.riskMatrixId)
-            threshold = (matrix.acceptableResidual or {}).get((entry.routine or "ROUTINE").lower()) if matrix else None
             residual_level = cell.riskLevel if cell else _derive_level(l.score * s.score)
             entry.residualLikelihoodId = l.id
             entry.residualLikelihoodScore = l.score
@@ -1011,11 +1592,62 @@ async def update_entry(
             entry.residualRiskScore = cell.riskScore if cell else l.score * s.score
             entry.residualRiskLevel = residual_level
             entry.residualRiskColor = cell.colorHex if cell else None
-            entry.residualAcceptable = (
-                _acceptability_ok(residual_level, threshold) if threshold else None
-            )
+            # residualAcceptable + ALARP region/status computed post-setattr,
+            # once the ALARP demonstration fields in the payload are applied.
         data.pop("residualLikelihoodId", None)
         data.pop("residualSeverityId", None)
+
+    # Target (forecast) risk — the projected residual once the recommended
+    # additional controls land. Hand-picked on the matrix; its ALARP region is
+    # computed so the register/editor can show the Initial→Residual→Target path.
+    if "targetLikelihoodId" in data or "targetSeverityId" in data:
+        both_null = (
+            "targetLikelihoodId" in data and data["targetLikelihoodId"] is None
+            and "targetSeverityId" in data and data["targetSeverityId"] is None
+        )
+        t_l_id = data.get("targetLikelihoodId") if "targetLikelihoodId" in data else entry.targetLikelihoodId
+        t_s_id = data.get("targetSeverityId") if "targetSeverityId" in data else entry.targetSeverityId
+        if both_null:
+            entry.targetLikelihoodId = None
+            entry.targetLikelihoodScore = None
+            entry.targetSeverityId = None
+            entry.targetSeverityScore = None
+            entry.targetRiskScore = None
+            entry.targetRiskLevel = None
+            entry.targetRiskColor = None
+            entry.targetAlarpRegion = None
+        elif t_l_id and t_s_id:
+            tl = await db.get(RiskMatrixLikelihood, t_l_id)
+            ts = await db.get(RiskMatrixSeverity, t_s_id)
+            if not tl or tl.matrixId != entry.study.riskMatrixId:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid targetLikelihoodId")
+            if not ts or ts.matrixId != entry.study.riskMatrixId:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid targetSeverityId")
+            tcell = (
+                await db.execute(
+                    select(RiskMatrixCell)
+                    .where(RiskMatrixCell.matrixId == entry.study.riskMatrixId)
+                    .where(RiskMatrixCell.likelihoodScore == tl.score)
+                    .where(RiskMatrixCell.severityScore == ts.score)
+                )
+            ).scalar_one_or_none()
+            t_level = tcell.riskLevel if tcell else _derive_level(tl.score * ts.score)
+            entry.targetLikelihoodId = tl.id
+            entry.targetLikelihoodScore = tl.score
+            entry.targetSeverityId = ts.id
+            entry.targetSeverityScore = ts.score
+            entry.targetRiskScore = tcell.riskScore if tcell else tl.score * ts.score
+            entry.targetRiskLevel = t_level
+            entry.targetRiskColor = tcell.colorHex if tcell else None
+            entry.targetAlarpRegion = _alarp_region(t_level, alarp_bands)
+        data.pop("targetLikelihoodId", None)
+        data.pop("targetSeverityId", None)
+
+    # Classify the edit before versioning — the verdict decides both the
+    # version's changeTrigger and whether the approval survives.
+    is_material, material_reasons = _classify_entry_change(
+        entry, before_fingerprint, before_scalars, data
+    )
 
     # Versioning — if approved/active study OR not v1, snapshot before mutating
     needs_version = entry.study.status in ("APPROVED", "ACTIVE") or entry.versionNumber > 1
@@ -1037,13 +1669,7 @@ async def update_entry(
             )
         )
         snap_entry = (await db.execute(snapshot_stmt)).scalar_one()
-        snapshot_dict = {
-            "entry": {
-                k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                for k, v in snap_entry.__dict__.items()
-                if not k.startswith("_") and not isinstance(v, list)
-            }
-        }
+        snapshot_dict = {"entry": _entry_snapshot(snap_entry)}
         changes = []
         for field, new_val in data.items():
             old_val = getattr(entry, field, None)
@@ -1053,18 +1679,21 @@ async def update_entry(
                     "from": str(old_val) if old_val is not None else None,
                     "to": str(new_val) if new_val is not None else None,
                 })
+        if material_reasons:
+            changes.append({"materiality": MATERIAL_TRIGGER, "signals": material_reasons})
+        archive_number = await _archive_version_number(db, entry)
         db.add(
             HiraVersion(
                 entryId=entry.id,
-                versionNumber=entry.versionNumber,
+                versionNumber=archive_number,
                 snapshot=snapshot_dict,
                 changes=changes,
                 changeReason=change_reason,
-                changeTrigger=change_trigger,
+                changeTrigger=_resolve_change_trigger(change_trigger, is_material),
                 createdById=user.id,
             )
         )
-        entry.versionNumber += 1
+        entry.versionNumber = archive_number + 1
 
     # Apply remaining scalar fields (protected fields cannot be patched via PATCH)
     ENTRY_PROTECTED_FIELDS = {"status", "versionNumber", "isCurrentVersion"}
@@ -1072,6 +1701,24 @@ async def update_entry(
         if k in ENTRY_PROTECTED_FIELDS:
             continue
         setattr(entry, k, v)
+
+    # Recompute ALARP banding + acceptability from the now-current residual
+    # level, routine and demonstration fields. Runs whenever a residual exists
+    # (covers residual-changed, routine-changed, and ALARP-fields-only edits).
+    if entry.residualRiskLevel:
+        region = _alarp_region(entry.residualRiskLevel, alarp_bands)
+        threshold = (matrix.acceptableResidual or {}).get((entry.routine or "ROUTINE").lower()) if matrix else None
+        _evaluate_alarp(entry, region, threshold, user.id)
+    else:
+        entry.residualAlarpRegion = None
+        entry.alarpStatus = None
+
+    # A material change invalidates the approval it was made under. `status` is
+    # in ENTRY_PROTECTED_FIELDS so a client can never drive this itself — the
+    # transition is server-side only, and re-approval goes back through
+    # POST /entries/{id}/approve under HIRA.APPROVE.
+    _apply_reapproval(entry, is_material)
+
     entry.updatedById = user.id
 
     await db.flush()
@@ -1081,14 +1728,30 @@ async def update_entry(
         select(HiraEntry)
         .where(HiraEntry.id == entry.id)
         .options(
-            selectinload(HiraEntry.hazards),
+            selectinload(HiraEntry.hazards).selectinload(HiraEntryHazard.hazard),
             selectinload(HiraEntry.existingControls),
             selectinload(HiraEntry.recommendedControls),
             selectinload(HiraEntry.regulationRefs),
+            # HiraEntryOut declares `capas`, so omitting it here left Pydantic
+            # to lazy-load on an async session — MissingGreenlet, i.e. the PATCH
+            # response blew up after the write had already been flushed.
+            selectinload(HiraEntry.capas),
         )
     )
     entry = (await db.execute(refresh_stmt)).scalar_one()
-    return HiraEntryOut.model_validate(entry)
+
+    # Denormalise the hazard library fields the same way get_entry does, so a
+    # save returns the same shape a fresh load would.
+    out = HiraEntryOut.model_validate(entry).model_dump()
+    for i, hz in enumerate(out["hazards"]):
+        src_hz = entry.hazards[i]
+        if src_hz.hazard is not None:
+            hz["hazardCode"] = src_hz.hazard.code
+            hz["hazardCategory"] = src_hz.hazard.category
+            hz["hazardName"] = src_hz.hazard.name
+            hz["hazardRequiresPermit"] = bool(src_hz.hazard.requiresPermit)
+            hz["hazardPermitTypes"] = src_hz.hazard.permitTypes or []
+    return HiraEntryOut(**out)
 
 
 
@@ -1147,10 +1810,81 @@ async def approve_entry(
     await require_permission_with_context(
         "HIRA.APPROVE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
-    if entry.status != "IN_REVIEW":
-        raise HTTPException(status.HTTP_409_CONFLICT, f"Entry must be IN_REVIEW to approve, current: {entry.status}")
+    if entry.status not in _APPROVABLE_ENTRY_STATUSES:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Entry must be IN_REVIEW or PENDING_REAPPROVAL to approve, current: {entry.status}",
+        )
+    # ALARP governance: an Unacceptable residual cannot be approved on the normal
+    # path. It must be reduced, OR authorised via the elevated, time-bounded
+    # override (POST /entries/{id}/override-unacceptable, HIRA.OVERRIDE_UNACCEPTABLE).
+    if entry.residualAlarpRegion == "UNACCEPTABLE" and not entry.unacceptableOverrideActive:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Residual risk is Unacceptable (ALARP): it cannot be approved. Reduce the residual with additional "
+            "controls, or obtain an elevated Unacceptable-risk override before approving.",
+        )
     entry.status = "APPROVED"
     entry.updatedById = user.id
+    await db.flush()
+    return await _get_entry_detail(entry_id, db)
+
+
+@router.post("/entries/{entry_id}/override-unacceptable", response_model=HiraEntryOut)
+async def override_unacceptable(
+    entry_id: str,
+    payload: HiraUnacceptableOverrideRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HiraEntryOut:
+    """Elevated, time-bounded authorisation to accept an Unacceptable residual.
+
+    Requires HIRA.OVERRIDE_UNACCEPTABLE (Plant Head / Corporate HSE tier), a
+    justification, and an expiry after which the review scheduler auto-flags the
+    entry. This is the ONLY way an Unacceptable residual can reach APPROVED, and
+    it replaces the old free-text 'acceptance rationale'. Recorded to
+    HiraVersion for the audit trail.
+    """
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.OVERRIDE_UNACCEPTABLE", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+    if entry.residualAlarpRegion != "UNACCEPTABLE":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Override applies only to an Unacceptable residual; this entry is "
+            f"{entry.residualAlarpRegion or 'unassessed'}.",
+        )
+
+    now = datetime.now(timezone.utc)
+    entry.unacceptableOverrideById = user.id
+    entry.unacceptableOverrideAt = now
+    entry.unacceptableOverrideJustification = payload.justification.strip()
+    entry.unacceptableOverrideExpiresAt = now + timedelta(days=payload.expiresInDays)
+    entry.updatedById = user.id
+
+    # Audit trail — the override is a governance decision, not a data edit.
+    archive_number = await _archive_version_number(db, entry)
+    db.add(
+        HiraVersion(
+            entryId=entry.id,
+            versionNumber=archive_number,
+            snapshot=_entry_snapshot(entry),
+            changes=[
+                {
+                    "action": "unacceptable_override",
+                    "expiresAt": entry.unacceptableOverrideExpiresAt.isoformat(),
+                    "justification": entry.unacceptableOverrideJustification,
+                }
+            ],
+            changeTrigger="UNACCEPTABLE_OVERRIDE",
+            changeReason=payload.justification.strip(),
+            createdById=user.id,
+        )
+    )
+    entry.versionNumber = archive_number + 1
     await db.flush()
     return await _get_entry_detail(entry_id, db)
 
@@ -1223,37 +1957,208 @@ async def update_capa(
     return HiraCapaOut.model_validate(capa)
 
 
+@router.get("/entries/{entry_id}/hazards/{row_id}/ptw-prefill", response_model=dict)
+async def hazard_ptw_prefill(
+    entry_id: str,
+    row_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Context for drafting a PTW from a permit-required hazard row.
+
+    Read-only: it does NOT create the permit. The PTW create screen consumes
+    this to pre-fill, and carries hiraEntryId/hiraEntryHazardId through to
+    permit creation so the link survives. Keeping the write on the PTW side
+    means the permit still goes through its own validation and numbering.
+    """
+    # select(), not db.get() — db.get() drops the eager-load options when the
+    # row is already in the identity map, which then lazy-loads under async.
+    row = (
+        await db.execute(
+            select(HiraEntryHazard)
+            .where(HiraEntryHazard.id == row_id)
+            .options(selectinload(HiraEntryHazard.hazard))
+        )
+    ).scalar_one_or_none()
+    if row is None or row.entryId != entry_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Hazard row not found on this entry")
+
+    entry = (
+        await db.execute(
+            select(HiraEntry)
+            .where(HiraEntry.id == entry_id)
+            .options(selectinload(HiraEntry.study), selectinload(HiraEntry.area))
+        )
+    ).scalar_one_or_none()
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.READ", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+
+    lib = row.hazard
+    if lib is None or not lib.requiresPermit:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This hazard is not flagged as permit-requiring in the hazard library.",
+        )
+
+    allowed = [t for t in (lib.permitTypes or []) if t in _PERMIT_TYPE_CODES]
+    suggested = allowed[0] if allowed else _CATEGORY_PERMIT_DEFAULT.get(lib.category)
+
+    scope_bits = [entry.activityDescription, lib.name]
+    if row.contextualDescription:
+        scope_bits.append(row.contextualDescription)
+
+    return {
+        "hiraEntryId": entry.id,
+        "hiraEntryHazardId": row.id,
+        "plantId": entry.study.plantId,
+        "areaId": entry.areaId,
+        "areaName": entry.area.name if entry.area else None,
+        "location": entry.subLocation or (entry.area.name if entry.area else ""),
+        "specificLocation": entry.subLocation,
+        "scopeOfWork": " — ".join(b for b in scope_bits if b),
+        "suggestedPermitType": suggested,
+        "allowedPermitTypes": allowed,
+        "hazardName": lib.name,
+        "hazardCategory": lib.category,
+        "consequence": row.consequence,
+        "residualRiskLevel": entry.residualRiskLevel,
+        "studyNumber": entry.study.number,
+    }
+
+
 @router.put("/entries/{entry_id}/hazards", response_model=dict)
 async def replace_entry_hazards(
     entry_id: str,
     payload: list[HiraEntryHazardReplaceItem],
+    change_reason: str | None = Query(None, alias="changeReason"),
+    skip_version: bool = Query(False, alias="skipVersion", description=_SKIP_VERSION_DOC),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
-    entry = await db.get(
-        HiraEntry, entry_id,
-        options=[selectinload(HiraEntry.study), selectinload(HiraEntry.hazards)],
-    )
+    # select() rather than db.get(): when the entry is already in the session's
+    # identity map, db.get() returns it and quietly DISCARDS the eager-load
+    # options, leaving entry.hazards to lazy-load and raise MissingGreenlet on
+    # an async session.
+    entry = (
+        await db.execute(
+            select(HiraEntry)
+            .where(HiraEntry.id == entry_id)
+            .options(selectinload(HiraEntry.study), selectinload(HiraEntry.hazards))
+        )
+    ).scalar_one_or_none()
     if entry is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
     await require_permission_with_context(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
-    # Delete existing hazards
-    for hz in entry.hazards:
-        await db.delete(hz)
-    await db.flush()
-    # Insert new hazards
-    for idx, h in enumerate(payload):
-        db.add(HiraEntryHazard(
+
+    existing_by_hazard = {hz.hazardId: hz for hz in entry.hazards}
+
+    # Consequence is required going forward (ISO 45001 cl.6.1.2.1 wants it as a
+    # distinct element). Rows already in the database with a NULL consequence
+    # are grandfathered — they can be re-saved untouched — but a NEW hazard row
+    # cannot omit it, and an existing populated value cannot be blanked out.
+    # No backfill is attempted here: retro-populating ~96 live rows is a data
+    # decision, not a code one.
+    missing: list[str] = []
+    for h in payload:
+        if (h.consequence or "").strip():
+            continue
+        prior = existing_by_hazard.get(h.hazardId)
+        if prior is None or (prior.consequence or "").strip():
+            missing.append(h.hazardId)
+    if missing:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Consequence is required for each hazard. Missing for hazardId(s): "
+            + ", ".join(missing),
+        )
+
+    before_hazards = _hazard_fingerprint(entry.hazards)
+    after_hazards = _hazard_fingerprint(payload)
+    is_material = before_hazards != after_hazards
+
+    needs_version = (
+        entry.study.status in ("APPROVED", "ACTIVE") or entry.versionNumber > 1
+    ) and not skip_version
+    if needs_version:
+        if not change_reason:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "changeReason is required when study is APPROVED or ACTIVE",
+            )
+        archive_number = await _archive_version_number(db, entry)
+        db.add(HiraVersion(
             entryId=entry.id,
-            hazardId=h.hazardId,
-            contextualDescription=h.contextualDescription,
-            consequence=h.consequence,
-            sortOrder=h.sortOrder if h.sortOrder is not None else idx,
+            versionNumber=archive_number,
+            snapshot=_entry_snapshot(entry),
+            changes=[
+                {
+                    "action": "hazards_replaced",
+                    "changeReason": change_reason,
+                    "materiality": MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+                }
+            ],
+            changeTrigger=MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+            changeReason=change_reason,
+            createdById=user.id,
         ))
+        entry.versionNumber = archive_number + 1
+        await db.flush()
+
+    # Reconcile in place rather than delete-and-reinsert: a hazard row's id is
+    # now referenced by Permit.hiraEntryHazardId, and a blanket delete would
+    # SET NULL those links on every unrelated save.
+    incoming_hazard_ids = {h.hazardId for h in payload}
+    for hazard_id, hz in existing_by_hazard.items():
+        if hazard_id not in incoming_hazard_ids:
+            await db.delete(hz)
+
+    # Library rows for the citation suggestion applied to newly added hazards.
+    new_hazard_ids = incoming_hazard_ids - set(existing_by_hazard)
+    lib_by_id: dict[str, HiraHazard] = {}
+    if new_hazard_ids:
+        lib_rows = (
+            await db.execute(select(HiraHazard).where(HiraHazard.id.in_(new_hazard_ids)))
+        ).scalars().all()
+        lib_by_id = {row.id: row for row in lib_rows}
+
+    for idx, h in enumerate(payload):
+        sort_order = h.sortOrder if h.sortOrder is not None else idx
+        row = existing_by_hazard.get(h.hazardId)
+        if row is not None:
+            row.contextualDescription = h.contextualDescription
+            if (h.consequence or "").strip():
+                row.consequence = h.consequence.strip()
+            row.regulationRef = (h.regulationRef or "").strip() or None
+            row.regulationSection = (h.regulationSection or "").strip() or None
+            row.sortOrder = sort_order
+        else:
+            suggested_ref, suggested_section = _suggest_hazard_regulation(
+                lib_by_id.get(h.hazardId)
+            )
+            db.add(HiraEntryHazard(
+                entryId=entry.id,
+                hazardId=h.hazardId,
+                contextualDescription=h.contextualDescription,
+                consequence=(h.consequence or "").strip() or None,
+                regulationRef=(h.regulationRef or "").strip() or suggested_ref,
+                regulationSection=(h.regulationSection or "").strip() or suggested_section,
+                sortOrder=sort_order,
+            ))
+
+    entry.updatedById = user.id
+    reapproval_required = _apply_reapproval(entry, is_material)
     await db.flush()
-    return {"count": len(payload)}
+    return {
+        "count": len(payload),
+        "material": is_material,
+        "reapprovalRequired": reapproval_required,
+        "entryStatus": entry.status,
+    }
 
 
 @router.put("/entries/{entry_id}/existing-controls")
@@ -1261,6 +2166,7 @@ async def replace_existing_controls(
     entry_id: str,
     payload: HiraEntryControlReplaceRequest,
     change_reason: str | None = Query(None, alias="changeReason"),
+    skip_version: bool = Query(False, alias="skipVersion", description=_SKIP_VERSION_DOC),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -1276,29 +2182,45 @@ async def replace_existing_controls(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
 
-    needs_version = entry.study.status in ("APPROVED", "ACTIVE")
-    if needs_version:
-        if not change_reason:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
-        snapshot = {k: v for k, v in entry.__dict__.items() if not k.startswith("_") and not isinstance(v, list)}
-        version = HiraVersion(
-            entryId=entry.id,
-            versionNumber=entry.versionNumber + 1,
-            isCurrentVersion=False,
-            snapshot=snapshot,
-            changes=[{"action": "controls_replaced", "changeReason": change_reason}],
-            changeTrigger="CONTROLS_UPDATED",
-            changeReason=change_reason,
-            changedById=user.id,
-        )
-        db.add(version)
-        entry.versionNumber += 1
-        await db.flush()
-
-    # Wholesale replace
+    # Read the current control set BEFORE the wholesale replace so the
+    # effectiveness comparison has something to compare against.
     existing = (
         await db.execute(select(HiraEntryControl).where(HiraEntryControl.entryId == entry_id))
     ).scalars().all()
+    before_controls = _control_effectiveness_fingerprint(existing)
+    after_controls = _control_effectiveness_fingerprint(payload.controls)
+    is_material = before_controls != after_controls
+
+    needs_version = entry.study.status in ("APPROVED", "ACTIVE") and not skip_version
+    if needs_version:
+        if not change_reason:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
+        archive_number = await _archive_version_number(db, entry)
+        version = HiraVersion(
+            entryId=entry.id,
+            versionNumber=archive_number,
+            snapshot=_entry_snapshot(entry),
+            changes=[
+                {
+                    "action": "controls_replaced",
+                    "changeReason": change_reason,
+                    "materiality": MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+                }
+            ],
+            # Was "CONTROLS_UPDATED" unconditionally; now reflects whether the
+            # control set's effectiveness actually moved.
+            changeTrigger=MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+            changeReason=change_reason,
+            # NOTE: this was `changedById`, which is not a column on HiraVersion
+            # — SQLAlchemy raised TypeError, so replacing controls on an
+            # APPROVED/ACTIVE study failed outright. Matches the PATCH handler.
+            createdById=user.id,
+        )
+        db.add(version)
+        entry.versionNumber = archive_number + 1
+        await db.flush()
+
+    # Wholesale replace
     for e in existing:
         await db.delete(e)
 
@@ -1329,7 +2251,44 @@ async def replace_existing_controls(
             .order_by(HiraEntryControl.sortOrder.asc())
         )
     ).scalars().all()
-    return {"controls": [{"id": r.id, "hierarchy": r.hierarchy, "description": r.description} for r in rows]}
+
+    # If the entry derives its residual from controls, recompute it now that the
+    # control set has changed, then re-evaluate ALARP + acceptability.
+    residual: dict | None = None
+    if entry.residualAutoCalculated is True:
+        matrix = await db.get(RiskMatrix, entry.study.riskMatrixId)
+        cells, liks_by_score, sevs_by_score = await _load_matrix_scales(db, entry.study.riskMatrixId)
+        _apply_residual_from_controls(entry, list(rows), cells, liks_by_score, sevs_by_score)
+        if entry.residualRiskLevel:
+            region = _alarp_region(entry.residualRiskLevel, matrix.alarpBands if matrix else None)
+            threshold = (
+                (matrix.acceptableResidual or {}).get((entry.routine or "ROUTINE").lower()) if matrix else None
+            )
+            _evaluate_alarp(entry, region, threshold, user.id)
+        await db.flush()
+        residual = {
+            "residualLikelihoodScore": entry.residualLikelihoodScore,
+            "residualSeverityScore": entry.residualSeverityScore,
+            "residualRiskScore": entry.residualRiskScore,
+            "residualRiskLevel": entry.residualRiskLevel,
+            "residualRiskColor": entry.residualRiskColor,
+            "residualAcceptable": entry.residualAcceptable,
+            "residualAlarpRegion": entry.residualAlarpRegion,
+            "alarpStatus": entry.alarpStatus,
+        }
+
+    # Control effectiveness feeds the residual; a change to it invalidates the
+    # approval the residual was signed off under.
+    reapproval_required = _apply_reapproval(entry, is_material)
+    await db.flush()
+
+    return {
+        "controls": [{"id": r.id, "hierarchy": r.hierarchy, "description": r.description} for r in rows],
+        "residual": residual,
+        "material": is_material,
+        "reapprovalRequired": reapproval_required,
+        "entryStatus": entry.status,
+    }
 
 
 @router.put("/entries/{entry_id}/recommended-controls")
@@ -1337,6 +2296,7 @@ async def replace_recommended_controls(
     entry_id: str,
     payload: HiraEntryRecommendedControlReplaceRequest,
     change_reason: str | None = Query(None, alias="changeReason"),
+    skip_version: bool = Query(False, alias="skipVersion", description=_SKIP_VERSION_DOC),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
@@ -1352,25 +2312,6 @@ async def replace_recommended_controls(
         "HIRA.UPDATE", user, db, plant_id=entry.study.plantId, record_id=entry.id
     )
 
-    needs_version = entry.study.status in ("APPROVED", "ACTIVE")
-    if needs_version:
-        if not change_reason:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
-        snapshot = {k: v for k, v in entry.__dict__.items() if not k.startswith("_") and not isinstance(v, list)}
-        version = HiraVersion(
-            entryId=entry.id,
-            versionNumber=entry.versionNumber + 1,
-            isCurrentVersion=False,
-            snapshot=snapshot,
-            changes=[{"action": "controls_replaced", "changeReason": change_reason}],
-            changeTrigger="CONTROLS_UPDATED",
-            changeReason=change_reason,
-            changedById=user.id,
-        )
-        db.add(version)
-        entry.versionNumber += 1
-        await db.flush()
-
     existing = (
         await db.execute(
             select(HiraEntryRecommendedControl).where(
@@ -1378,6 +2319,38 @@ async def replace_recommended_controls(
             )
         )
     ).scalars().all()
+    # A proposal moving PROPOSED → IMPLEMENTED / REJECTED (or appearing /
+    # disappearing) changes the ALARP argument; editing its rationale does not.
+    before_recommended = _recommended_status_fingerprint(existing)
+    after_recommended = _recommended_status_fingerprint(payload.controls)
+    is_material = before_recommended != after_recommended
+
+    needs_version = entry.study.status in ("APPROVED", "ACTIVE") and not skip_version
+    if needs_version:
+        if not change_reason:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "changeReason is required when study is APPROVED or ACTIVE")
+        archive_number = await _archive_version_number(db, entry)
+        version = HiraVersion(
+            entryId=entry.id,
+            versionNumber=archive_number,
+            snapshot=_entry_snapshot(entry),
+            changes=[
+                {
+                    "action": "recommended_controls_replaced",
+                    "changeReason": change_reason,
+                    "materiality": MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+                }
+            ],
+            changeTrigger=MATERIAL_TRIGGER if is_material else MINOR_TRIGGER,
+            changeReason=change_reason,
+            # Was `changedById` + `isCurrentVersion`, neither of which exists on
+            # HiraVersion — this path raised TypeError before ever committing.
+            createdById=user.id,
+        )
+        db.add(version)
+        entry.versionNumber = archive_number + 1
+        await db.flush()
+
     incoming_ids = {c.id for c in payload.controls if c.id and not c.id.startswith("new-")}
 
     # Delete rows not in incoming AND not linked to a CAPA (preserves linked rows)
@@ -1398,6 +2371,10 @@ async def replace_recommended_controls(
             row.proposedImplementationDate = c.proposedImplementationDate
             row.responsibleId = c.responsibleId
             row.status = c.status
+            row.evidenceAttached = c.evidenceAttached
+            # Clearing the checkbox clears the reference, mirroring how
+            # Section 4's existing-control evidence pair behaves.
+            row.documentReference = c.documentReference if c.evidenceAttached else None
         else:
             db.add(
                 HiraEntryRecommendedControl(
@@ -1411,10 +2388,13 @@ async def replace_recommended_controls(
                     proposedImplementationDate=c.proposedImplementationDate,
                     responsibleId=c.responsibleId,
                     status=c.status,
+                    evidenceAttached=c.evidenceAttached,
+                    documentReference=c.documentReference if c.evidenceAttached else None,
                 )
             )
 
     entry.updatedById = user.id
+    reapproval_required = _apply_reapproval(entry, is_material)
     await db.flush()
 
     rows = (
@@ -1424,7 +2404,12 @@ async def replace_recommended_controls(
             .order_by(HiraEntryRecommendedControl.createdAt.asc())
         )
     ).scalars().all()
-    return {"controls": [{"id": r.id, "hierarchy": r.hierarchy, "status": r.status} for r in rows]}
+    return {
+        "controls": [{"id": r.id, "hierarchy": r.hierarchy, "status": r.status} for r in rows],
+        "material": is_material,
+        "reapprovalRequired": reapproval_required,
+        "entryStatus": entry.status,
+    }
 
 
 @router.put("/entries/{entry_id}/regulation-refs")
@@ -1782,7 +2767,7 @@ async def for_flra(
         .where(HiraStudy.plantId == plant_id)
         .where(HiraStudy.status == "ACTIVE")
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
     )
     if area_id:
         stmt = stmt.where(HiraEntry.areaId == area_id)
@@ -1812,7 +2797,7 @@ async def for_ptw(
         .where(HiraStudy.plantId == plant_id)
         .where(HiraStudy.status == "ACTIVE")
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
     )
     if area_id:
         base = base.where(HiraEntry.areaId == area_id)
@@ -1845,7 +2830,7 @@ async def for_ptw(
 
     sorted_entries = sorted(
         by_id.values(),
-        key=lambda x: (x[0].residualRiskScore or x[0].initialRiskScore or 0),
+        key=lambda x: (x[0].residualRiskScore or x[0].initialRiskScore),
         reverse=True,
     )
     entries = [_serialize_integration_entry(e, s) for e, s in sorted_entries]
@@ -1879,7 +2864,7 @@ async def for_inspection(
         .where(HiraStudy.plantId == plant_id)
         .where(HiraStudy.status == "ACTIVE")
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
     )
     if area_id:
         stmt = stmt.where(HiraEntry.areaId == area_id)
@@ -1973,6 +2958,10 @@ async def export_study_csv(
             "Routine",
             "Frequency",
             "Hazards",
+            # Hazard-grain ISO 45001 cl.6.1.2.1 elements, kept next to the
+            # hazards they belong to and separate from the entry-level refs.
+            "Consequences",
+            "Hazard Reg Refs",
             "Init L",
             "Init S",
             "Init Risk",
@@ -1982,9 +2971,14 @@ async def export_study_csv(
             "Resid S",
             "Resid Risk",
             "Resid Level",
+            "ALARP Region",
+            "ALARP Status",
             "Acceptable",
+            "Target Level",
+            "Target ALARP",
             "Recommended",
-            "Reg Refs",
+            "Recommended Evidence",
+            "Reg Refs (entry)",
             "Status",
         ]
     )
@@ -1998,6 +2992,17 @@ async def export_study_csv(
                 e.routine,
                 e.frequency,
                 "; ".join(f"{h.hazard.name if h.hazard else '(deleted)'} [{h.hazard.category if h.hazard else '?'}]" for h in e.hazards),
+                "; ".join(
+                    f"{h.hazard.name if h.hazard else 'Hazard'}: "
+                    f"{(h.consequence or '').strip() or '— not recorded —'}"
+                    for h in e.hazards
+                ),
+                "; ".join(
+                    f"{h.hazard.name if h.hazard else 'Hazard'}: "
+                    f"{' '.join(x for x in (h.regulationRef, h.regulationSection) if x)}"
+                    for h in e.hazards
+                    if h.regulationRef or h.regulationSection
+                ),
                 str(e.initialLikelihoodScore),
                 str(e.initialSeverityScore),
                 str(e.initialRiskScore),
@@ -2007,8 +3012,17 @@ async def export_study_csv(
                 str(e.residualSeverityScore) if e.residualSeverityScore is not None else "",
                 str(e.residualRiskScore) if e.residualRiskScore is not None else "",
                 e.residualRiskLevel or "",
+                (e.residualAlarpRegion or "").replace("_", " ").title(),
+                (e.alarpStatus or "").replace("_", " ").title(),
                 "" if e.residualAcceptable is None else ("Yes" if e.residualAcceptable else "No"),
+                e.targetRiskLevel or "",
+                (e.targetAlarpRegion or "").replace("_", " ").title(),
                 "; ".join(f"[{c.status}] {c.hierarchy}: {c.description}" for c in e.recommendedControls),
+                "; ".join(
+                    f"{c.hierarchy}: {c.documentReference or 'evidence on file'}"
+                    for c in e.recommendedControls
+                    if c.evidenceAttached or c.documentReference
+                ),
                 "; ".join(f"{r.regulation} {r.section or ''}".strip() for r in e.regulationRefs),
                 e.status,
             ]
@@ -2075,7 +3089,7 @@ async def dashboard_high_risk(
         .select_from(HiraEntry)
         .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
     )
     if accessible is not None:
         if not accessible:
@@ -2101,7 +3115,7 @@ async def dashboard_risk_reduction(
         select(HiraEntry.initialRiskScore, HiraEntry.residualRiskScore)
         .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "PENDING_REAPPROVAL"]))
     )
     if accessible is not None:
         if not accessible:
@@ -2133,7 +3147,7 @@ async def dashboard_top_hazards(
         .join(HiraEntry, HiraEntryHazard.entryId == HiraEntry.id)
         .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
         .where(HiraEntry.isCurrentVersion.is_(True))
-        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+        .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
         .group_by(HiraHazard.category)
         .order_by(func.count(HiraEntryHazard.id).desc())
         .limit(5)
@@ -2177,7 +3191,7 @@ async def cron_review_scheduler(
             select(HiraEntry, HiraStudy)
             .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
             .where(HiraEntry.isCurrentVersion.is_(True))
-            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE"]))
+            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "PENDING_REAPPROVAL"]))
             .where(HiraEntry.nextReviewDue.is_not(None))
             .where(HiraEntry.nextReviewDue <= in30)
             .where(HiraEntry.nextReviewDue >= now)
@@ -2212,7 +3226,7 @@ async def cron_review_scheduler(
         await db.execute(
             select(HiraEntry.id)
             .where(HiraEntry.isCurrentVersion.is_(True))
-            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE"]))
+            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "PENDING_REAPPROVAL"]))
             .where(
                 HiraEntry.id.in_(
                     select(HiraReviewCycle.entryId)
@@ -2237,7 +3251,7 @@ async def cron_review_scheduler(
             select(HiraEntry, HiraStudy)
             .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
             .where(HiraEntry.isCurrentVersion.is_(True))
-            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW"]))
+            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "FLAGGED_FOR_REVIEW", "PENDING_REAPPROVAL"]))
             .where(HiraEntry.nextReviewDue.is_not(None))
             .where(HiraEntry.nextReviewDue < now)
             .where(
@@ -2266,6 +3280,26 @@ async def cron_review_scheduler(
             stats["forced_overdue"] += 1
         except Exception as e:
             stats["errors"].append(f"Overdue entry {entry.id}: {e}")
+
+    # Expired Unacceptable-risk overrides: the time-bounded authorisation has
+    # lapsed. Void the override and flag the entry so an Unacceptable residual
+    # can never sit approved on a stale override.
+    expired = (
+        await db.execute(
+            select(HiraEntry)
+            .where(HiraEntry.isCurrentVersion.is_(True))
+            .where(HiraEntry.unacceptableOverrideExpiresAt.is_not(None))
+            .where(HiraEntry.unacceptableOverrideExpiresAt < now)
+            .where(HiraEntry.unacceptableOverrideById.is_not(None))
+            .limit(500)
+        )
+    ).scalars().all()
+    stats["override_expired"] = 0
+    for entry in expired:
+        _clear_unacceptable_override(entry)
+        if entry.status in ("APPROVED", "ACTIVE"):
+            entry.status = "FLAGGED_FOR_REVIEW"
+        stats["override_expired"] += 1
 
     await db.flush()
     return {"success": True, "ranAt": now.isoformat(), "stats": stats}
@@ -2316,7 +3350,7 @@ async def cron_training_expiry(
             select(HiraEntry, HiraStudy)
             .join(HiraStudy, HiraEntry.studyId == HiraStudy.id)
             .where(HiraEntry.isCurrentVersion.is_(True))
-            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE"]))
+            .where(HiraEntry.status.in_(["APPROVED", "ACTIVE", "PENDING_REAPPROVAL"]))
             .where(HiraEntry.triggersTrainingProgramIds.is_not(None))
             .limit(2000)
         )
@@ -2372,9 +3406,14 @@ async def study_wizard_options(
     from app.models.masters import Department
     from app.models.plant import Area, Plant
 
-    check = await can(db, user.id, "HIRA.CREATE", PermissionContext())
-    if not check.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+    # Shared master-data endpoint: the HIRA new-study wizard AND every CAPA intake
+    # form (/capa/new/*) read it for the plant + user pickers. A CAPA creator
+    # (e.g. the CRO) often holds CAPA.CREATE but not HIRA.CREATE — gating only on
+    # HIRA.CREATE 403'd that call and crashed the CAPA pages. Accept either role.
+    hira_ok = (await can(db, user.id, "HIRA.CREATE", PermissionContext())).allowed
+    capa_ok = (await can(db, user.id, "CAPA.CREATE", PermissionContext())).allowed
+    if not (hira_ok or capa_ok):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
 
     accessible = await get_accessible_plants(db, user.id)
 
@@ -2564,3 +3603,19 @@ async def dashboard_review_compliance(
     return HiraDashboardReviewCompliance(
         overdue=overdue, dueSoon30Days=due_soon, completedLast90Days=completed_90
     )
+
+
+# ── P2-7 ISO 45001 §8.1.2 control-hierarchy validation (soft warning) ─────────
+@router.post("/validate-control-hierarchy")
+async def validate_control_hierarchy_endpoint(
+    payload: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return ISO 45001 §8.1.2 hierarchy warnings for a set of control types.
+    Soft (non-blocking) — the form shows warnings; the assessor acknowledges to save."""
+    from app.services.iso_validation import validate_control_hierarchy
+    control_types = payload.get("controlTypes") or []
+    enforce = payload.get("enforce", True)
+    warnings = validate_control_hierarchy(control_types, enforce=enforce)
+    return {"warnings": warnings, "ok": len(warnings) == 0}

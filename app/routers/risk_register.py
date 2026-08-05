@@ -11,16 +11,19 @@ the source modules.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
+from app.core.deps import get_current_user
 from app.models.eai import EaiEntry, EaiFeatureFlag, EaiStudy
 from app.models.hira import HiraEntry, HiraStudy
+from app.models.user import User
+from app.services.access_scope import build_query_scope
 
 router = APIRouter(prefix="/api/risk-register", tags=["risk-register"])
 
@@ -63,7 +66,11 @@ async def get_combined_register(
     type_: Literal["all", "hira", "eai"] = Query("all", alias="type"),
     significantOnly: bool = Query(False),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    scope = await build_query_scope(db, user.id, "RISK.COMBINED_VIEW")
+    if not scope.allows_plant(plantId):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied for this plant")
     items: list[CombinedRegisterRow] = []
     hira_total = 0
     eai_total = 0

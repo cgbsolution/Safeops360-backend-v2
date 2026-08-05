@@ -1,0 +1,749 @@
+[
+  {
+    "category_code": "HR",
+    "category_name": "Human Resources",
+    "category_color": "#7C3AED",
+    "category_icon": "users",
+    "sequence": 1,
+    "checkpoints": [
+      {
+        "code": "PI-HR-001",
+        "question": "Factory registration and licences (Shops & Establishments / Factories Act) are valid and up to date.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-002",
+        "question": "Employment contracts/appointment letters issued to all employees as per law.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-003",
+        "question": "Standing Orders or Employee Handbook available, displayed, and communicated.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-004",
+        "question": "Age proof documents maintained for all workers (Aadhaar, birth certificate, school records).",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-005",
+        "question": "No child labour policy in place and signed by management.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-006",
+        "question": "Workmen compensation / ESIC registration and compliance verified.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-007",
+        "question": "PF registration and compliance – Forms, challans, and employee enrolments.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-008",
+        "question": "Contractor compliance documents (RC, labour licence, wage registers) verified monthly.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-009",
+        "question": "Transparent recruitment process without discrimination or unfair fees.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-010",
+        "question": "Induction training conducted and recorded for all new hires.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-011",
+        "question": "Equal opportunity policy implemented (gender, caste, religion, disability).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-012",
+        "question": "No withholding of original documents (Aadhaar, certificates, bank cards).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-013",
+        "question": "No forced labour – freedom to resign, no deposits, no coercion.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-014",
+        "question": "Use of temporary/contract labour complies with the Contract Labour Act.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-015",
+        "question": "Wage structure complies with State Minimum Wages (skilled, semi-skilled categories).",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-016",
+        "question": "Timely payment of wages (within 7th or 10th as applicable).",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-017",
+        "question": "Overtime wages paid at double rate as per the Factories Act.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-018",
+        "question": "Accurate payroll records – attendance, deductions, hours worked.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-019",
+        "question": "Statutory deductions (PF, ESIC, PT) correctly calculated and deposited.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-020",
+        "question": "Payslips issued with all details of earnings and deductions.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-021",
+        "question": "No illegal deductions (production loss, fines without legal process).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-022",
+        "question": "Working hours comply with law (48 hrs/week, 9 hrs/day).",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-023",
+        "question": "Overtime limits follow legal norms (max 50–60 hrs/month depending on state).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-024",
+        "question": "Weekly off provided every 7th day.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-025",
+        "question": "Accurate timekeeping system (biometric/manual attendance).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-026",
+        "question": "Breaks provided as per law (rest intervals, lunch breaks).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-027",
+        "question": "Written HR policies (leave, discipline, harassment, grievance) are communicated.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-028",
+        "question": "POSH Committee formed as per the Sexual Harassment Act; training conducted.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-029",
+        "question": "Grievance mechanism available (suggestion boxes, hotline, HR contact).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-030",
+        "question": "Disciplinary procedures fair, documented, and non-abusive.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-031",
+        "question": "Union or worker committee meetings recorded.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-HR-032",
+        "question": "Worker welfare amenities (drinking water, toilets, dining area) adequate and hygienic.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-033",
+        "question": "Medical room / first-aid boxes maintained with trained first-aiders.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-034",
+        "question": "Personal protective equipment (PPE) issued and records maintained.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-035",
+        "question": "Fire safety training and mock drills documented for all staff.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-036",
+        "question": "Accident records & investigation reports maintained.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-037",
+        "question": "Maternity benefits provided (MB Act compliance, leave records).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-038",
+        "question": "Crèche facility provided if applicable (30 or more women workers).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-039",
+        "question": "Crèche Staff is appointed",
+        "criticality": "minor",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-HR-040",
+        "question": "Daily attendence register is maintained in the Crèche facility.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      }
+    ]
+  },
+  {
+    "category_code": "EHS",
+    "category_name": "Environment, Health & Safety",
+    "category_color": "#DC2626",
+    "category_icon": "shield",
+    "sequence": 2,
+    "checkpoints": [
+      {
+        "code": "PI-EHS-001",
+        "question": "Consent to Establish (CTE) / Consent to Operate (CTO) from the Pollution Control Board is valid.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-002",
+        "question": "Hazardous Waste Authorization (if applicable) maintained and compliant.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-003",
+        "question": "Air & Water pollution monitoring reports available and within permissible limits.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-004",
+        "question": "DG set emission and noise certificates updated.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-005",
+        "question": "Stack/effluent monitoring records maintained and submitted to authorities as required.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-006",
+        "question": "Waste segregation system implemented (hazardous, recyclable, general waste).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-007",
+        "question": "E-waste collection & disposal through authorized recyclers.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-008",
+        "question": "Chemical storage compliant with MSDS guidelines and labelled properly.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-009",
+        "question": "Spill control kits available near chemical handling areas.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-010",
+        "question": "Effluent Treatment Plant (ETP/STP) functional with logbooks maintained.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-011",
+        "question": "Water conservation measures implemented (metering, leak prevention).",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-012",
+        "question": "Energy conservation practices documented (LED, efficient motors).",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-013",
+        "question": "Record of waste disposal manifests (Form 10 for hazardous waste).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-014",
+        "question": "Fire extinguishers of appropriate types installed, serviced, and tagged.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-015",
+        "question": "Fire hydrant system/sprinklers maintained and pressure-tested.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-016",
+        "question": "Emergency exits unlocked, well-marked, illuminated, and unobstructed.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-017",
+        "question": "Fire alarm system functional with monitoring records.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-018",
+        "question": "Mock drills conducted and documented (twice/year recommended).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-019",
+        "question": "Trained fire wardens and emergency response team appointed.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-020",
+        "question": "Machine safety guards installed on all sewing/fabric cutting/finishing equipment.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-021",
+        "question": "Needle guard & eye guard present on sewing machines.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-022",
+        "question": "Lockout–Tagout (LOTO) procedure implemented for maintenance.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-023",
+        "question": "Electrical panels properly labelled, insulated, and with no exposed wires.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-024",
+        "question": "Safe storage of LPG/boilers/compressors with valid certificates.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-025",
+        "question": "Noise level monitoring conducted in high-noise areas.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-026",
+        "question": "Ventilation and lighting adequate in all work areas.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-027",
+        "question": "Housekeeping maintained – no debris, obstructed aisles, or blocked access.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-028",
+        "question": "Emergency evacuation plan displayed on all floors.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-029",
+        "question": "Material Safety Data Sheets (MSDS) available for all chemicals.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-030",
+        "question": "Chemical handling training provided to workers.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-031",
+        "question": "Bunded storage areas for chemicals and oils to prevent spills.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-032",
+        "question": "Proper labelling of all containers (hazard symbols, contents).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-033",
+        "question": "First-aid eyewash stations and showers available where chemicals are used.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-034",
+        "question": "First-aid boxes adequately stocked and accessible.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-035",
+        "question": "Medical room or tie-up with registered medical practitioner available as per law.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-036",
+        "question": "Accident & near-miss records maintained and investigated.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-037",
+        "question": "PPE distribution and usage monitored (masks, gloves, earplugs, safety shoes).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-EHS-038",
+        "question": "SOP for PPE is maintained",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-039",
+        "question": "SOP for PPE is updated as per requirements",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-EHS-040",
+        "question": "Periodic health check-ups conducted for workers as required by law.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      }
+    ]
+  },
+  {
+    "category_code": "PRODUCTION",
+    "category_name": "Production",
+    "category_color": "#EA580C",
+    "category_icon": "cog",
+    "sequence": 3,
+    "checkpoints": [
+      {
+        "code": "PI-PR-001",
+        "question": "Workstations arranged ergonomically (proper seating, adjustable chairs, footrests).",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-002",
+        "question": "Aisles and evacuation routes clearly marked and unobstructed.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-003",
+        "question": "Emergency exits unlocked during working hours.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-004",
+        "question": "Sufficient ventilation (fans, exhaust, cross-ventilation, HVAC where required).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-005",
+        "question": "Adequate lighting across sewing, cutting, finishing, and packing areas.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-006",
+        "question": "Machine guards (needle guards, belt guards, cutting machine guards) installed and functional.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-007",
+        "question": "Sharp tool management (scissors, cutters issued & logged).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-008",
+        "question": "Fabric cutting tables maintained safely with no electrical hazards.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-009",
+        "question": "Ironing and steam stations have insulated pipes and emergency shut-offs.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-010",
+        "question": "Noise control measures in high-noise machinery areas.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-011",
+        "question": "Mandatory PPE use (masks, gloves, aprons, safety shoes where applicable).",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-012",
+        "question": "No loose clothing or accessories near moving machinery.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-013",
+        "question": "Safe load handling practices followed for lifting and material movement.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-014",
+        "question": "Chemical usage (spot cleaning) done with proper ventilation and PPE.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-015",
+        "question": "Fire extinguishers accessible and workers trained to use them.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-016",
+        "question": "Production targets not set at levels that encourage unsafe speed or excessive overtime.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-017",
+        "question": "Supervisor conduct training completed and documented.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-018",
+        "question": "Material movement safe and organized (trolleys used; no overloading).",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-019",
+        "question": "Needle policy implemented (tracking, breakage logs, metal detection where required).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-020",
+        "question": "Machine maintenance logs updated (preventive maintenance schedule followed).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-021",
+        "question": "Calibration of critical equipment (scales, metal detectors, cutters) maintained.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-022",
+        "question": "Work-in-progress (WIP) areas organized to avoid clutter and fire risks.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-023",
+        "question": "Evacuation diagrams displayed at production floor entry/exit points.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-024",
+        "question": "Fire alarm points accessible with workers trained on their use.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-025",
+        "question": "Smoke detectors / sprinklers functional where installed.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-026",
+        "question": "Fire drills participation from production staff is recorded.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-027",
+        "question": "Quality checkpoints clearly defined (end-line, inline QA).",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-028",
+        "question": "Rework area separated and safely organized.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-029",
+        "question": "Use of safe chemicals only (spot cleaning chemicals approved by EHS team).",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-030",
+        "question": "Packaging materials stored properly to avoid fire hazards.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-031",
+        "question": "Production records accurate. No double books.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-032",
+        "question": "Buyer Code of Conduct displayed & communicated to production staff.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-033",
+        "question": "Production floors have adequate material flow mapping to prevent congestion or cross-traffic between cutting, sewing, and finishing sections.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-034",
+        "question": "Bottleneck areas identified and decongested to avoid crowding and unsafe working conditions.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-035",
+        "question": "Operators trained on machine start-up/shut-down procedures, and training logs maintained.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-036",
+        "question": "Visual management boards (output, defects, safety alerts) displayed and updated daily.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-037",
+        "question": "No sitting on tables, fabric bundles, or unsafe surfaces—clear discipline observed on the floor.",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      },
+      {
+        "code": "PI-PR-038",
+        "question": "Fans and overhead fixtures firmly secured with routine safety inspections.",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-039",
+        "question": "Electrical cords, plug points, and extension boards on the floor kept away from walkways and heat sources.",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY"
+      },
+      {
+        "code": "PI-PR-040",
+        "question": "Pressing/steam stations equipped with drip trays and insulated flooring to prevent slips or burns.",
+        "criticality": "major",
+        "requirement_type": "INTERNAL_REQUIREMENT"
+      }
+    ]
+  }
+]

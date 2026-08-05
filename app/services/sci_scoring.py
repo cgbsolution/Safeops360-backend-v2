@@ -113,3 +113,31 @@ async def sync_all(db: AsyncSession, *, plant_id: str, actor: str = "SYSTEM") ->
     await db.commit()
     total = sum(stats.values())
     return {"plantId": plant_id, "created": total, "byModule": stats}
+
+
+# ── P3-6 Safety Culture maturity bands (Hudson / Hearts-and-Minds) ───────────
+_MATURITY_BANDS = [
+    (0, 20, 1, "Pathological", "Why should we spend money unless we have to?"),
+    (21, 40, 2, "Reactive", "Managing safety like other business risks"),
+    (41, 60, 3, "Calculative", "Having systems in place to manage hazards"),
+    (61, 80, 4, "Proactive", "Working on problems we can still foresee"),
+    (81, 100, 5, "Generative", "Safety is how we do business around here"),
+]
+
+
+def maturity_band(score: float | None) -> dict[str, object] | None:
+    """Map a 0–100 SCI score to a Hudson maturity band (level, label, description)."""
+    if score is None:
+        return None
+    s = max(0, min(100, round(score)))
+    for lo, hi, level, label, desc in _MATURITY_BANDS:
+        if lo <= s <= hi:
+            return {"level": level, "label": label, "description": desc, "rangeLow": lo, "rangeHigh": hi}
+    return None
+
+
+def size_normalised_contribution(raw_score: float, headcount: int) -> float:
+    """Department SCI contribution normalised by sqrt(headcount) so a 400-person
+    department doesn't outweigh a 40-person one by 10× (P3-08)."""
+    import math
+    return round(raw_score / math.sqrt(max(1, headcount)), 2)

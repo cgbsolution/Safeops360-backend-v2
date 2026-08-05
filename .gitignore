@@ -12,3 +12,13 @@ venv/
 htmlcov/
 *.log
 .DS_Store
+
+# Licence Authority secrets — the PRIVATE signing key + issued-licence registry
+# must NEVER be committed or shipped in the client app (build prompt §2.1, §9).
+.licence_keys/
+*.private.pem
+licence_registry.json
+# Issued client licences are delivered out-of-band, not committed.
+clients/*.lic
+# The active deployment licence is environment state (issue one per install).
+/licence.lic

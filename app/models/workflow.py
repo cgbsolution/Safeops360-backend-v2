@@ -46,6 +46,8 @@ class Action(str, enum.Enum):
     ESCALATED = "ESCALATED"
     COMMENTED = "COMMENTED"
     SUSPENDED = "SUSPENDED"
+    # PTW closed-loop: operational cancellation (DB column is plain String).
+    CANCELLED = "CANCELLED"
 
 
 class WorkflowDefinition(Base, IdMixin):
@@ -156,6 +158,10 @@ class WorkflowTask(Base, IdMixin):
     completedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Prisma has a NOT NULL `priority` with default "NORMAL".
     priority: Mapped[str] = mapped_column(String, nullable=False, default="NORMAL")
+    # Inbox read state — null means the assignee has never opened the record.
+    # Mirrors Notification.readAt. One assignee per task, so this column alone
+    # is per-user read state.
+    readAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     instance: Mapped[WorkflowInstance] = relationship(back_populates="pendingTasks")
 

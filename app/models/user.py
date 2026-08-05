@@ -24,6 +24,15 @@ class User(Base, IdMixin):
     plantId: Mapped[str | None] = mapped_column(ForeignKey("Plant.id"))
     designation: Mapped[str | None] = mapped_column(String)
     department: Mapped[str | None] = mapped_column(String)
+    # ─── Safety-roster gate (Observation deroster workflow) ───
+    # active | pending_safety_review | derostered. Anything other than `active`
+    # excludes this person from NEW work assignment (PTW crew, mobilisation,
+    # gate clearance) — it never affects login or existing records. Set by
+    # services/observation_deroster.py only; see models/observation_sla.py.
+    rosterStatus: Mapped[str] = mapped_column(String, nullable=False, default="active", index=True)
+    # -> ObservationDeroster.id of the open flag holding this status, so the
+    # roster screens can deep-link to the reason rather than showing a dead badge.
+    currentDerosterRef: Mapped[str | None] = mapped_column(String)
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     plant: Mapped[Plant | None] = relationship(back_populates="users")
