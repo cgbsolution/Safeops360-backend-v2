@@ -207,9 +207,42 @@ class TemplateCustomCheckpointBody(BaseModel):
 
 
 class AllocateBody(BaseModel):
-    ownerId: str | None = None  # null = unassign
+    """Allocate a selection of checkpoints to an auditee, an auditor, or both.
+
+    `setOwner` / `setAuditor` say WHICH axis this call changes. They exist
+    because `ownerId: null` is a real instruction — unassign the auditee — and
+    a null alone cannot also mean "don't touch the auditee". Defaults keep the
+    original behaviour (owner-only) for existing callers.
+
+    A selection is `checkpointIds` (any set of rows, which is how a client
+    allocates individual checkpoints that cut across departments) and/or
+    `disciplineId` (the whole-discipline fast path). Both may be sent.
+    """
+
+    ownerId: str | None = None  # the AUDITEE; null = unassign
+    auditorId: str | None = None  # the AUDITOR who conducts it; null = the lead
+    setOwner: bool = True
+    setAuditor: bool = False
     checkpointIds: list[str] = []  # specific instances (per-row / bulk)
     disciplineId: str | None = None  # whole-discipline assign
+
+
+class TeamBody(BaseModel):
+    """Re-seat the audit team after the audit exists.
+
+    Every field is optional and only what is SENT is changed — naming auditees
+    cannot blank the co-auditors the call never mentioned. This is what lets the
+    auditees be filled in after the opening meeting, which is when they are
+    usually identified, without touching the rest of the cast.
+    """
+
+    coAuditors: list[CoAuditorAssignment] | None = None
+    auditees: list[AuditeeAssignment] | None = None
+    plantManagerUserId: str | None = None
+    # Re-routing skips checkpoints somebody allocated by hand, because a
+    # discipline-level default must not silently undo a per-checkpoint decision.
+    # Set this to deliberately reset those too.
+    overrideManualAllocations: bool = False
 
 
 class TransitionBody(BaseModel):
@@ -393,6 +426,137 @@ async def get_library(
     if data is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Library not found")
     return data
+
+
+# ── Library editing ──────────────────────────────────────────────────────
+#
+# The bulk import is the authoring tool; these are the maintenance tools. They
+# exist because re-pasting a 120-checkpoint document to correct one question is
+# both laborious and lossy — it silently discards every other edit made since
+# the copy was taken.
+#
+# Editing a library never touches an audit already materialised from it: each
+# audit snapshots its own checkpoint rows at creation, so a wording change today
+# cannot restate what an auditor assessed last quarter. Edits reach the next
+# audit scheduled.
+
+
+class LibraryCheckpointPatch(BaseModel):
+    """Fields editable on a library checkpoint. Everything is optional; only
+    what is SENT changes, so a UI that edits the question alone cannot blank the
+    guidance it never rendered."""
+
+    question: str | None = None
+    guidance: str | None = None
+    requirement_reference: str | None = None
+    standard: str | None = None
+    criticality: str | None = None  # critical | major | minor | informational
+    requirement_type: str | None = None  # STATUTORY_REGULATORY | INTERNAL_REQUIREMENT
+    requires_photo_on_fail: bool | None = None
+    auto_trigger_capa_on_fail: bool | None = None
+    linked_safeops_module: str | None = None
+    # Move the checkpoint to another discipline, keeping its code (the code is
+    # what links it to history, so a move is an edit and not a re-creation).
+    category_code: str | None = None
+
+
+class LibraryCheckpointBody(LibraryCheckpointPatch):
+    disciplineCode: str = Field(min_length=1)
+    code: str | None = None  # minted from the discipline's series when omitted
+
+
+class LibraryDisciplineBody(BaseModel):
+    category_code: str = Field(min_length=1)
+    category_name: str = ""
+    category_color: str | None = None
+    category_icon: str | None = None
+
+
+@router.post("/library/{industry_code}/checkpoints", status_code=status.HTTP_201_CREATED)
+async def add_library_checkpoint(
+    industry_code: str,
+    body: LibraryCheckpointBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Add a checkpoint to a discipline of a library."""
+    await _require(db, user, "AUDIT_COMPLIANCE.CREATE")
+    payload = body.model_dump(exclude_unset=True)
+    payload.pop("disciplineCode", None)
+    try:
+        return await svc.add_library_checkpoint(
+            db, industry_code=industry_code, discipline_code=body.disciplineCode, data=payload
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.patch("/library/{industry_code}/checkpoints/{code}")
+async def update_library_checkpoint(
+    industry_code: str,
+    code: str,
+    body: LibraryCheckpointPatch,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Edit one checkpoint in place."""
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE")
+    try:
+        return await svc.update_library_checkpoint(
+            db, industry_code=industry_code, code=code,
+            patch=body.model_dump(exclude_unset=True),
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.delete("/library/{industry_code}/checkpoints/{code}")
+async def delete_library_checkpoint(
+    industry_code: str,
+    code: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Retire a checkpoint from future audits. Past audits are unaffected."""
+    await _require(db, user, "AUDIT_COMPLIANCE.DELETE")
+    try:
+        return await svc.delete_library_checkpoint(db, industry_code=industry_code, code=code)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.put("/library/{industry_code}/disciplines")
+async def upsert_library_discipline(
+    industry_code: str,
+    body: LibraryDisciplineBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Add a discipline, or rename / recolour an existing one."""
+    await _require(db, user, "AUDIT_COMPLIANCE.CREATE")
+    try:
+        return await svc.upsert_library_discipline(
+            db, industry_code=industry_code, data=body.model_dump(exclude_unset=True)
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.delete("/library/{industry_code}/disciplines/{discipline_code}")
+async def delete_library_discipline(
+    industry_code: str,
+    discipline_code: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Remove a discipline and every checkpoint in it."""
+    await _require(db, user, "AUDIT_COMPLIANCE.DELETE")
+    try:
+        return await svc.delete_library_discipline(
+            db, industry_code=industry_code, discipline_code=discipline_code
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
 
 @router.post("/templates/{template_id}/custom-checkpoints", status_code=status.HTTP_201_CREATED)
@@ -796,21 +960,76 @@ async def allocate_checkpoints(
                            "plantManagerUserId": audit.plantManagerUserId,
                            "createdByUserId": audit.createdByUserId},
                    record_id=audit.id)
-    # Allocating a checkpoint makes someone the responding auditee for it, so
-    # it needs the same eligibility check as naming an auditee up front.
-    # ownerId=None is an unassign — nothing to validate.
-    if body.ownerId:
+    # Allocating a checkpoint seats someone in a role for it, so each axis needs
+    # the same eligibility check as naming that person up front. A null id is an
+    # unassign (auditee) or a fall-back to the lead (auditor) — nothing to check.
+    slots: dict[str, list[str]] = {}
+    if body.setOwner and body.ownerId:
+        slots["auditee"] = [body.ownerId]
+    if body.setAuditor and body.auditorId:
+        slots["coAuditor"] = [body.auditorId]
+    if slots:
         try:
-            await assignment.assert_assignable(
-                db, plant_id=audit.plantId, assignments={"auditee": [body.ownerId]}
-            )
+            await assignment.assert_assignable(db, plant_id=audit.plantId, assignments=slots)
         except ValueError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
     try:
         return await svc.allocate_checkpoints(
-            db, user=user, audit_id=audit_id, owner_id=body.ownerId,
+            db, user=user, audit_id=audit_id,
+            owner_id=body.ownerId, auditor_id=body.auditorId,
+            set_owner=body.setOwner, set_auditor=body.setAuditor,
             checkpoint_ids=body.checkpointIds, discipline_id=body.disciplineId,
         )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.patch("/{audit_id}/team")
+async def update_audit_team(
+    audit_id: str,
+    body: TeamBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Re-seat co-auditors / auditees / plant manager on a live audit.
+
+    Permitted right up until closure, deliberately. The auditees on a real audit
+    are frequently not known when it is scheduled — they are identified at the
+    opening meeting once the auditor has met the departments — and an audit that
+    could only be cast a week in advance was being cast with guesses.
+    """
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record={"leadAuditorUserId": audit.leadAuditorUserId,
+                           "plantManagerUserId": audit.plantManagerUserId,
+                           "createdByUserId": audit.createdByUserId},
+                   record_id=audit.id)
+    payload = body.model_dump(exclude_unset=True)
+    if "coAuditors" in payload and payload["coAuditors"] is not None:
+        payload["coAuditors"] = [
+            c if isinstance(c, dict) else c.model_dump() for c in payload["coAuditors"]
+        ]
+    if "auditees" in payload and payload["auditees"] is not None:
+        payload["auditees"] = [
+            a if isinstance(a, dict) else a.model_dump() for a in payload["auditees"]
+        ]
+    # The picker is filtered client-side as a courtesy; this is the gate. A
+    # crafted request must not be able to seat someone who holds none of the
+    # permissions the seat's actions require.
+    slots: dict[str, list[str]] = {}
+    if payload.get("coAuditors"):
+        slots["coAuditor"] = [c["userId"] for c in payload["coAuditors"]]
+    if payload.get("auditees"):
+        slots["auditee"] = [a["userId"] for a in payload["auditees"]]
+    if payload.get("plantManagerUserId"):
+        slots["plantManager"] = [payload["plantManagerUserId"]]
+    if slots:
+        try:
+            await assignment.assert_assignable(db, plant_id=audit.plantId, assignments=slots)
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    try:
+        return await svc.update_audit_team(db, user=user, audit_id=audit_id, data=payload)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
