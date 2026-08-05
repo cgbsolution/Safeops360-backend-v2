@@ -174,6 +174,14 @@ class ContractorWorker(Base, IdMixin):
     currentMedicalValidUntil: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     overallStatus: Mapped[str] = mapped_column(String, nullable=False, default="active")
+    # ─── Safety-roster gate (Observation deroster workflow) ───
+    # Deliberately SEPARATE from overallStatus. overallStatus is the EPC
+    # employment/suspension state owned by the contractor coordinator;
+    # rosterStatus is a safety hold owned by HSE. Collapsing them would let an
+    # EPC status edit silently clear a safety deroster. Gate check (g) reads
+    # overallStatus; a new check (i) reads this. See models/observation_sla.py.
+    rosterStatus: Mapped[str] = mapped_column(String, nullable=False, default="active", index=True)
+    currentDerosterRef: Mapped[str | None] = mapped_column(String)
     biometricEnrolled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     trainingCertificates: Mapped[list] = mapped_column(JSONB, nullable=True, default=list)

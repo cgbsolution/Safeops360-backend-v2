@@ -5,6 +5,8 @@ Endpoints:
   POST /api/auth/refresh            — rotate access token from a valid bearer
   GET  /api/auth/me                 — current user
   GET  /api/auth/permissions        — permission-code → bool map
+  GET  /api/auth/demo-user          — demo picker: exact-email name lookup
+  GET  /api/auth/demo-search        — demo picker: name/email search
   POST /api/auth/forgot-password    — issues an OTP (dev: surfaced in response)
   POST /api/auth/verify-otp         — accepts OTP, returns reset token
   POST /api/auth/reset-password     — applies new password using reset token
@@ -31,7 +33,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from jose import JWTError, jwt
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -44,6 +46,7 @@ from app.core.security import (
     safe_decode,
     verify_password,
 )
+from app.models.plant import Plant
 from app.models.user import User
 from app.schemas.auth import (
     DeviceRegisterRequest,
@@ -78,13 +81,22 @@ _RESET_TOKEN_TTL_SECONDS = 900  # 15 minutes
 _RESET_TOKEN_AUDIENCE = "safeops:password-reset"
 
 
-def _user_to_out(u: User) -> UserOut:
+async def _user_to_out(db: AsyncSession, u: User) -> UserOut:
+    """Serialise the signed-in user, plant RESOLVED.
+
+    `get_current_user` loads the User with `db.get`, so `u.plant` is an
+    unloaded lazy relationship — touching it under asyncio raises. Hence the
+    explicit lookup rather than `u.plant.name`.
+    """
+    plant = await db.get(Plant, u.plantId) if u.plantId else None
     return UserOut(
         id=u.id,
         email=u.email,
         name=u.name,
         role=u.role,
         plantId=u.plantId,
+        plantName=plant.name if plant else None,
+        plantCode=plant.code if plant else None,
         designation=u.designation,
         department=u.department,
     )
@@ -115,7 +127,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
     return LoginResponse(
         access_token=token,
         refresh_token=token,
-        user=_user_to_out(user),
+        user=await _user_to_out(db, user),
     )
 
 
@@ -170,8 +182,10 @@ async def my_permissions(
 
 
 @router.get("/me", response_model=UserOut)
-async def me(user: User = Depends(get_current_user)) -> UserOut:
-    return _user_to_out(user)
+async def me(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> UserOut:
+    return await _user_to_out(db, user)
 
 
 @router.get("/demo-user")
@@ -189,6 +203,46 @@ async def demo_user_lookup(email: str, db: AsyncSession = Depends(get_db)) -> di
     return {"name": row.name, "designation": row.designation}
 
 
+@router.get("/demo-search")
+async def demo_user_search(q: str, limit: int = 25, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Public name/email search used by the login page's demo account picker.
+
+    Same enumeration stance as /demo-user above: restricted to @safeops360.in
+    demo accounts, so this is not a generic directory oracle for real tenants.
+    Returns the identity fields the picker renders — name, plant, department,
+    role — plus the email it fills into the sign-in form.
+    """
+    term = (q or "").strip()
+    if len(term) < 2:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "search term must be at least 2 characters")
+    capped = max(1, min(limit, 50))
+    pattern = f"%{term.lower()}%"
+
+    stmt = (
+        select(User, Plant)
+        .outerjoin(Plant, Plant.id == User.plantId)
+        .where(User.email.ilike("%@safeops360.in"))
+        .where(func.lower(User.name).like(pattern) | func.lower(User.email).like(pattern))
+        .order_by(User.name)
+        .limit(capped)
+    )
+    rows = (await db.execute(stmt)).all()
+    return {
+        "results": [
+            {
+                "email": u.email,
+                "name": u.name,
+                "role": u.role,
+                "designation": u.designation,
+                "department": u.department,
+                "plantCode": p.code if p else None,
+                "plantName": p.name if p else None,
+            }
+            for u, p in rows
+        ]
+    }
+
+
 # --- Password reset flow (dev stub) ------------------------------------------
 
 
@@ -202,10 +256,18 @@ async def forgot_password(
     otp = f"{secrets.randbelow(900_000) + 100_000}"  # 6-digit
     if row is not None:
         _OTP_STORE[email] = {"otp": otp, "expiresAt": time.time() + _OTP_TTL_SECONDS}
-        log.info("Password-reset OTP issued for %s: %s (dev mode)", email, otp)
-    # Dev convenience: surface the OTP in the response body in non-production
-    # so QA can complete the flow without an email gateway. Strip in prod.
-    dev_otp = otp if (row is not None and not settings.is_production) else None
+        # Never write the OTP value to logs (logs persist and may be shipped);
+        # record only that an OTP was issued, and only outside production.
+        if not settings.is_production:
+            log.info("Password-reset OTP issued for %s", email)
+    # Dev convenience: surface the OTP in the response body ONLY when explicitly
+    # opted in via EXPOSE_DEV_OTP (off by default). Gating on APP_ENV alone was
+    # unsafe — the deployed env runs as 'development', which would leak the OTP.
+    dev_otp = (
+        otp
+        if (row is not None and settings.expose_dev_otp and not settings.is_production)
+        else None
+    )
     return ForgotPasswordResponse(ok=True, dev_otp=dev_otp)
 
 
@@ -218,7 +280,7 @@ async def verify_otp(payload: VerifyOtpRequest) -> VerifyOtpResponse:
     if entry["expiresAt"] < time.time():
         _OTP_STORE.pop(email, None)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "OTP expired")
-    if entry["otp"] != payload.otp:
+    if not secrets.compare_digest(str(entry["otp"]), str(payload.otp)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid OTP")
 
     # Burn the OTP so it can't be reused.

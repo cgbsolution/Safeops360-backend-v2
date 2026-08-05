@@ -51,7 +51,13 @@ async def list_manhours(
         return {"items": [], "total": 0}
     else:
         stmt = stmt.where(Manhours.plantId.in_(plants))
-    rows = (await db.execute(stmt.order_by(Manhours.year.desc(), Manhours.month.desc()).limit(60))).scalars().all()
+    # Newest-created first — platform-wide register convention. A submission
+    # entered now for an older period must still lead the list.
+    rows = (
+        await db.execute(
+            stmt.order_by(Manhours.createdAt.desc(), Manhours.id.desc()).limit(60)
+        )
+    ).scalars().all()
     return {"items": [ManhoursOut.model_validate(r) for r in rows], "total": len(rows)}
 
 

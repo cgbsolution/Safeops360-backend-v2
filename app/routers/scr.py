@@ -20,9 +20,24 @@ from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.models.scr import RegisterEntry, RegisterMaster
 from app.models.user import User
+from app.services.access_scope import build_query_scope
 from app.services.scr_register import sync_all
 
 router = APIRouter(prefix="/api/scr", tags=["scr"])
+
+
+async def _require_scr_plant(db: AsyncSession, user: User, plant_id: str) -> None:
+    """Authorise a statutory-register read (Form 18 accident register carries
+    injured-person PII). Allowed if the caller can read this plant's compliance
+    data OR its incidents (the register is incident-fed). Uses permission-
+    specific plant scope so it fails CLOSED for OWN_DEPARTMENT/OWN_RECORDS and
+    an unrelated ALL_PLANTS grant on another module can't unlock every plant's
+    register."""
+    for perm in ("COMPLIANCE.READ", "INCIDENT.READ"):
+        scope = await build_query_scope(db, user.id, perm)
+        if scope.allows_plant(plant_id):
+            return
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied for this plant")
 
 
 def _register_dict(reg: RegisterMaster, entry_count: int, last_entry: datetime | None) -> dict:
@@ -61,7 +76,12 @@ async def _entry_stats(db: AsyncSession, register_id: str) -> tuple[int, datetim
 
 
 @router.get("/registers")
-async def list_registers(plantId: str = Query(...), db: AsyncSession = Depends(get_db)) -> list[dict]:
+async def list_registers(
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    await _require_scr_plant(db, user, plantId)
     regs = (
         await db.execute(
             select(RegisterMaster)
@@ -77,7 +97,12 @@ async def list_registers(plantId: str = Query(...), db: AsyncSession = Depends(g
 
 
 @router.get("/dashboard")
-async def dashboard(plantId: str = Query(...), db: AsyncSession = Depends(get_db)) -> dict:
+async def dashboard(
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    await _require_scr_plant(db, user, plantId)
     regs = (
         await db.execute(select(RegisterMaster).where(RegisterMaster.plantId == plantId))
     ).scalars().all()
@@ -128,8 +153,12 @@ async def dashboard(plantId: str = Query(...), db: AsyncSession = Depends(get_db
 
 @router.get("/registers/{register_code}")
 async def get_register(
-    register_code: str, plantId: str = Query(...), db: AsyncSession = Depends(get_db)
+    register_code: str,
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict:
+    await _require_scr_plant(db, user, plantId)
     reg = (
         await db.execute(
             select(RegisterMaster)
@@ -176,6 +205,7 @@ async def sync(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Back-fill every register for the plant from its source modules."""
+    await _require_scr_plant(db, user, plantId)
     result = await sync_all(db, plant_id=plantId, actor="SYSTEM")
     # Shape kept backwards-compatible for the existing UI (results[0].created/updated).
     return {"plantId": plantId, "results": [result], **result}
@@ -223,8 +253,12 @@ def _columns_for(register_code: str) -> list[tuple[str, str]]:
 
 @router.get("/registers/{register_code}/export.csv")
 async def export_register_csv(
-    register_code: str, plantId: str = Query(...), db: AsyncSession = Depends(get_db)
+    register_code: str,
+    plantId: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
+    await _require_scr_plant(db, user, plantId)
     reg = (
         await db.execute(
             select(RegisterMaster)

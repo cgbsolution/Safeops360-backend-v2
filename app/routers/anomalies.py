@@ -86,7 +86,10 @@ async def list_anomalies(
     if plantId:
         stmt = stmt.where(Anomaly.plantId == plantId)
 
-    stmt = stmt.order_by(Anomaly.status.asc(), Anomaly.detectedAt.desc()).limit(200)
+    # Newest-created first — platform-wide register convention. Anomaly has no
+    # createdAt; `detectedAt` IS its insert timestamp. Status grouping used to
+    # push freshly-detected anomalies below older open ones.
+    stmt = stmt.order_by(Anomaly.detectedAt.desc(), Anomaly.id.desc()).limit(200)
     rows = (await db.execute(stmt)).scalars().all()
     return {"anomalies": [_row_to_dict(a) for a in rows]}
 

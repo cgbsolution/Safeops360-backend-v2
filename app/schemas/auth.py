@@ -12,6 +12,11 @@ class UserOut(BaseModel):
     name: str
     role: str
     plantId: str | None = None
+    # The mobile profile screens showed the plant as its raw cuid because the
+    # id was all this payload carried. Same `Id` + `Name` pairing every other
+    # Out schema on the platform uses.
+    plantName: str | None = None
+    plantCode: str | None = None
     designation: str | None = None
     department: str | None = None
 

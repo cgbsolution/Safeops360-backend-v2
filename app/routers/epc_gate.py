@@ -322,6 +322,14 @@ async def _run_eight_checks(
         ),
     }
 
+    # i. safety_roster — HSE-owned hold from the Observation deroster workflow.
+    # Separate from (g): (g) reads `overallStatus`, the contractor coordinator's
+    # employment state. This reads `rosterStatus`, which only HSE sets. Merging
+    # them would let an EPC status edit clear a safety hold at the gate.
+    from app.services import roster_gate
+
+    checks["safety_roster"] = roster_gate.for_person(worker).as_check()
+
     # h. contractor_company_status
     approved_statuses = {"approved", "conditionally_approved"}
     checks["contractor_company_status"] = {

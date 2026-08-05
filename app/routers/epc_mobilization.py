@@ -174,6 +174,14 @@ async def _run_pre_checks(
         "checkedAt": now.isoformat(),
     }
 
+    # 3b. worker_safety_roster — Observation deroster hold. Distinct from
+    # `worker_not_suspended` above, which reads the EPC employment status;
+    # this is the HSE-owned safety hold and neither can clear the other.
+    from app.services import roster_gate
+
+    _roster = roster_gate.for_person(worker)
+    checks["worker_safety_roster"] = {**_roster.as_check(), "checkedAt": now.isoformat()}
+
     # 4. existing_active_mobilization
     existing_active = (
         await db.execute(
@@ -304,16 +312,31 @@ async def site_roster(
         )
     ).scalars().all()
 
+    from app.services import roster_gate
+
     roster = []
+    blocked_count = 0
     for m in mobs:
         worker = await db.get(ContractorWorker, m.contractorWorkerId)
         company = await db.get(ContractorCompany, m.contractorCompanyId)
+        # Already-mobilised workers are ANNOTATED, not removed. Dropping a
+        # flagged worker from the site roster would hide someone who is
+        # physically on site from the supervisor who needs to know they are on
+        # hold — the gate check is what stops them working, this is what tells
+        # the site why.
+        gate = roster_gate.for_person(worker)
+        if not gate.allowed:
+            blocked_count += 1
         roster.append({
             "mobilizationId": m.id,
             "mobilizationNumber": m.mobilizationNumber,
             "workerId": m.contractorWorkerId,
             "workerCode": worker.workerCode if worker else None,
             "workerName": worker.fullName if worker else None,
+            "rosterStatus": gate.status,
+            "rosterStatusLabel": gate.label,
+            "availableForWork": gate.allowed,
+            "derosterRef": gate.derosterRef,
             "primaryTrade": m.tradeAtSite,
             "workArea": m.workArea,
             "companyName": company.name if company else None,
@@ -328,6 +351,8 @@ async def site_roster(
         "siteCode": site.siteCode,
         "siteName": site.siteName,
         "activeWorkerCount": len(roster),
+        # Mobilised but currently held by a safety review / deroster.
+        "safetyHoldCount": blocked_count,
         "roster": roster,
     }
 

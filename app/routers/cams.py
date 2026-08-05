@@ -27,9 +27,9 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
+from app.models.audit_compliance import AuditCheckpointResponse, ComplianceAudit
 from app.models.capa import Capa
 from app.models.cams import (
-    CamsAnalyticsSnapshot,
     CamsAuditType,
     CamsComplianceLink,
     CamsEngagement,
@@ -43,7 +43,6 @@ from app.models.cams import (
 from app.models.user import User
 from app.schemas import cams as S
 from app.services import cams as svc
-from app.services import cams_providers as providers
 from app.services.permissions import PermissionContext, can
 
 router = APIRouter(prefix="/api/cams", tags=["cams"])
@@ -385,21 +384,6 @@ async def clause_catalogue(standard: str | None = Query(None), user: User = Depe
     return [S.ClauseRef(**r) for r in rows]
 
 
-@router.get("/rca-methods", response_model=list[S.RcaMethodOut])
-async def rca_methods(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Shipped RCA method library (§4) — always available so RCA works standalone."""
-    await _require(db, user, "CAMS.READ")
-    return [S.RcaMethodOut(**m) for m in providers.rca_methods()]
-
-
-@router.get("/assets", response_model=list[S.AssetOut])
-async def list_assets(siteId: str | None = Query(None), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Asset picklist for asset/area inspections — Equipment Master (integrated)
-    or the CAMS lite asset register (standalone), same shape (§1.3 / TC-16)."""
-    await _require(db, user, "CAMS.READ")
-    return [S.AssetOut(**a) for a in await providers.list_assets(db, siteId)]
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Engagements  (C-04 / C-05)
 # ════════════════════════════════════════════════════════════════════════════
@@ -449,7 +433,12 @@ async def list_engagements(
     db: AsyncSession = Depends(get_db),
 ):
     await _require(db, user, "CAMS.READ")
-    stmt = select(CamsEngagement).where(CamsEngagement.isDeleted.is_(False))
+    # P1-2: scope to the actor's plants (fail-closed). Without this a user could
+    # omit siteId and read every plant's engagements.
+    from app.services.access_scope import build_query_scope
+
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    stmt = scope.apply(select(CamsEngagement).where(CamsEngagement.isDeleted.is_(False)), CamsEngagement)
     if estatus:
         stmt = stmt.where(CamsEngagement.status == estatus)
     if engagementType:
@@ -467,7 +456,14 @@ async def list_engagements(
     if q:
         like = f"%{q}%"
         stmt = stmt.where(or_(CamsEngagement.engagementCode.ilike(like), CamsEngagement.title.ilike(like)))
-    rows = (await db.execute(stmt.order_by(CamsEngagement.plannedDate.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention. `plannedDate`
+    # is a schedule field, so a freshly-scheduled engagement for an earlier date
+    # used to land mid-list instead of on top.
+    rows = (
+        await db.execute(
+            stmt.order_by(CamsEngagement.createdAt.desc(), CamsEngagement.id.desc())
+        )
+    ).scalars().all()
 
     roll = await _finding_rollup(db, [e.id for e in rows])
     names = await svc.user_name_map(db, [e.leadAuditorId for e in rows] + [e.auditeeOwnerId for e in rows])
@@ -484,6 +480,57 @@ async def list_engagements(
         status_counts[e.status] = status_counts.get(e.status, 0) + 1
         type_counts[e.engagementType] = type_counts.get(e.engagementType, 0) + 1
     return S.EngagementListResponse(items=items, total=len(items), statusCounts=status_counts, typeCounts=type_counts)
+
+
+@router.get("/unified-engagements")
+async def unified_engagements(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Centralized feed: Cams inspections/engagements UNION ComplianceAudit
+    audits (projected to the engagement shape, status vocab translated). Drives
+    the CAMS command centre + calendar. Each item carries `href` so audit rows
+    route to /cams/audits and inspection rows to /cams/engagements."""
+    await _require(db, user, "CAMS.READ")
+    rows = (
+        await db.execute(
+            select(CamsEngagement)
+            .where(CamsEngagement.isDeleted.is_(False))
+            # Newest-created first — platform-wide register convention.
+            .order_by(CamsEngagement.createdAt.desc(), CamsEngagement.id.desc())
+        )
+    ).scalars().all()
+    roll = await _finding_rollup(db, [e.id for e in rows])
+    names = await svc.user_name_map(db, [e.leadAuditorId for e in rows] + [e.auditeeOwnerId for e in rows])
+    plants = await svc.plant_name_map(db, [e.siteId for e in rows])
+    type_ids = {e.auditTypeId for e in rows if e.auditTypeId}
+    tpl_ids = {e.templateId for e in rows if e.templateId}
+    types = {t.id: t.name for t in (await db.execute(select(CamsAuditType).where(CamsAuditType.id.in_(type_ids)))).scalars().all()} if type_ids else {}
+    templates = {t.id: t.name for t in (await db.execute(select(CamsTemplate).where(CamsTemplate.id.in_(tpl_ids)))).scalars().all()} if tpl_ids else {}
+
+    cams_items: list[dict[str, Any]] = []
+    for e in rows:
+        d = _serialise_engagement(e, names, plants, types, templates, roll.get(e.id, {})).model_dump()
+        d["href"] = f"/cams/engagements/{e.id}"
+        cams_items.append(d)
+    items = (await svc.audit_engagements(db)) + cams_items
+    # The two sources type `plannedDate` differently — audit_engagements emits an
+    # ISO string (`.isoformat()`), while the Cams `model_dump()` keeps a datetime.
+    # Normalise to an ISO string in the key so a mixed list sorts without a
+    # str-vs-datetime TypeError (ISO 8601 sorts lexically == chronologically).
+    def _planned_key(x: dict[str, Any]) -> str:
+        v = x.get("plannedDate")
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v or ""
+
+    items.sort(key=_planned_key, reverse=True)
+    status_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    for it in items:
+        status_counts[it["status"]] = status_counts.get(it["status"], 0) + 1
+        type_counts[it["engagementType"]] = type_counts.get(it["engagementType"], 0) + 1
+    return {"items": items, "total": len(items), "statusCounts": status_counts, "typeCounts": type_counts}
 
 
 async def _engagement_out(db: AsyncSession, e: CamsEngagement) -> S.EngagementOut:
@@ -504,10 +551,6 @@ async def _engagement_out(db: AsyncSession, e: CamsEngagement) -> S.EngagementOu
 @router.post("/engagements", response_model=S.EngagementOut, status_code=201)
 async def create_engagement(body: S.EngagementCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "CAMS.SCHEDULE", plant_id=body.siteId)
-    # Auditor independence (§7 / TC-21): a party cannot audit its own area —
-    # the lead auditor must not be the auditee/area owner.
-    if body.auditeeOwnerId and body.leadAuditorId == body.auditeeOwnerId:
-        raise HTTPException(400, "Independence: the lead auditor cannot be the auditee/area owner (a party cannot audit its own area).")
     e = CamsEngagement(
         engagementCode=await svc.next_engagement_code(db, body.engagementType),
         title=body.title, engagementType=body.engagementType, auditTypeId=body.auditTypeId,
@@ -519,30 +562,6 @@ async def create_engagement(body: S.EngagementCreate, user: User = Depends(get_c
         status="SCHEDULED" if body.scheduledStart else "PLANNED", createdBy=user.id,
     )
     db.add(e)
-    await db.commit()
-    await db.refresh(e)
-    out = await _engagement_out(db, e)
-    # Enrichment: warn (never block) when the lead auditor lacks a required
-    # competency. Empty in standalone / when Skill Matrix is absent (§4).
-    if e.auditTypeId:
-        at = await db.get(CamsAuditType, e.auditTypeId)
-        if at and at.requiresAuditorCompetency:
-            out.competencyWarnings = await providers.check_competencies(db, e.leadAuditorId, at.requiresAuditorCompetency)
-    return out
-
-
-@router.post("/consumer/inspection", response_model=S.EngagementOut, status_code=201)
-async def consumer_inspection(body: S.ConsumerInspectionCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """§8 consumer-integration entry point: a module (Fire / PPE / Pharma / EPC)
-    launches an inspection through the SHARED CAMS engine, tagging provenance.
-    Behaviour is identical to a CAMS-native engagement — one engine (TC-18)."""
-    await _require(db, user, "CAMS.SCHEDULE", plant_id=body.siteId)
-    e = await svc.create_consumer_engagement(
-        db, source_module=body.sourceModule, title=body.title, engagement_type=body.engagementType,
-        lead_auditor_id=body.leadAuditorId or user.id, planned_date=body.plannedDate, site_id=body.siteId,
-        audit_type_id=body.auditTypeId, template_id=body.templateId, standard_refs=body.standardRefs,
-        area_or_asset_ref=body.areaOrAssetRef, actor_id=user.id,
-    )
     await db.commit()
     await db.refresh(e)
     return await _engagement_out(db, e)
@@ -676,10 +695,6 @@ async def save_checklist(engagement_id: str, body: S.ChecklistSave, user: User =
     if not e or e.isDeleted:
         raise HTTPException(404, "Engagement not found")
     await _require(db, user, "CAMS.EXECUTE", plant_id=e.siteId)
-    # Auditor independence (§7 / TC-21): the auditee/area owner must never execute
-    # the audit of their own area.
-    if e.auditeeOwnerId and user.id == e.auditeeOwnerId:
-        raise HTTPException(403, "Independence: the auditee/area owner cannot execute the audit of their own area.")
     if e.status not in ("IN_PROGRESS",):
         raise HTTPException(409, f"Checklist can only be saved while IN_PROGRESS (is {e.status}). Move the engagement to fieldwork first.")
     if not e.templateId:
@@ -711,8 +726,6 @@ async def save_checklist(engagement_id: str, body: S.ChecklistSave, user: User =
     created = 0
     if body.complete:
         created = await svc.sync_findings_from_answers(db, e, tpl.sections, answers_by_q, actor_id=user.id)
-        if created:
-            await svc.detect_repeat_findings(db)  # newly-spawned findings may be recurrences
         score = svc.compute_score(tpl.sections, answers_by_q, tpl.scoringConfig)
         resp.sectionScores = score["sectionScores"]
         resp.completedBy = user.id
@@ -796,6 +809,64 @@ async def list_findings(
     return S.FindingListResponse(items=items, total=len(items), severityCounts=sev_counts, statusCounts=status_counts, repeatCount=repeat)
 
 
+@router.get("/unified-findings")
+async def unified_findings(
+    severity: str | None = Query(None),
+    fstatus: str | None = Query(None, alias="status"),
+    standardClauseRef: str | None = Query(None),
+    siteId: str | None = Query(None),
+    repeatOnly: bool = Query(False),
+    overdueOnly: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Centralized findings register: Cams inspection findings UNION
+    ComplianceAudit fail/partial checkpoints (projected to the finding shape).
+    Filters apply to both sources; audit findings are never repeats."""
+    await _require(db, user, "CAMS.READ")
+    rows = (
+        await db.execute(
+            select(CamsFinding).where(CamsFinding.isDeleted.is_(False)).order_by(CamsFinding.createdAt.desc())
+        )
+    ).scalars().all()
+    eng_ids = {f.engagementId for f in rows}
+    engagements = {e.id: e for e in (await db.execute(select(CamsEngagement).where(CamsEngagement.id.in_(eng_ids)))).scalars().all()} if eng_ids else {}
+    names = await svc.user_name_map(db, [f.ownerId for f in rows])
+    plants = await svc.plant_name_map(db, [f.siteId for f in rows])
+    cams_items: list[dict[str, Any]] = []
+    for f in rows:
+        d = (await _serialise_finding(db, f, names, plants, engagements)).model_dump()
+        d["href"] = f"/cams/findings/{f.id}"
+        cams_items.append(d)
+    items = (await svc.audit_findings(db)) + cams_items
+
+    def _keep(it: dict[str, Any]) -> bool:
+        if severity and it["severity"] != severity:
+            return False
+        if fstatus and it["status"] != fstatus:
+            return False
+        if standardClauseRef and (it.get("standardClauseRef") or "") != standardClauseRef:
+            return False
+        if siteId and it.get("siteId") != siteId:
+            return False
+        if repeatOnly and not it.get("isRepeatFinding"):
+            return False
+        if overdueOnly and not (it.get("ageDays") and it["status"] not in ("CLOSED", "ACCEPTED_RISK")):
+            return False
+        return True
+
+    items = [it for it in items if _keep(it)]
+    sev_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    repeat = 0
+    for it in items:
+        sev_counts[it["severity"]] = sev_counts.get(it["severity"], 0) + 1
+        status_counts[it["status"]] = status_counts.get(it["status"], 0) + 1
+        if it.get("isRepeatFinding"):
+            repeat += 1
+    return {"items": items, "total": len(items), "severityCounts": sev_counts, "statusCounts": status_counts, "repeatCount": repeat}
+
+
 @router.post("/findings", response_model=S.FindingOut, status_code=201)
 async def create_finding(body: S.FindingCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "CAMS.FINDING_MANAGE")
@@ -810,8 +881,6 @@ async def create_finding(body: S.FindingCreate, user: User = Depends(get_current
         dueDate=body.dueDate, status="OPEN", createdBy=user.id,
     )
     db.add(f)
-    await db.flush()
-    await svc.detect_repeat_findings(db)  # this finding may complete a recurrence
     await db.commit()
     await db.refresh(f)
     return await _serialise_finding(db, f, await svc.user_name_map(db, [f.ownerId]), await svc.plant_name_map(db, [f.siteId]), {e.id: e})
@@ -843,8 +912,6 @@ async def update_finding(finding_id: str, body: S.FindingUpdate, user: User = De
     for k, v in data.items():
         setattr(f, k, v)
     f.updatedBy = user.id
-    if "standardClauseRef" in data:  # grouping key changed → recurrence may differ
-        await svc.detect_repeat_findings(db)
     await db.commit()
     await db.refresh(f)
     e = await db.get(CamsEngagement, f.engagementId)
@@ -869,20 +936,6 @@ async def raise_capa(finding_id: str, user: User = Depends(get_current_user), db
     await db.commit()
     await db.refresh(f)
     return await _serialise_finding(db, f, await svc.user_name_map(db, [f.ownerId]), await svc.plant_name_map(db, [f.siteId]), {e.id: e})
-
-
-@router.post("/findings/recompute-repeats", response_model=S.RepeatDetectionOut)
-async def recompute_repeats(
-    windowDays: int | None = Query(None, ge=1, description="Recurrence window in days (default 365)"),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Backfill / on-demand recompute of repeat-finding flags across the tenant.
-    Idempotent; the Analytics engine owns these flags (§5.2.3)."""
-    await _require(db, user, "CAMS.FINDING_MANAGE")
-    res = await svc.detect_repeat_findings(db, window_days=windowDays)
-    await db.commit()
-    return S.RepeatDetectionOut(**res)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -938,90 +991,9 @@ async def run_recurrences(user: User = Depends(get_current_user), db: AsyncSessi
 # Analytics & Benchmarking  (C-13)
 # ════════════════════════════════════════════════════════════════════════════
 @router.get("/analytics", response_model=S.AnalyticsOut)
-async def analytics(
-    siteId: str | None = Query(None),
-    engagementType: str | None = Query(None),
-    standardRef: str | None = Query(None),
-    fromDate: datetime | None = Query(None),
-    toDate: datetime | None = Query(None),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
+async def analytics(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "CAMS.ANALYTICS")
-    return S.AnalyticsOut(**await svc.compute_analytics(
-        db, site_id=siteId, engagement_type=engagementType, standard_ref=standardRef,
-        date_from=fromDate, date_to=toDate,
-    ))
-
-
-@router.get("/analytics/snapshots", response_model=list[S.AnalyticsSnapshotOut])
-async def list_snapshots(
-    periodLabel: str | None = Query(None),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Persisted QoQ snapshots for trend lines + the board pack (§5.2 / §10.6)."""
-    await _require(db, user, "CAMS.ANALYTICS")
-    stmt = select(CamsAnalyticsSnapshot).where(CamsAnalyticsSnapshot.isDeleted.is_(False))
-    if periodLabel:
-        stmt = stmt.where(CamsAnalyticsSnapshot.periodLabel == periodLabel)
-    rows = (
-        await db.execute(
-            stmt.order_by(CamsAnalyticsSnapshot.periodStart.asc().nullslast(), CamsAnalyticsSnapshot.periodLabel)
-        )
-    ).scalars().all()
-    return [S.AnalyticsSnapshotOut.model_validate(r) for r in rows]
-
-
-@router.post("/analytics/snapshots", response_model=S.AnalyticsSnapshotOut, status_code=201)
-async def create_snapshot(body: S.SnapshotCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Precompute + persist a snapshot for a (period, scope). Idempotent per
-    period+scope (re-running updates in place). RBAC: analytics author."""
-    await _require(db, user, "CAMS.ANALYTICS")
-    snap = await svc.precompute_snapshot(
-        db, period_label=body.periodLabel, period_start=body.periodStart, period_end=body.periodEnd,
-        site_id=body.siteId, engagement_type=body.engagementType, standard_ref=body.standardRef,
-        actor_id=user.id,
-    )
-    await db.commit()
-    await db.refresh(snap)
-    return S.AnalyticsSnapshotOut.model_validate(snap)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Audit Programme  (C-03)
-# ════════════════════════════════════════════════════════════════════════════
-@router.get("/programme", response_model=S.ProgrammeOut)
-async def programme(
-    fromDate: datetime | None = Query(None),
-    toDate: datetime | None = Query(None),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Coverage matrix (sites × audit types/standards) with planned/done/missing
-    + gap flags for un-audited scope (§6 C-03)."""
-    await _require(db, user, "CAMS.READ")
-    return S.ProgrammeOut(**await svc.compute_programme(db, date_from=fromDate, date_to=toDate))
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Board / Management-Review pack  (C-15)
-# ════════════════════════════════════════════════════════════════════════════
-@router.get("/board-pack", response_model=S.BoardPackOut)
-async def board_pack(
-    periodLabel: str | None = Query(None),
-    fromDate: datetime | None = Query(None),
-    toDate: datetime | None = Query(None),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Management-review / certification-readiness pack (§6 C-15): programme,
-    findings profile, repeat rate, clause conformance, CAPA, compliance assurance,
-    benchmarking — assembled with an integrity hash (§12)."""
-    await _require(db, user, "CAMS.ANALYTICS")
-    pack = await svc.compute_board_pack(db, period_label=periodLabel, date_from=fromDate, date_to=toDate)
-    pack["generatedAt"] = _now()
-    return S.BoardPackOut(**pack)
+    return S.AnalyticsOut(**await svc.compute_analytics(db))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1082,6 +1054,17 @@ async def audit_capas(
     eng_ids = {f.engagementId for f in finds.values()}
     engs = {e.id: e for e in (await db.execute(select(CamsEngagement).where(CamsEngagement.id.in_(eng_ids)))).scalars().all()} if eng_ids else {}
 
+    # A CAPA from the ComplianceAudit engine points sourceReferenceId at an
+    # AuditCheckpointResponse (not a CamsFinding). Resolve those too so audit
+    # CAPAs show their checkpoint code + audit number (not blank). The remaining
+    # unresolved ids are the audit-checkpoint ones.
+    acr_ids = [fid for fid in fids if fid not in finds]
+    acr = {r.id: r for r in (await db.execute(
+        select(AuditCheckpointResponse).where(AuditCheckpointResponse.id.in_(acr_ids)))).scalars().all()} if acr_ids else {}
+    acr_audit_ids = {r.auditId for r in acr.values()}
+    acr_audits = {a.id: a for a in (await db.execute(
+        select(ComplianceAudit).where(ComplianceAudit.id.in_(acr_audit_ids)))).scalars().all()} if acr_audit_ids else {}
+
     items = []
     state_counts: dict[str, int] = {}
     overdue_n = open_n = 0
@@ -1090,10 +1073,15 @@ async def audit_capas(
         o = S.AuditCapaOut.model_validate(c)
         o.primaryOwnerName = names.get(c.primaryOwnerUserId)
         fnd = finds.get(c.sourceReferenceId) if c.sourceReferenceId else None
+        cp = acr.get(c.sourceReferenceId) if c.sourceReferenceId else None
         if fnd:
             o.findingCode = fnd.findingCode
             eng = engs.get(fnd.engagementId)
             o.engagementCode = eng.engagementCode if eng else None
+        elif cp:
+            o.findingCode = cp.checkpointCode
+            a = acr_audits.get(cp.auditId)
+            o.engagementCode = a.auditNumber if a else None
         is_open = c.state not in closed_states
         if is_open:
             open_n += 1
@@ -1110,3 +1098,58 @@ async def audit_capas(
         items = [i for i in items if i.overdueDays > 0]
     items.sort(key=lambda i: (0 if i.overdueDays else 1, i.capaNumber))
     return S.AuditCapaListResponse(items=items, total=len(items), stateCounts=state_counts, overdueCount=overdue_n, openCount=open_n)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Analytics & Benchmarking (P2-4) — computed, not seed commentary
+# ═════════════════════════════════════════════════════════════════════
+@router.post("/analytics/detect-repeats")
+async def analytics_detect_repeats(
+    windowDays: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Recompute is_repeat_finding across all findings (auto-detection engine)."""
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    res = await ca.detect_repeat_findings(db, window_days=windowDays)
+    await db.commit()
+    return res
+
+
+@router.get("/analytics/pareto")
+async def analytics_pareto(
+    dimension: str = Query("clause"), days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.findings_pareto(db, pids, dimension=dimension, days=days)
+
+
+@router.get("/analytics/benchmarks")
+async def analytics_benchmarks(
+    days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.site_benchmarks(db, pids, days=days)
+
+
+@router.get("/analytics/clause-conformance")
+async def analytics_clause(
+    standardRef: str | None = Query(None), days: int = Query(365, ge=30, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    await _require(db, user, "CAMS.READ")
+    from app.services import cams_analytics as ca
+    from app.services.access_scope import build_query_scope
+    scope = await build_query_scope(db, user.id, "CAMS.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await ca.clause_analysis(db, pids, standard_ref=standardRef, days=days)

@@ -176,6 +176,8 @@ async def update_definition(
                     "isOptional": st.isOptional,
                     "conditionExpr": st.conditionExpr,
                     "notes": st.notes,
+                    "parallelStrategy": st.parallelStrategy,
+                    "slaBySeverity": st.slaBySeverity,
                 }
                 for st in sorted(definition.steps, key=lambda x: x.sequence)
             ],
@@ -197,11 +199,21 @@ async def update_definition(
             )
         )
 
-        # Replace steps
+        # Replace steps. NOTE: this mints new step ids, so any in-flight
+        # instance's currentStepId / WorkflowTask.stepId stops resolving.
+        # Preserve every column here — a field omitted below is erased on
+        # save even though the caller never asked to change it.
+        preserved = {
+            st.sequence: (st.parallelStrategy, st.slaBySeverity)
+            for st in definition.steps
+        }
         for st in list(definition.steps):
             await db.delete(st)
         await db.flush()
         for s in ordered:
+            # Fall back to the value the step at this position already had, so
+            # older clients that don't send these fields don't wipe them.
+            prev_parallel, prev_sla_by_sev = preserved.get(s["sequence"], (None, None))
             db.add(
                 WorkflowStep(
                     definitionId=definition.id,
@@ -218,6 +230,8 @@ async def update_definition(
                     isOptional=s.get("isOptional", False),
                     conditionExpr=s.get("conditionExpr"),
                     notes=s.get("notes"),
+                    parallelStrategy=s.get("parallelStrategy") or prev_parallel,
+                    slaBySeverity=s.get("slaBySeverity") or prev_sla_by_sev,
                 )
             )
 
@@ -357,6 +371,8 @@ async def restore_version(
                 isOptional=s.get("isOptional", False),
                 conditionExpr=s.get("conditionExpr"),
                 notes=s.get("notes"),
+                parallelStrategy=s.get("parallelStrategy"),
+                slaBySeverity=s.get("slaBySeverity"),
             )
         )
     db.add(

@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.common import UserRefOut
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Master data
@@ -261,6 +263,13 @@ class CapaOut(BaseModel):
     contributors: list[CapaContributorOut] = []
     attachments: list[CapaAttachmentOut] = []
     comments: list[CapaCommentOut] = []
+
+    # Display-ready lookup for every user id carried by this payload (owners,
+    # raiser, contributors, action owners, comment authors, …). Keyed by user
+    # id so the UI can render a name + plant + role instead of the raw cuid.
+    # Populated by the detail endpoint; empty on write responses (the client
+    # re-fetches the detail view, which re-resolves it).
+    userDirectory: dict[str, UserRefOut] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────

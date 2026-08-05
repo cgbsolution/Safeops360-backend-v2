@@ -94,6 +94,26 @@ class ChangeRequest(Base, IdMixin):
     spawnedFromCapaId: Mapped[str | None] = mapped_column(String)
     supersededByMocId: Mapped[str | None] = mapped_column(String)
 
+    # ── Gensuite-parity extension (5-step wizard) — additive/nullable; column
+    #    names match Prisma exactly. See prisma/apply-moc-ddl.ts for the DDL. ──
+    urgency: Mapped[str] = mapped_column(String, default="standard")
+    emergencyRetroApprovalDueAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    linkedMocIds: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+
+    psmApplicable: Mapped[bool] = mapped_column(Boolean, default=False)
+    psmDetails: Mapped[dict | None] = mapped_column(JSON)
+    riskMatrixPre: Mapped[dict | None] = mapped_column(JSON)
+    riskMatrixResidual: Mapped[dict | None] = mapped_column(JSON)
+    hazardCategories: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    mitigations: Mapped[str | None] = mapped_column(Text)
+
+    departmentImpact: Mapped[dict | None] = mapped_column(JSON)
+    trainingRequired: Mapped[bool] = mapped_column(Boolean, default=False)
+    trainingCertificateId: Mapped[str | None] = mapped_column(String)
+
+    pssrChecklist: Mapped[dict | None] = mapped_column(JSON)
+    effectivenessReview: Mapped[dict | None] = mapped_column(JSON)
+
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -113,6 +133,9 @@ class ChangeRequest(Base, IdMixin):
     )
     impactAssessment: Mapped[MocImpactAssessment | None] = relationship(
         back_populates="changeRequest", cascade="all, delete-orphan", uselist=False
+    )
+    attachments: Mapped[list[MocAttachment]] = relationship(
+        back_populates="changeRequest", cascade="all, delete-orphan"
     )
 
 
@@ -212,6 +235,31 @@ class MocImpactAssessment(Base, IdMixin):
     )
 
     changeRequest: Mapped[ChangeRequest] = relationship(back_populates="impactAssessment")
+
+
+# ─── MocAttachment — supporting docs (Supabase two-phase signed-URL) ──
+
+
+class MocAttachment(Base, IdMixin):
+    __tablename__ = "MocAttachment"
+
+    changeRequestId: Mapped[str] = mapped_column(
+        ForeignKey("ChangeRequest.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    fileName: Mapped[str] = mapped_column(String, nullable=False)
+    storagePath: Mapped[str] = mapped_column(String, nullable=False)
+    fileSize: Mapped[int] = mapped_column(Integer, nullable=False)
+    mimeType: Mapped[str] = mapped_column(String, nullable=False)
+    caption: Mapped[str | None] = mapped_column(Text)
+    # FK-by-value → User.id (resolved to a display name in the router).
+    uploadedById: Mapped[str] = mapped_column(String, nullable=False)
+    uploadedAt: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    deletedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+    changeRequest: Mapped[ChangeRequest] = relationship(back_populates="attachments")
 
 
 # ─── MocFreeze — administrative block on new submissions ──────────────

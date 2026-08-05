@@ -177,7 +177,11 @@ async def list_items(
         stmt = stmt.where(PpeItem.ppeTypeCode == typeCode)
     if holderId:
         stmt = stmt.where(PpeItem.currentHolderUserId == holderId)
-    items = (await db.execute(stmt.order_by(PpeItem.itemNumber.asc()))).scalars().all()
+    # Newest-created first — platform-wide register convention (itemNumber asc
+    # put the oldest catalogued item on top).
+    items = (
+        await db.execute(stmt.order_by(PpeItem.createdAt.desc(), PpeItem.id.desc()))
+    ).scalars().all()
 
     now = datetime.now(timezone.utc)
     # category filter needs the type → resolve codes once
@@ -427,7 +431,10 @@ async def list_issuances(
     stmt = select(PpeIssuance).where(PpeIssuance.plantId == plantId)
     if status_filter:
         stmt = stmt.where(PpeIssuance.status == status_filter)
-    rows = (await db.execute(stmt.order_by(PpeIssuance.issuedAt.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(stmt.order_by(PpeIssuance.createdAt.desc(), PpeIssuance.id.desc()))
+    ).scalars().all()
     now = datetime.now(timezone.utc)
     out: list[dict] = []
     for i in rows:
@@ -703,3 +710,17 @@ async def ptw_gate_check(
         "nonCompliantWorkers": non_compliant,
         "overrideAllowed": False,
     }
+
+
+# ── P3-3 Expired PPE on active permits ───────────────────────────────────────
+@router.get("/expired-on-active-permits")
+async def expired_on_active_permits(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Workers on ACTIVE/SUSPENDED permits whose PPE lapsed (service-life,
+    inspection, fit-test, or recall) after activation. Powers the PTW red banner."""
+    from app.services.access_scope import build_query_scope
+    from app.services.ppe_expiry import expired_ppe_on_active_permits as _q
+    scope = await build_query_scope(db, user.id, "PPE.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await _q(db, pids)

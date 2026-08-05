@@ -21,7 +21,13 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
-from app.models.observation import Observation, ObservationAttachment, ObservationStatus
+from app.models.observation import (
+    Observation,
+    ObservationAttachment,
+    ObservationCategory,
+    ObservationStatus,
+)
+from app.models.observation_severity import OVERRIDE_SOURCE_EDIT
 from app.models.plant import Plant
 from app.models.user import User
 from app.models.workflow import WorkflowTask
@@ -112,7 +118,10 @@ async def list_observations(
         except ValueError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid status: {status_filter}") from e
 
-    stmt = stmt.order_by(Observation.date.desc()).limit(100)
+    # Newest-created first — platform-wide register convention. Ordering by the
+    # user-entered event `date` buried a just-submitted record whenever the
+    # event itself was backdated.
+    stmt = stmt.order_by(Observation.createdAt.desc(), Observation.id.desc()).limit(100)
     rows = (await db.execute(stmt)).scalars().all()
     return ObservationListResponse(items=[ObservationOut.model_validate(r) for r in rows], total=len(rows))
 
@@ -131,13 +140,87 @@ async def create_observation(
     if plant is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid plant")
 
+    # P3-1 BBS quality gate — reject vague at-risk submissions; compute specificity.
+    from app.services.bbs_quality import capa_recommended, quality_score, validate_quality
+
+    _otype = payload.type.value if hasattr(payload.type, "value") else str(payload.type)
+    _qerr = validate_quality(_otype, payload.description)
+    if _qerr:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, _qerr)
+    _qscore = quality_score(payload.description, payload.areaId, payload.responsiblePersonId)
+
+    # ─── STOP taxonomy gate ───
+    # 400s on a category/sub-category that doesn't belong to this type's axis
+    # (e.g. "Reactions of People" on an UNSAFE_CONDITION). Server-side by
+    # design — the type-aware dropdowns are UX, this is the enforcement.
+    from app.services import observation_taxonomy as tax
+
+    _cat_code, _sub_code, _axis = await tax.validate_selection(
+        db, payload.type, payload.categoryCode, payload.subCategoryCode
+    )
+    # Dual-write the legacy `category` enum from the STOP code so every existing
+    # group-by-category consumer (insight rules, Daily Brief, BBS quality,
+    # list-view analytics, mobile) keeps working untouched. Safe observations
+    # keep the hazard category the observer picked.
+    _legacy = tax.legacy_category_for(_cat_code) or payload.category
+    if _legacy is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A hazard category is required for safe observations.",
+        )
+    # Coerce explicitly: legacy_category_for hands back a plain string, and
+    # relying on SQLAlchemy's name-vs-value lookup to accept it would break the
+    # day a STOP code's name and value stop being identical.
+    _category = ObservationCategory(_legacy)
+
     # Compare on date only — sidesteps the offset-naive vs offset-aware
     # datetime mismatch you get when the form sends a bare YYYY-MM-DD that
-    # Pydantic parses as a naive datetime.
+    # Pydantic parses as a naive datetime. Only reachable on the manual
+    # fallback path: with an SLA policy in force the server computes the date.
     if payload.targetDate is not None:
         target_d = payload.targetDate.date() if hasattr(payload.targetDate, "date") else payload.targetDate
         if target_d < datetime.now(timezone.utc).date():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target closure date cannot be in the past.")
+
+    # ─── Worker Involved gate ───
+    # Mandatory only for UNSAFE_ACT at HIGH/CRITICAL. Enforced server-side so
+    # the form's conditional asterisk cannot be the only thing holding the rule
+    # (spec §7 walks all four severity × two type combinations).
+    from app.services import observation_deroster as deroster_svc
+
+    _workers_required = deroster_svc.worker_involved_required(payload.type, payload.severity)
+    if _workers_required and not payload.workersInvolved:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "At least one worker must be named for a High or Critical severity Unsafe Act.",
+        )
+    for _w in payload.workersInvolved:
+        try:
+            _w.validated()
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+    # ─── Severity suggestion gate ───
+    # The engine is re-resolved HERE rather than trusting `payload.suggestedSeverity`.
+    # It is deterministic, so recomputing costs one indexed lookup — and keying
+    # the justification requirement on a client-supplied value would let any
+    # client skip it by claiming the suggestion matched. A combination with no
+    # seeded rule yields no suggestion, no requirement and no log row, which is
+    # exactly today's behaviour (§6.6 — degrade gracefully, never block).
+    from app.services import observation_severity as sev_svc
+
+    _suggestion = await sev_svc.resolve(
+        db,
+        observation_type=_axis or payload.type,
+        category=_cat_code,
+        sub_category=_sub_code,
+        plant_id=payload.plantId,
+        area_id=payload.areaId,
+    )
+    try:
+        sev_svc.require_reason(_suggestion, payload.severity, payload.severityOverrideReason)
+    except sev_svc.SeverityOverrideError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
     # Number generation — same pattern as Node side: count existing rows + 1
     count_stmt = select(func.count()).select_from(Observation).where(Observation.plantId == payload.plantId)
@@ -148,19 +231,74 @@ async def create_observation(
         number=number,
         date=payload.date,
         type=payload.type,
-        category=payload.category,
+        category=_category,
+        categoryCode=_cat_code,
+        subCategoryCode=_sub_code,
+        taxonomyAxis=_axis,
         severity=payload.severity,
         plantId=payload.plantId,
         areaId=payload.areaId,
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
+        contractorCompanyId=payload.contractorCompanyId,
         description=payload.description,
+        qualityScore=_qscore,
+        antecedent=getattr(payload, "antecedent", None),
+        behaviourObserved=getattr(payload, "behaviourObserved", None),
+        consequence=getattr(payload, "consequence", None),
         immediateAction=payload.immediateAction,
         targetDate=payload.targetDate,
         status=ObservationStatus.OPEN,
     )
     db.add(obs)
     await db.flush()
+
+    # ─── Severity override log ───
+    # After the flush, so `obs.id` exists and the row can never reference an id
+    # that was rolled back. Inside the main transaction, so an override can
+    # never be silently lost while the observation it justifies saves. Writes
+    # nothing when the observer accepted the suggestion — agreement carries no
+    # analytical signal the observation itself doesn't already carry.
+    sev_svc.log_override(
+        db,
+        observation=obs,
+        suggestion=_suggestion,
+        final_severity=payload.severity,
+        reason=payload.severityOverrideReason,
+        actor_id=user.id,
+        source=payload.severityOverrideSource,
+    )
+
+    # ─── SLA-based target closure date ───
+    # Computed from the severity × category-group matrix and stamped with a
+    # frozen copy of the policy applied. Falls back to the submitted free-text
+    # date when no policy matches, so unconfigured policy never blocks a
+    # submission (spec §2.1). Runs INSIDE the main transaction — the date and
+    # its history row are part of the record, not a best-effort side effect.
+    from app.services import observation_sla as sla_svc
+
+    await sla_svc.apply_on_create(
+        db, obs, submitted_target_date=payload.targetDate, actor_id=user.id
+    )
+    await db.flush()
+
+    # ─── Named workers + deroster trigger ───
+    # Also inside the main transaction: a High-severity act whose worker rows
+    # silently failed to save would leave the record looking unattributed, and
+    # the soft-lock is the whole point of the feature.
+    _workers = []
+    if payload.workersInvolved:
+        try:
+            _workers = await deroster_svc.persist_workers_involved(
+                db, obs, payload.workersInvolved, actor_id=user.id
+            )
+        except deroster_svc.DerosterError as e:
+            raise HTTPException(e.status_code, str(e)) from e
+
+    if _workers:
+        await deroster_svc.trigger_for_observation(
+            db, obs, _workers, actor_id=user.id, category_label=obs.subCategoryCode
+        )
 
     # Kick off workflow. Best-effort — workflow init failures must NOT
     # poison the main transaction (otherwise the Observation INSERT, even
@@ -228,6 +366,18 @@ async def create_observation(
         print(f"TriageAgent failed: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
 
+    # Training & Competency Engine — stage a trigger event (dedicated outbox) so
+    # the background resolver can evaluate the severity + threshold rules against
+    # this observation's classification. Best-effort SAVEPOINT — never blocks
+    # creation (spec: rule engine runs as a background job, not in the request).
+    try:
+        async with db.begin_nested():
+            from app.services.training_engine import emit_training_trigger
+
+            await emit_training_trigger(db, "OBSERVATION", obs)
+    except Exception as e:  # noqa: BLE001
+        print(f"Training trigger emit failed: {e}", file=sys.stderr)
+
     # Final refresh before serialising. The savepoint flushes above
     # (workflow init, TriageAgent's UPDATE on closureTriggers) leave
     # `obs` with expired attributes — even with expire_on_commit=False
@@ -236,7 +386,15 @@ async def create_observation(
     # MissingGreenlet because the lazy load needs an async context.
     # Refreshing here loads everything in one round-trip.
     await db.refresh(obs)
-    return ObservationOut.model_validate(obs)
+    out = ObservationOut.model_validate(obs)
+    # Echo back the named workers with their flags so the form can route
+    # straight to the review panel on a qualifying submission.
+    from app.schemas.observation_sla import WorkerInvolvedOut
+
+    out.workersInvolved = [
+        WorkerInvolvedOut(**r) for r in await deroster_svc.load_workers_involved(db, obs.id)
+    ]
+    return out
 
 
 @router.get("/{observation_id}", response_model=ObservationOut)
@@ -261,7 +419,16 @@ async def get_observation(
     )
     if not result.allowed and not await _is_workflow_actor(db, user.id, observation_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    return ObservationOut.model_validate(obs)
+    out = ObservationOut.model_validate(obs)
+    # Detail view hydrates the named workers + their reviews; the list route
+    # deliberately does not (one child query per row).
+    from app.schemas.observation_sla import WorkerInvolvedOut
+    from app.services import observation_deroster as deroster_svc
+
+    out.workersInvolved = [
+        WorkerInvolvedOut(**r) for r in await deroster_svc.load_workers_involved(db, obs.id)
+    ]
+    return out
 
 
 @router.patch("/{observation_id}", response_model=ObservationOut)
@@ -288,6 +455,108 @@ async def update_observation(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
+
+    # ─── Core-detail edit ("edit while open"). A CLOSED observation is a
+    #     finalised record — its facts can't be edited (workflow status changes
+    #     still go through their own panels). ───
+    core_edit = any(
+        v is not None
+        for v in (
+            payload.type, payload.category, payload.categoryCode, payload.subCategoryCode,
+            payload.severity, payload.description, payload.areaId,
+        )
+    )
+    if core_edit and obs.status == ObservationStatus.CLOSED:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot edit a closed observation.")
+
+    # ─── STOP taxonomy ───
+    # Only re-validated when the edit actually touches type or the taxonomy —
+    # a status-only PATCH on a legacy record (no categoryCode yet) must not be
+    # blocked by a requirement that record predates.
+    from app.services import observation_taxonomy as tax
+
+    if any(v is not None for v in (payload.type, payload.categoryCode, payload.subCategoryCode)):
+        new_type = payload.type if payload.type is not None else obs.type
+        old_axis = obs.taxonomyAxis or tax.axis_for_type(obs.type)
+        # Crossing the act/condition boundary invalidates the stored pair by
+        # definition. Drop it and let validate_selection demand a fresh one —
+        # the server-side mirror of the form's clear-and-re-prompt, so an API
+        # caller can't leave a now-invalid category silently attached either.
+        axis_changed = tax.axis_for_type(new_type) != old_axis
+        keep_cat = None if axis_changed else obs.categoryCode
+        keep_sub = None if axis_changed else obs.subCategoryCode
+        cat_code, sub_code, axis = await tax.validate_selection(
+            db,
+            new_type,
+            payload.categoryCode if payload.categoryCode is not None else keep_cat,
+            payload.subCategoryCode if payload.subCategoryCode is not None else keep_sub,
+        )
+        obs.categoryCode = cat_code
+        obs.subCategoryCode = sub_code
+        obs.taxonomyAxis = axis
+        legacy = tax.legacy_category_for(cat_code)
+        if legacy is not None:
+            obs.category = ObservationCategory(legacy)
+
+    if payload.type is not None:
+        obs.type = payload.type
+    if payload.category is not None and tax.legacy_category_for(obs.categoryCode) is None:
+        # An at-risk record's `category` is owned by the STOP code (dual-write);
+        # only a safe observation lets the client set it directly.
+        obs.category = payload.category
+    if payload.severity is not None:
+        obs.severity = payload.severity
+    if payload.description is not None:
+        obs.description = payload.description
+    if payload.areaId is not None:
+        obs.areaId = payload.areaId or None
+    if payload.responsiblePersonId is not None:
+        obs.responsiblePersonId = payload.responsiblePersonId or None
+    if payload.targetDate is not None:
+        obs.targetDate = payload.targetDate
+
+    # ─── Severity suggestion gate (edit path) ───
+    # Runs only when the edit touches an input the suggestion depends on. A
+    # status-only or description-only PATCH must never demand a justification
+    # for a severity that was set — and possibly already justified — earlier.
+    #
+    # Re-saving an unchanged, already-logged override is also not a new
+    # decision: `existing_override` finds the row for this exact
+    # (suggested, final) pair and lets the save through without duplicating it.
+    # A different pair is a fresh decision and needs its own reason.
+    _sev_inputs_touched = any(
+        v is not None
+        for v in (payload.severity, payload.categoryCode, payload.subCategoryCode,
+                  payload.type, payload.areaId)
+    )
+    if _sev_inputs_touched:
+        from app.services import observation_severity as sev_svc
+
+        suggestion = await sev_svc.resolve_for_observation(db, obs)
+        if sev_svc.diverges(suggestion, obs.severity):
+            final = sev_svc.normalise_severity(obs.severity)
+            already = await sev_svc.existing_override(
+                db,
+                observation_id=obs.id,
+                suggested=suggestion["suggested"],
+                final=final,
+            )
+            if already is None:
+                try:
+                    sev_svc.require_reason(
+                        suggestion, obs.severity, payload.severityOverrideReason
+                    )
+                except sev_svc.SeverityOverrideError as e:
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+                sev_svc.log_override(
+                    db,
+                    observation=obs,
+                    suggestion=suggestion,
+                    final_severity=obs.severity,
+                    reason=payload.severityOverrideReason,
+                    actor_id=user.id,
+                    source=OVERRIDE_SOURCE_EDIT,
+                )
 
     if payload.status is not None:
         obs.status = payload.status
@@ -453,16 +722,11 @@ async def upload_attachment(
     if obs is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
     record = {"observerId": obs.observerId, "responsiblePersonId": obs.responsiblePersonId}
-    # The observer who logged this observation can always attach their own
-    # evidence — mirrors the gallery-read rule. Observations can be CREATEd for
-    # any plant (ALL_PLANTS), so without this the observer would be blocked from
-    # adding a photo to their own cross-plant observation (UPDATE is OWN_PLANT).
-    is_observer = bool(user.id) and obs.observerId == user.id
     result = await can(
         db, user.id, "OBSERVATION.UPDATE",
         PermissionContext(record_id=obs.id, plant_id=obs.plantId, record=record),
     )
-    if not result.allowed and not is_observer:
+    if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     if not is_storage_configured():
         raise HTTPException(
@@ -605,3 +869,30 @@ async def download_attachment(
         download=None if inline else att.fileName,
     )
     return {"url": url}
+
+
+# ── P3-1 Raise a corrective action from an at-risk observation ────────────────
+@router.post("/{observation_id}/raise-capa")
+async def raise_capa_from_observation(
+    observation_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict:
+    """One-click CAPA from an at-risk observation (SAFETY_OBSERVATION source).
+    Idempotent — returns the existing CAPA if one was already raised."""
+    obs = await db.get(Observation, observation_id)
+    if obs is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
+    await require_permission_with_context("OBSERVATION.UPDATE", user, db, plant_id=obs.plantId)
+    if obs.capaId:
+        return {"capaId": obs.capaId, "created": False}
+    from app.services.capa_spawn import spawn_capa
+    capa = await spawn_capa(
+        db, source_code="SAFETY_OBSERVATION", plant_id=obs.plantId,
+        title=f"Corrective action — {obs.description[:120]}", problem=obs.description[:500],
+        ref_id=obs.id, ref_url=f"/observations/{obs.id}", ref_summary=obs.number,
+        metadata={"observationNumber": obs.number}, severity="MODERATE",
+        detected_method="SAFETY_OBSERVATION", owner_id=obs.responsiblePersonId or user.id, actor_id=user.id, due_days=30,
+    )
+    await db.flush()
+    obs.capaId = capa.id
+    await db.commit()
+    return {"capaId": capa.id, "capaNumber": capa.capaNumber, "created": True}

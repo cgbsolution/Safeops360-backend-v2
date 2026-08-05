@@ -105,6 +105,17 @@ class NearMissUpdate(BaseModel):
     rootCauseCategory: str | None = None
     rootCauseDetail: str | None = None
     targetDate: datetime | None = None
+    # ─── Editable core details ("edit while open"). All optional; applied only
+    #     while the near miss is not CLOSED (router guard) under NEAR_MISS.UPDATE. ───
+    description: str | None = Field(default=None, min_length=10)
+    potentialSeverity: Severity | None = None
+    areaId: str | None = None
+    location: str | None = None
+    specificLocation: str | None = None
+    hazardCategory: str | None = None
+    energySource: str | None = None
+    activityBeingPerformed: str | None = None
+    immediateAction: str | None = None
 
 
 class NearMissPersonOut(BaseModel):

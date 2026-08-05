@@ -164,6 +164,14 @@ class IncidentClassifyRequest(BaseModel):
     costPropertyDamage: float | None = None
     costLostProduction: float | None = None
 
+    # ─── Feature 5 — numeric 5×5 severity scoring ───
+    # consequenceScore set by the classifier; likelihoodOfRecurrence defaults
+    # to the trend-matcher count but can be overridden. When present, severity
+    # `severity` label is derived from the resulting band.
+    consequenceScore: int | None = Field(default=None, ge=1, le=5)
+    likelihoodOfRecurrence: int | None = Field(default=None, ge=1, le=5)
+    linkedRiskRegisterId: str | None = None
+
     # Required to advance the Phase 2 workflow CHECKER step
     classificationTaskId: str
     comments: str | None = None
@@ -177,6 +185,7 @@ class IncidentCapaInput(BaseModel):
     description: str = Field(min_length=10)
     type: Literal["CORRECTIVE", "PREVENTIVE"]
     rootCauseAddressed: str | None = None
+    linkedCauseId: str | None = None  # Feature 1 — RCA cause node this CAPA addresses
     ownerId: str
     targetDate: datetime
 
@@ -188,6 +197,7 @@ class IncidentCapaOut(BaseModel):
     description: str
     type: str
     rootCauseAddressed: str | None
+    linkedCauseId: str | None = None
     ownerId: str
     targetDate: datetime
     status: str
@@ -482,7 +492,65 @@ class IncidentOut(BaseModel):
     statutoryDeadline: datetime | None = None
     severity: str | None = None
 
+    # ─── Incident Intelligence (Slice 1) ───
+    severityDetail: dict[str, Any] | None = None  # Feature 5
+    aiAssist: dict[str, Any] | None = None  # Feature 2
+    # ─── Incident Intelligence (Slice 2) ───
+    causeAnalysis: dict[str, Any] | None = None  # Feature 1 shared canvas model
+    statutoryObligation: dict[str, Any] | None = None  # Feature 4
+    costImpact: dict[str, Any] | None = None  # Feature 8
+
     model_config = {"from_attributes": True}
+
+
+# ─── Incident Intelligence (Slice 1) request payloads ─────────────────────
+
+
+class CauseAnalysisPatch(BaseModel):
+    """Feature 1 — method-agnostic upsert of the RCA canvas. Both the Fishbone
+    and 5-Why views read/write the same `rootCauseData` store; the router
+    re-derives the denormalised `rootCauses` array + plain-English summary."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    rootCauseMethod: str | None = None
+    rootCauseData: dict[str, Any] | None = None
+    # Feature 1 (Slice 2) — the shared canvas model. Both Fishbone and 5-Why
+    # views write this one `causes[]` array so switching method never loses data.
+    causeAnalysis: dict[str, Any] | None = None
+    immediateCauses: list[str] | None = None
+    underlyingCauses: list[str] | None = None
+    rootCauses: list[str] | None = None
+    contributingFactors: list[str] | None = None
+
+
+class SeverityScoreRequest(BaseModel):
+    """Feature 5 — (re)compute the numeric severity score outside the classify
+    flow, e.g. when a new similar incident changes the recurrence likelihood."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    consequenceScore: int | None = Field(default=None, ge=1, le=5)
+    likelihoodOfRecurrence: int | None = Field(default=None, ge=1, le=5)
+    linkedRiskRegisterId: str | None = None
+
+
+class AiSummaryDecision(BaseModel):
+    """Accept (optionally with an edited paragraph) an AI-drafted summary."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str | None = None  # edited text; if omitted, accepts the draft as-is
+
+
+class AiSuggestionDecision(BaseModel):
+    """Accept / edit / reject an AI root-cause suggestion. `reason` is logged to
+    the audit trail on rejection (optional free text, per spec)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    text: str | None = None  # edited root-cause text on accept
+    reason: str | None = None  # rejection reason
 
 
 # ─── Attachments ─────────────────────────────────────────────────────────

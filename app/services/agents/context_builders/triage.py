@@ -505,6 +505,10 @@ async def _active_permits_in_area(
     active_statuses = [
         PermitStatus.ACTIVE,
         PermitStatus.SUSPENDED,
+        # Closed-loop states (post-approval, pre-acceptance)
+        PermitStatus.APPROVED,
+        PermitStatus.ISSUED,
+        # Deprecated pre-rebuild intermediates (kept for old rows)
         PermitStatus.PLANT_HEAD_APPROVED,
         PermitStatus.SAFETY_APPROVED,
         PermitStatus.ISSUER_APPROVED,

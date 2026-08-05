@@ -19,8 +19,11 @@ Public surface mirrors the TS WorkflowEngine object:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+_wf_logger = logging.getLogger(__name__)
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +47,41 @@ from app.services.permissions import get_user_role_codes
 
 class WorkflowError(Exception):
     """Workflow-level error. Routers convert to HTTP 400 / 403."""
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# PTW closed-loop step names (must match app/seed/seed_workflows.py)
+# ───────────────────────────────────────────────────────────────────────────
+
+# Receiver acceptance — first-class signed act, completable ONLY via
+# POST /api/ptw/{id}/accept (which captures GPS + photo + signature).
+PTW_ACCEPT_STEP = "Receiver Accepts Permit"
+# Conditional FLRA sub-task (instantiated only when Permit.flraRequired).
+PTW_FLRA_STEP = "FLRA & Crew Sign-off"
+# Pre-rebuild combined receiver step — in-flight instances seeded before the
+# closed-loop rebuild still carry this name; they keep the legacy behaviour.
+PTW_LEGACY_RECEIVER_PREFIX = "Receiver Acknowledges"
+
+
+def _ptw_approval_step_key(step: WorkflowStep) -> str:
+    """Map a PTW workflow step to the PermitApproval.step key
+    (ISSUER | SAFETY_OFFICER | PLANT_HEAD | CLOSURE | <step name>)."""
+    step_type = step.stepType.value if hasattr(step.stepType, "value") else str(step.stepType)
+    if step_type == StepType.CLOSURE.value:
+        return "CLOSURE"
+    # Two seeds define the issuer step differently: app/seed/seed_workflows.py
+    # uses approverField="ISSUER", while prisma/seed-workflows.ts — the shape
+    # the live definitions actually carry — uses approverRole="PERMIT_ISSUER".
+    # Matching only the first meant the key fell through to the free-text step
+    # name, so Permit.issuerApprovedAt was never stamped on any live permit
+    # and PermitApproval.step recorded "Issuer Review" instead of "ISSUER".
+    if step.approverField == "ISSUER" or step.approverRole == "PERMIT_ISSUER":
+        return "ISSUER"
+    if step.approverRole == "SAFETY_OFFICER":
+        return "SAFETY_OFFICER"
+    if step.approverRole == "PLANT_HEAD":
+        return "PLANT_HEAD"
+    return step.name
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -193,6 +231,23 @@ async def _enrich_record_data(
                 merged.setdefault("actionOwnerId", nm.actionOwnerId)
                 merged.setdefault("responsiblePersonId", nm.actionOwnerId)
                 merged.setdefault("plantId", nm.plantId)
+        elif module == "PTW":
+            # Closed-loop rebuild. Two jobs:
+            #  • assignee safety net — approving without recordData (the
+            #    mobile inbox does this) used to fall back to the initiator
+            #    for the RECEIVER step; issuer/receiver now always resolve.
+            #  • condition inputs — the conditional FLRA step's
+            #    conditionExpr evaluates `flraRequired` from here.
+            from app.models.permit import Permit as _Permit
+
+            p = await db.get(_Permit, record_id)
+            if p is not None:
+                merged.setdefault("originatorId", p.originatorId)
+                merged.setdefault("issuerId", p.issuerId)
+                merged.setdefault("receiverId", p.receiverId)
+                merged.setdefault("plantId", p.plantId)
+                merged.setdefault("type", p.type.value if hasattr(p.type, "value") else p.type)
+                merged.setdefault("flraRequired", bool(p.flraRequired))
         # Other modules can be added as their workflows wire up. Falling
         # through with the base dict is safe — we just lose the safety net.
     except Exception:
@@ -401,25 +456,71 @@ async def _sync_record_status(
     record_id: str,
     next_step_type: StepType | None,
     instance_completed: bool,
+    actor_id: str | None = None,
 ) -> None:
     """Mirror of TS syncRecordStatus(). Module-specific status mapping kept here
     to centralise the rules. Only PTW has a non-trivial status enum that the
     engine drives; other modules use generic statuses that are status-set by
-    the route handlers themselves."""
+    the route handlers themselves.
+
+    PTW closed-loop mapping:
+      • next step CHECKER/VERIFIER   → SUBMITTED (pending approval chain)
+      • next step ASSIGNEE_TASK      → APPROVED → auto-ISSUED (released to the
+                                       receiver; issuedAt/issuedById stamped once)
+      • next step CLOSURE            → ACTIVE (receiver accepted — work in
+                                       progress; activatedAt/ById stamped once)
+      • instance completed           → CLOSED (post-closure rules fire)
+    WORK_COMPLETED / HANDBACK_INSPECTION are driven by the dedicated
+    /complete and /handback endpoints, not by the engine."""
     if module == "PTW":
         from app.models.permit import Permit, PermitStatus
 
         permit = await db.get(Permit, record_id)
-        if permit is None or permit.status in {PermitStatus.SUSPENDED, PermitStatus.EXPIRED, PermitStatus.REJECTED}:
+        if permit is None or permit.status in {
+            PermitStatus.SUSPENDED,
+            PermitStatus.EXPIRED,
+            PermitStatus.REJECTED,
+            PermitStatus.CANCELLED,
+        }:
             return
 
+        now = datetime.now(timezone.utc)
         if instance_completed:
             permit.status = PermitStatus.CLOSED
-            permit.closedAt = datetime.now(timezone.utc)
-        elif next_step_type in (StepType.ASSIGNEE_TASK.value, StepType.CLOSURE.value):
-            permit.status = PermitStatus.ACTIVE
+            permit.closedAt = now
+        elif next_step_type == StepType.ASSIGNEE_TASK.value:
+            # Final approval landed → APPROVED, then auto-fire the
+            # APPROVED → ISSUED release in the same transaction (issue mode
+            # (a): zero-friction; a manual "Issue" button can slot in here
+            # later by stopping at APPROVED).
+            if permit.status in (
+                PermitStatus.DRAFT,
+                PermitStatus.SUBMITTED,
+                PermitStatus.APPROVED,
+                PermitStatus.ISSUED,
+            ):
+                permit.status = PermitStatus.ISSUED
+                if permit.issuedAt is None:
+                    permit.issuedAt = now
+                    permit.issuedById = actor_id
+        elif next_step_type == StepType.CLOSURE.value:
+            # Receiver accepted → work in progress. Never downgrade a permit
+            # that already declared Work Completed / recorded its handback
+            # (repair-orphan may recreate a closure task later).
+            if permit.status in (
+                PermitStatus.SUBMITTED,
+                PermitStatus.APPROVED,
+                PermitStatus.ISSUED,
+                PermitStatus.ACTIVE,
+            ):
+                permit.status = PermitStatus.ACTIVE
+                if permit.activatedAt is None:
+                    permit.activatedAt = now
+                    permit.activatedById = actor_id
         else:
-            permit.status = PermitStatus.SUBMITTED
+            # Still inside the approval chain.
+            if permit.status in (PermitStatus.DRAFT, PermitStatus.SUBMITTED):
+                permit.status = PermitStatus.SUBMITTED
         await db.flush()
 
         # Post-closure cross-module triggers (Dimension 4). Each rule is
@@ -518,10 +619,23 @@ async def _sync_record_status(
                     run_incident_post_closure_rules,
                 )
 
-                await run_incident_post_closure_rules(db, incident_id=record_id)
-        except Exception as e:  # noqa: BLE001
-            import sys
-            print(f"[post-closure] INCIDENT {record_id}: {e}", file=sys.stderr)
+                audit_log = await run_incident_post_closure_rules(db, incident_id=record_id)
+            # Surface per-rule failures. The rules engine catches them
+            # internally and returns them as audit entries, so logging nothing
+            # here meant a compliance-relevant trigger (HIRA review, CAPA
+            # spawn) could fail without leaving any reviewable trace.
+            failed = [e for e in (audit_log or []) if e.get("error")]
+            if failed:
+                _wf_logger.error(
+                    "[post-closure] INCIDENT %s: %d rule(s) failed: %s",
+                    record_id,
+                    len(failed),
+                    "; ".join(f"{e.get('ruleName')}: {e.get('reason')}" for e in failed),
+                )
+        except Exception:  # noqa: BLE001
+            _wf_logger.exception(
+                "[post-closure] INCIDENT %s: rules engine aborted", record_id
+            )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -846,6 +960,7 @@ async def initiate(
         record_id=record_id,
         next_step_type=next_step.stepType,
         instance_completed=False,
+        actor_id=initiator_id,
     )
     return instance
 
@@ -892,6 +1007,14 @@ async def _advance(
     current_step = next((s for s in steps if s.id == task.stepId), None)
     if current_step is None:
         raise WorkflowError("Step missing")
+
+    # Enrich record_data from the actual record BEFORE evaluating step
+    # conditions — the caller may have passed nothing (mobile inbox), and
+    # conditional steps (e.g. PTW's FLRA sub-task keyed on `flraRequired`)
+    # must see the canonical values, not a partial client dict.
+    record_data = await _enrich_record_data(
+        db, module=task.module, record_id=task.recordId, base=record_data
+    )
 
     # Mark this specific task complete and record history first.
     task.status = TaskStatus.COMPLETED.value
@@ -971,6 +1094,7 @@ async def _advance(
         record_id=task.recordId,
         next_step_type=next_step.stepType if next_step else None,
         instance_completed=next_step is None,
+        actor_id=user_id,
     )
 
     # Post-step hooks. Anything that needs to run AFTER a specific step
@@ -1036,31 +1160,54 @@ async def approve(
         raise WorkflowError("Step missing")
     await _rbac_gate(db, task=task, step=current_step, user_id=user_id, action="APPROVE")
 
-    # PTW closure gate: a permit cannot reach CLOSED until the receiver has
-    # returned the permit AND a site-verification has been recorded. Closing
-    # remark goes onto Permit.closingRemark via _sync_record_status.
-    if task.module == "PTW" and current_step.stepType == StepType.CLOSURE.value:
-        from app.models.permit import Permit as PermitModel
+    # PTW: every approval writes an audit-grade PermitApproval row + the
+    # legacy per-step timestamp (Phase-6 dead-code fix — the table existed
+    # but nothing ever wrote to it). The CLOSURE step additionally enforces
+    # the closed-loop gate: Work Completed declared + handback inspection
+    # recorded + a closing remark.
+    if task.module == "PTW":
+        from app.models.permit import Permit as PermitModel, PermitApproval
 
         permit_row = await db.get(PermitModel, task.recordId)
         if permit_row is None:
-            raise WorkflowError("Permit not found for closure")
-        if permit_row.returnedAt is None:
-            raise WorkflowError(
-                "Receiver must return the permit before closure. "
-                "Open the permit detail page → Return panel."
+            raise WorkflowError("Permit not found")
+
+        step_key = _ptw_approval_step_key(current_step)
+
+        if current_step.stepType == StepType.CLOSURE.value:
+            if permit_row.workCompletedAt is None and permit_row.returnedAt is None:
+                raise WorkflowError(
+                    "Receiver must declare Work Completed before closure. "
+                    "Open the permit detail page → Work Completed panel."
+                )
+            if permit_row.siteVerifiedAt is None:
+                raise WorkflowError(
+                    "Handback inspection is required before closure. "
+                    "Open the permit detail page → Handback Inspection panel."
+                )
+            if not (comments and comments.strip()):
+                raise WorkflowError("A closing remark is required.")
+            # Persist the closing remark + closer onto the permit row so the
+            # detail view + post-closure rules engine can read them.
+            permit_row.closedById = user_id
+            permit_row.closingRemark = comments.strip()
+
+        now = datetime.now(timezone.utc)
+        if step_key == "ISSUER":
+            permit_row.issuerApprovedAt = now
+        elif step_key == "SAFETY_OFFICER":
+            permit_row.safetyApprovedAt = now
+        elif step_key == "PLANT_HEAD":
+            permit_row.plantHeadApprovedAt = now
+        db.add(
+            PermitApproval(
+                permitId=permit_row.id,
+                step=step_key,
+                approverId=user_id,
+                decision="APPROVED",
+                comments=comments,
             )
-        if permit_row.siteVerifiedAt is None:
-            raise WorkflowError(
-                "Site verification is required before closure. "
-                "Open the permit detail page → Site Verification panel."
-            )
-        if not (comments and comments.strip()):
-            raise WorkflowError("A closing remark is required.")
-        # Persist the closing remark + closer onto the permit row so the
-        # detail view + post-closure rules engine can read them.
-        permit_row.closedById = user_id
-        permit_row.closingRemark = comments.strip()
+        )
         await db.flush()
 
     return await _advance(
@@ -1093,6 +1240,26 @@ async def reject(
         raise WorkflowError("Step missing")
     await _rbac_gate(db, task=task, step=current_step, user_id=user_id, action="REJECT")
 
+    # PTW (Phase-6 dead-code fix): REJECTED used to be written only to the
+    # WorkflowInstance — Permit.status stayed SUBMITTED and rejectionReason
+    # was never populated. Persist both, plus the PermitApproval audit row.
+    if task.module == "PTW":
+        from app.models.permit import Permit as PermitModel, PermitApproval, PermitStatus as _PStatus
+
+        permit_row = await db.get(PermitModel, task.recordId)
+        if permit_row is not None:
+            permit_row.status = _PStatus.REJECTED
+            permit_row.rejectionReason = reason
+            db.add(
+                PermitApproval(
+                    permitId=permit_row.id,
+                    step=_ptw_approval_step_key(current_step),
+                    approverId=user_id,
+                    decision="REJECTED",
+                    comments=f"{reason}\n\n{comments}" if comments else reason,
+                )
+            )
+
     task.status = TaskStatus.COMPLETED.value
     task.completedAt = datetime.now(timezone.utc)
     instance.status = InstanceStatus.REJECTED.value
@@ -1124,6 +1291,7 @@ async def submit_execution(
     attachments: list[str] | None = None,
     record_data: dict[str, Any] | None = None,
     plant_id: str | None = None,
+    allow_ptw_accept: bool = False,
 ) -> dict[str, Any]:
     task, instance, steps = await _load_task_with_definition(db, task_id)
     if task.status not in OPEN_TASK_STATUSES:
@@ -1133,21 +1301,55 @@ async def submit_execution(
         raise WorkflowError("Step missing")
     await _rbac_gate(db, task=task, step=current_step, user_id=user_id, action="EXECUTE")
 
-    # PTW activation gate: full pre-flight before transitioning out of the
-    # receiver step. Blocks on FLRA, crew validity, isolations, expiry, and
-    # any explicit suspension. The full blocker list is surfaced so the user
-    # can fix all of them in one round-trip.
+    # PTW receiver-side step gates (closed-loop rebuild):
+    #   • FLRA sub-task — completable only once the latest FLRA is COMPLETED
+    #     (all crew signed). No activation gate yet; that runs at Accept.
+    #   • Accept step — a first-class signed act. It must come through
+    #     POST /api/ptw/{id}/accept (allow_ptw_accept=True), which captures
+    #     GPS + photo + signature before delegating here; the generic
+    #     /api/workflow/submit-execution path is rejected with a pointer.
+    #     The full activation gate (FLRA if required, crew validity, PPE,
+    #     isolations, expiry) runs before the permit can go ACTIVE.
+    #   • Legacy combined step ("Receiver Acknowledges + FLRA…") — in-flight
+    #     permits from before the rebuild keep the original full-gate check.
     if task.module == "PTW" and current_step.stepType == StepType.ASSIGNEE_TASK.value:
-        from app.services.ptw_activation_gate import can_ptw_transition_to_active
+        step_name = current_step.name or ""
 
-        gate = await can_ptw_transition_to_active(db, task.recordId)
-        if not gate.ok:
-            messages = [b.message for b in gate.blockers]
+        if step_name == PTW_FLRA_STEP:
+            from app.models.flra import FLRA, FLRAStatus
+
+            latest_flra = (
+                await db.execute(
+                    select(FLRA)
+                    .where(FLRA.permitId == task.recordId)
+                    .where(FLRA.status.in_([FLRAStatus.IN_PROGRESS, FLRAStatus.COMPLETED]))
+                    .order_by(FLRA.createdAt.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if latest_flra is None or latest_flra.status != FLRAStatus.COMPLETED:
+                raise WorkflowError(
+                    "The FLRA must be completed (all crew signed) before this "
+                    "step can be closed. Open the FLRA panel to finish sign-off."
+                )
+        elif step_name == PTW_ACCEPT_STEP and not allow_ptw_accept:
             raise WorkflowError(
-                "Cannot activate permit:\n• " + "\n• ".join(messages)
-                if messages
-                else "Activation gate is closed for this permit."
+                "Receiver acceptance is a signed act — use POST /api/ptw/{id}/accept "
+                "(captures GPS, onsite photo and signature)."
             )
+        else:
+            # Accept step via the dedicated endpoint, or a legacy combined
+            # receiver step: run the full activation gate.
+            from app.services.ptw_activation_gate import can_ptw_transition_to_active
+
+            gate = await can_ptw_transition_to_active(db, task.recordId)
+            if not gate.ok:
+                messages = [b.message for b in gate.blockers]
+                raise WorkflowError(
+                    "Cannot activate permit:\n• " + "\n• ".join(messages)
+                    if messages
+                    else "Activation gate is closed for this permit."
+                )
 
     merged = {**(record_data or {}), **(execution_data or {})}
     return await _advance(
@@ -1282,6 +1484,19 @@ async def resubmit(
     instance.currentStepId = next_step.id
     instance.currentStepName = next_step.name
     instance.completedAt = None
+
+    # PTW: reject() now writes REJECTED onto the permit row, and
+    # _sync_record_status early-returns on REJECTED — so reset the permit
+    # back to SUBMITTED here (and clear the stale rejection reason) before
+    # the sync call below runs.
+    if instance.module == "PTW":
+        from app.models.permit import Permit as _PermitModel, PermitStatus as _PStatus
+
+        _permit = await db.get(_PermitModel, instance.recordId)
+        if _permit is not None and _permit.status == _PStatus.REJECTED:
+            _permit.status = _PStatus.SUBMITTED
+            _permit.rejectionReason = None
+
     db.add(
         WorkflowHistory(
             instanceId=instance.id,
@@ -1312,5 +1527,6 @@ async def resubmit(
         record_id=instance.recordId,
         next_step_type=next_step.stepType,
         instance_completed=False,
+        actor_id=user_id,
     )
     return {"ok": True, "sentTo": next_step.name}

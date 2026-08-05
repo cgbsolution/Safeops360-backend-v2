@@ -124,6 +124,11 @@ async def get_invocation(
     """Fetch an invocation and its tool calls. The caller is authorised
     if they have the agent's invoke permission (they triggered it) OR
     AGENT.AUDIT_VIEW (they're reviewing someone else's run)."""
+    # Sweep abandoned runs before reading. This is the poll endpoint, so it
+    # is exactly where a stuck row surfaces — without this the card spins
+    # forever on an invocation whose background task died. Cheap and
+    # idempotent: only writes when something is actually stale.
+    await agent_service.expire_stale_invocations(db)
     invocation = await _load_invocation_with_tool_calls(db, invocation_id)
     await _authorise_view(db, user, invocation)
     return AgentInvocationOut.model_validate(invocation)
@@ -164,6 +169,10 @@ async def latest_invocation(
     """The most recent invocation for a source record. Lets the UI hydrate the
     agent card on page load so a finished result shows immediately — instead of
     being lost when the client-side poll state goes away."""
+    # Same sweep as the poll endpoint: this is the call that rehydrates the
+    # card on page load, so a zombie RUNNING row would otherwise restart an
+    # endless poll every single time the incident is opened.
+    await agent_service.expire_stale_invocations(db)
     inv = (
         await db.execute(
             select(AgentInvocation)

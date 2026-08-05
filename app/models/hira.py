@@ -63,6 +63,12 @@ class RiskMatrix(Base, IdMixin):
     # JSON: { routine: "MODERATE", non_routine: "MODERATE", emergency: "LOW" }
     acceptableResidual: Mapped[dict] = mapped_column(JSON, nullable=False)
 
+    # ALARP tolerability banding — maps each riskLevel to an ALARP region.
+    # JSON: { "LOW": "BROADLY_ACCEPTABLE", "MODERATE": "TOLERABLE",
+    #         "HIGH": "TOLERABLE", "CRITICAL": "UNACCEPTABLE" }
+    # Nullable for backward-compat; the router falls back to DEFAULT_ALARP_BANDS.
+    alarpBands: Mapped[dict | None] = mapped_column(JSON)
+
     controlHierarchyEnforced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     isDefault: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -157,6 +163,12 @@ class HiraHazard(Base, IdMixin):
     isoReference: Mapped[str | None] = mapped_column(String)
 
     typicalControlsSuggested: Mapped[list | None] = mapped_column(JSON)
+
+    # Permit gate. When true, an entry hazard row built from this library
+    # hazard surfaces a "Create PTW" prompt. permitTypes narrows which
+    # PermitType the drafted permit defaults to (null/empty => originator picks).
+    requiresPermit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    permitTypes: Mapped[list | None] = mapped_column(JSON)
 
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     isGlobal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -353,6 +365,57 @@ class HiraEntry(Base, IdMixin):
     residualRiskColor: Mapped[str | None] = mapped_column(String)
     residualAcceptable: Mapped[bool | None] = mapped_column(Boolean)
     residualAcceptanceRationale: Mapped[str | None] = mapped_column(Text)
+    # When True, the residual likelihood/severity are DERIVED from the existing
+    # controls (hierarchy + effectiveness) rather than hand-picked on the matrix.
+    # Null on legacy rows → treated as a manual override so their hand-set
+    # residual is never silently recomputed. See routers/hira.py.
+    residualAutoCalculated: Mapped[bool | None] = mapped_column(Boolean)
+
+    # ALARP banding — region derived from the risk level via matrix.alarpBands.
+    # UNACCEPTABLE | TOLERABLE | BROADLY_ACCEPTABLE. Computed server-side.
+    initialAlarpRegion: Mapped[str | None] = mapped_column(String, index=True)
+    residualAlarpRegion: Mapped[str | None] = mapped_column(String, index=True)
+
+    # ALARP demonstration (required for a residual in the TOLERABLE region).
+    # NOT_REQUIRED (broadly acceptable / unacceptable) | REQUIRED | DEMONSTRATED
+    alarpStatus: Mapped[str | None] = mapped_column(String, index=True)
+    alarpFurtherControlsConsidered: Mapped[bool | None] = mapped_column(Boolean)
+    alarpFurtherControlsDescription: Mapped[str | None] = mapped_column(Text)
+    alarpRiskReductionBenefit: Mapped[str | None] = mapped_column(Text)
+    # Cost/effort band of the further controls: LOW | MEDIUM | HIGH | VERY_HIGH
+    alarpCostBand: Mapped[str | None] = mapped_column(String)
+    # Verdict: is the cost/effort grossly disproportionate to the benefit?
+    # True  => further reduction not reasonably practicable => risk is ALARP.
+    # False => further reduction IS practicable => risk not yet ALARP.
+    alarpGrosslyDisproportionate: Mapped[bool | None] = mapped_column(Boolean)
+    alarpJustification: Mapped[str | None] = mapped_column(Text)
+    alarpDemonstratedById: Mapped[str | None] = mapped_column(String)
+    alarpDemonstratedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Target (forecast) risk — the projected residual once the RECOMMENDED
+    # additional controls are implemented. Hand-picked by the assessor on the
+    # matrix (not auto-derived). Drives the ALARP risk-reduction pathway view.
+    # Stored as plain ids (no relationship) — the UI selects by score.
+    targetLikelihoodId: Mapped[str | None] = mapped_column(String)
+    targetLikelihoodScore: Mapped[int | None] = mapped_column(Integer)
+    targetSeverityId: Mapped[str | None] = mapped_column(String)
+    targetSeverityScore: Mapped[int | None] = mapped_column(Integer)
+    targetRiskScore: Mapped[int | None] = mapped_column(Integer)
+    targetRiskLevel: Mapped[str | None] = mapped_column(String)
+    targetRiskColor: Mapped[str | None] = mapped_column(String)
+    targetAlarpRegion: Mapped[str | None] = mapped_column(String, index=True)
+    targetRationale: Mapped[str | None] = mapped_column(Text)
+
+    # Unacceptable-risk override (ALARP governance). An Unacceptable (e.g.
+    # CRITICAL) residual can NOT be approved through the normal path. The only
+    # way to APPROVE it is an elevated, time-bounded override recorded here by a
+    # holder of HIRA.OVERRIDE_UNACCEPTABLE (Plant Head / Corporate HSE). Cleared
+    # automatically when a material change moves the risk basis, and expired by
+    # the review scheduler at unacceptableOverrideExpiresAt.
+    unacceptableOverrideById: Mapped[str | None] = mapped_column(String)
+    unacceptableOverrideAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unacceptableOverrideJustification: Mapped[str | None] = mapped_column(Text)
+    unacceptableOverrideExpiresAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     triggersTrainingProgramIds: Mapped[list | None] = mapped_column(JSON)
     triggersInspectionTypeIds: Mapped[list | None] = mapped_column(JSON)
@@ -368,7 +431,9 @@ class HiraEntry(Base, IdMixin):
     lastReviewType: Mapped[str | None] = mapped_column(String)
     triggeredByRecordId: Mapped[str | None] = mapped_column(String)
 
-    # DRAFT | IN_REVIEW | APPROVED | ACTIVE | FLAGGED_FOR_REVIEW | SUPERSEDED | ARCHIVED
+    # DRAFT | IN_REVIEW | PENDING_REAPPROVAL | APPROVED | ACTIVE | FLAGGED_FOR_REVIEW | SUPERSEDED | ARCHIVED
+    # PENDING_REAPPROVAL = was APPROVED/ACTIVE, a material change withdrew the
+    # sign-off; distinct from IN_REVIEW (never-yet-approved).
     status: Mapped[str] = mapped_column(String, nullable=False, default="DRAFT", index=True)
 
     versionNumber: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -394,6 +459,19 @@ class HiraEntry(Base, IdMixin):
     versions: Mapped[list["HiraVersion"]] = relationship(back_populates="entry", cascade="all, delete-orphan")
     capas: Mapped[list["HiraCapa"]] = relationship(back_populates="entry", cascade="all, delete-orphan")
 
+    @property
+    def unacceptableOverrideActive(self) -> bool:
+        """True while a recorded Unacceptable-risk override is still in force
+        (present and not past its review/expiry date)."""
+        exp = self.unacceptableOverrideExpiresAt
+        if self.unacceptableOverrideById is None or exp is None:
+            return False
+        from datetime import datetime, timezone
+
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return exp > datetime.now(timezone.utc)
+
 
 class HiraEntryHazard(Base, IdMixin):
     __tablename__ = "HiraEntryHazard"
@@ -412,6 +490,14 @@ class HiraEntryHazard(Base, IdMixin):
     potentialHarm: Mapped[list | None] = mapped_column(JSON)
     affectedPersons: Mapped[list | None] = mapped_column(JSON)
     consequence: Mapped[str | None] = mapped_column(Text)
+
+    # Hazard-row-grain regulatory citation. Deliberately separate from the
+    # entry-level HiraEntryRegulationRef list: auditors expect the instrument
+    # cited against the hazard, not only against the activity. Seeded from the
+    # library hazard's factoriesActSection/oshaStandard/isStandard/isoReference
+    # when the row is added from the library, then freely overridable.
+    regulationRef: Mapped[str | None] = mapped_column(String(200))
+    regulationSection: Mapped[str | None] = mapped_column(String(120))
 
     sortOrder: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -461,6 +547,12 @@ class HiraEntryRecommendedControl(Base, IdMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, default="PROPOSED")
 
     capaId: Mapped[str | None] = mapped_column(ForeignKey("HiraCapa.id"))
+
+    # Proof that a proposal actually landed. Mirrors HiraEntryControl exactly
+    # (same types, same ungated availability) — a recommendation that reaches
+    # IMPLEMENTED without a document reference is the audit finding this closes.
+    evidenceAttached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    documentReference: Mapped[str | None] = mapped_column(String(500))
 
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updatedAt: Mapped[datetime] = mapped_column(

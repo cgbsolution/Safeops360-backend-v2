@@ -209,7 +209,10 @@ async def list_contractors(
             | ContractorCompany.code.ilike(pattern)
         )
     companies = (
-        await db.execute(stmt.order_by(ContractorCompany.name.asc()))
+        # Newest-created first — platform-wide register convention.
+        await db.execute(
+            stmt.order_by(ContractorCompany.createdAt.desc(), ContractorCompany.id.desc())
+        )
     ).scalars().all()
 
     out: list[dict] = []
@@ -354,7 +357,12 @@ async def list_company_workers(
             ContractorWorker.fullName.ilike(pattern)
             | ContractorWorker.workerCode.ilike(pattern)
         )
-    workers = (await db.execute(stmt.order_by(ContractorWorker.fullName.asc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    workers = (
+        await db.execute(
+            stmt.order_by(ContractorWorker.createdAt.desc(), ContractorWorker.id.desc())
+        )
+    ).scalars().all()
 
     out = [
         {
@@ -363,6 +371,8 @@ async def list_company_workers(
             "fullName": w.fullName,
             "primaryTrade": w.primaryTrade,
             "overallStatus": w.overallStatus,
+            # Observation deroster safety hold (separate from overallStatus).
+            "rosterStatus": getattr(w, "rosterStatus", "active") or "active",
             "gender": w.gender,
             "mobileNumber": w.mobileNumber,
             "currentMedicalValidUntil": (

@@ -11,11 +11,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
+from app.models.plant import Plant
 from app.models.user import User, UserRole
 from app.models.workflow import (
     Action,
@@ -56,6 +57,100 @@ def _bad_request(e: WorkflowError) -> HTTPException:
     return HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
 
+async def _ptw_task_context(
+    db: AsyncSession, task_id: str
+) -> tuple[str, Any] | None:
+    """(recordId, step-row) for a PTW task, or None for non-PTW/missing.
+
+    Scalar-column queries only — loading the WorkflowTask entity here would
+    poison the identity map for the engine's `_load_task_with_definition`
+    (see the note in approve() below)."""
+    row = (
+        await db.execute(
+            select(WorkflowTask.module, WorkflowTask.recordId, WorkflowTask.stepId)
+            .where(WorkflowTask.id == task_id)
+        )
+    ).first()
+    if row is None or row.module != "PTW":
+        return None
+    step = (
+        await db.execute(
+            select(
+                WorkflowStep.stepType,
+                WorkflowStep.approverField,
+                WorkflowStep.approverRole,
+                WorkflowStep.name,
+            ).where(WorkflowStep.id == row.stepId)
+        )
+    ).first()
+    return row.recordId, step
+
+
+def _ptw_evidence_action_for_step(step: Any):
+    """Map an approval step to its PermitEvidenceAction."""
+    from app.models.permit import PermitEvidenceAction
+
+    if step is not None:
+        step_type = (
+            step.stepType.value if hasattr(step.stepType, "value") else str(step.stepType)
+        )
+        if step_type == StepType.CLOSURE.value:
+            return PermitEvidenceAction.CLOSE
+        if step.approverField == "ISSUER":
+            return PermitEvidenceAction.APPROVE_ISSUER
+        if step.approverRole == "SAFETY_OFFICER":
+            return PermitEvidenceAction.APPROVE_SAFETY
+        if step.approverRole == "PLANT_HEAD":
+            return PermitEvidenceAction.APPROVE_PLANT_HEAD
+    return PermitEvidenceAction.APPROVE
+
+
+async def _record_ptw_workflow_evidence(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    user_id: str,
+    evidence,
+    comments: str | None,
+    action_override=None,
+    enforce: bool = True,
+) -> None:
+    """Validate + persist the field-evidence row for a PTW workflow action.
+    Raises HTTP 422 with the full missing-element list when the policy for
+    the action isn't met. No-op for non-PTW tasks."""
+    ctx = await _ptw_task_context(db, task_id)
+    if ctx is None:
+        return
+    record_id, step = ctx
+
+    from app.models.permit import Permit
+    from app.services.ptw_evidence import EvidenceError, record_action_evidence
+
+    permit = await db.get(Permit, record_id)
+    if permit is None:
+        return
+
+    action = action_override or _ptw_evidence_action_for_step(step)
+    ev = evidence
+    try:
+        await record_action_evidence(
+            db,
+            permit=permit,
+            action=action,
+            actor_id=user_id,
+            gps_latitude=ev.gpsLatitude if ev else None,
+            gps_longitude=ev.gpsLongitude if ev else None,
+            gps_accuracy_meters=ev.gpsAccuracyMeters if ev else None,
+            signature_image=ev.signatureImageBase64 if ev else None,
+            declaration_text=ev.declarationText if ev else None,
+            comments=comments,
+            photo_attachment_ids=ev.photoAttachmentIds if ev else None,
+            enforce=enforce,
+        )
+    except EvidenceError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
+
+
 @router.post("/approve")
 async def approve(
     payload: ApproveRequest,
@@ -92,6 +187,19 @@ async def approve(
                     obs.responsiblePersonId = rp_id
                     await db.flush()
 
+        # PTW closed-loop: every permit approval (issuer / safety officer /
+        # plant head / closure) must carry field evidence — GPS + signature,
+        # photo per policy. Validated + persisted BEFORE the engine advances;
+        # a WorkflowError afterwards rolls the evidence row back with the
+        # rest of the transaction. Non-PTW modules are untouched.
+        await _record_ptw_workflow_evidence(
+            db,
+            task_id=payload.taskId,
+            user_id=user.id,
+            evidence=payload.evidence,
+            comments=payload.comments,
+        )
+
         return await workflow_engine.approve(
             db,
             task_id=payload.taskId,
@@ -112,6 +220,21 @@ async def reject(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     try:
+        # PTW: record whatever evidence the device provided (policy for
+        # REJECT is fully optional — a rejection may happen off-site).
+        if payload.evidence is not None:
+            from app.models.permit import PermitEvidenceAction
+
+            await _record_ptw_workflow_evidence(
+                db,
+                task_id=payload.taskId,
+                user_id=user.id,
+                evidence=payload.evidence,
+                comments=payload.reason,
+                action_override=PermitEvidenceAction.REJECT,
+                enforce=False,
+            )
+
         return await workflow_engine.reject(
             db,
             task_id=payload.taskId,
@@ -446,33 +569,44 @@ _INBOX_TABS = (
     "overdue_escalated",
 )
 
+# A task is still OPEN — and therefore still belongs in the assignee's queue —
+# in every non-terminal state, not just PENDING. The SLA sweep rewrites
+# PENDING → OVERDUE → ESCALATED in place, so filtering on PENDING alone made
+# a task silently vanish from the inbox at the exact moment it became urgent.
+# The web Inbox already used this broader set; the API tabs now match it.
+_OPEN_TASK_STATUSES = (
+    TaskStatus.PENDING.value,
+    "OVERDUE",
+    "ESCALATED",
+)
+
 
 def _apply_tab_filter(stmt, tab: str, user_id: str, now: datetime):
     """Narrow a WorkflowTask query to one of the five inbox tabs.
 
     Each tab corresponds to a column in the web Inbox segmented control:
-      • pending_approvals    — APPROVAL tasks assigned to me, status PENDING
-      • my_tasks             — EXECUTION tasks assigned to me, status PENDING
-      • pending_verification — VERIFICATION tasks assigned to me, status PENDING
+      • pending_approvals    — open APPROVAL tasks assigned to me
+      • my_tasks             — open EXECUTION tasks assigned to me
+      • pending_verification — open VERIFICATION tasks assigned to me
       • submitted_by_me      — instances I started (any status)
-      • overdue_escalated    — pending tasks past their dueAt OR URGENT
+      • overdue_escalated    — open tasks past their dueAt OR URGENT/ESCALATED
     """
     if tab == "pending_approvals":
         return (
             stmt.where(WorkflowTask.assignedToId == user_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
             .where(WorkflowTask.taskType == TaskType.APPROVAL.value)
         )
     if tab == "my_tasks":
         return (
             stmt.where(WorkflowTask.assignedToId == user_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
             .where(WorkflowTask.taskType == TaskType.EXECUTION.value)
         )
     if tab == "pending_verification":
         return (
             stmt.where(WorkflowTask.assignedToId == user_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
             .where(WorkflowTask.taskType == TaskType.VERIFICATION.value)
         )
     if tab == "submitted_by_me":
@@ -482,15 +616,34 @@ def _apply_tab_filter(stmt, tab: str, user_id: str, now: datetime):
     if tab == "overdue_escalated":
         return (
             stmt.where(WorkflowTask.assignedToId == user_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
             .where(
                 or_(
                     and_(WorkflowTask.dueAt.is_not(None), WorkflowTask.dueAt < now),
+                    WorkflowTask.status.in_(("OVERDUE", "ESCALATED")),
                     WorkflowTask.priority.in_(("URGENT", "ESCALATED")),
                 )
             )
         )
     return stmt
+
+
+def _tab_order_by(tab: str | None):
+    """Ordering clause for an inbox tab.
+
+    The working tabs are a feed — the task that just landed is the one the
+    assignee is looking for, so newest-assigned leads and lateness is conveyed
+    by the row's SLA chip. Only Overdue / Escalated ranks by lateness, where
+    "how long has this sat past due" IS the sort key: oldest dueAt first, and
+    tasks with no SLA at all sort last rather than pretending to be the most
+    overdue thing in the queue.
+    """
+    if (tab or "").lower() == "overdue_escalated":
+        return (
+            WorkflowTask.dueAt.asc().nullslast(),
+            WorkflowTask.assignedAt.asc(),
+        )
+    return (WorkflowTask.assignedAt.desc(), WorkflowTask.id.desc())
 
 
 @router.get("/my-count", response_model=MyCountResponse)
@@ -501,8 +654,10 @@ async def my_count(
     """Inbox counters — totals for the five tabs the mobile Inbox renders."""
     now = datetime.now(timezone.utc)
 
-    async def _count_tab(tab: str) -> int:
+    async def _count_tab(tab: str, *, unread_only: bool = False) -> int:
         stmt = _apply_tab_filter(select(func.count()).select_from(WorkflowTask), tab, user.id, now)
+        if unread_only:
+            stmt = stmt.where(WorkflowTask.readAt.is_(None))
         return int((await db.execute(stmt)).scalar_one())
 
     tab_pa = await _count_tab("pending_approvals")
@@ -511,11 +666,22 @@ async def my_count(
     tab_sm = await _count_tab("submitted_by_me")
     tab_oe = await _count_tab("overdue_escalated")
 
+    # Unread = the assignee has never opened the record. Not computed for
+    # submitted_by_me: those tasks are assigned to other people, so their read
+    # state is not this user's to report.
+    unread_pa = await _count_tab("pending_approvals", unread_only=True)
+    unread_my = await _count_tab("my_tasks", unread_only=True)
+    unread_pv = await _count_tab("pending_verification", unread_only=True)
+    unread_oe = await _count_tab("overdue_escalated", unread_only=True)
+
+    # "pending" here means OPEN, matching the tab counts above. Counting only
+    # literal PENDING under-reported the moment the SLA sweep flipped a task to
+    # OVERDUE, so this total disagreed with the sum of the tabs beside it.
     pending_stmt = (
         select(func.count())
         .select_from(WorkflowTask)
         .where(WorkflowTask.assignedToId == user.id)
-        .where(WorkflowTask.status == TaskStatus.PENDING.value)
+        .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
     )
     completed_stmt = (
         select(func.count())
@@ -536,6 +702,11 @@ async def my_count(
         tabPendingVerification=tab_pv,
         tabSubmittedByMe=tab_sm,
         tabOverdueEscalated=tab_oe,
+        unreadTotal=unread_pa + unread_my + unread_pv,
+        unreadPendingApprovals=unread_pa,
+        unreadMyTasks=unread_my,
+        unreadPendingVerification=unread_pv,
+        unreadOverdueEscalated=unread_oe,
     )
 
 
@@ -556,18 +727,20 @@ async def list_my_tasks(
       • `status_filter=PENDING|COMPLETED|ALL` (legacy) — kept for back-compat
         with the older single-list inbox.
 
-    Results are capped at `limit` (max 200) and ordered by assignedAt desc.
-    The response includes initiator info + an `isOverdue` flag so the
-    mobile row can render the full web-style metadata in one pass.
+    Results are capped at `limit` (max 200); ordering is per-tab — see
+    `_tab_order_by`. The response includes initiator identity + an `isOverdue`
+    flag so the mobile row can render the full web-style metadata in one pass.
     """
     capped_limit = max(1, min(limit, 200))
     now = datetime.now(timezone.utc)
 
-    # Join the instance so we can surface initiatedBy + initiator name.
+    # Join the instance + initiator (and the initiator's plant) so a row can
+    # render the initiator's full identity without a second round-trip.
     stmt = (
-        select(WorkflowTask, WorkflowInstance, User)
+        select(WorkflowTask, WorkflowInstance, User, Plant.name)
         .join(WorkflowInstance, WorkflowInstance.id == WorkflowTask.instanceId)
         .outerjoin(User, User.id == WorkflowInstance.initiatedById)
+        .outerjoin(Plant, Plant.id == User.plantId)
     )
 
     if tab and tab.lower() in _INBOX_TABS:
@@ -581,17 +754,20 @@ async def list_my_tasks(
         elif sf == "COMPLETED":
             stmt = stmt.where(WorkflowTask.status == TaskStatus.COMPLETED.value)
 
-    stmt = stmt.order_by(WorkflowTask.assignedAt.desc()).limit(capped_limit)
+    stmt = stmt.order_by(*_tab_order_by(tab)).limit(capped_limit)
     rows = (await db.execute(stmt)).all()
 
     items: list[WorkflowTaskOut] = []
-    for t, _instance, initiator in rows:
+    for t, _instance, initiator, initiator_plant in rows:
         due_aware = (
             t.dueAt.replace(tzinfo=timezone.utc)
             if t.dueAt is not None and t.dueAt.tzinfo is None
             else t.dueAt
         )
-        is_overdue = (
+        # A task the sweep already marked OVERDUE / ESCALATED is overdue by
+        # definition; checking only PENDING under-reported it, so the mobile
+        # row lost its red flag the moment the sweep ran.
+        is_overdue = t.status in ("OVERDUE", "ESCALATED") or (
             t.status == TaskStatus.PENDING.value
             and due_aware is not None
             and due_aware < now
@@ -611,7 +787,13 @@ async def list_my_tasks(
                 dueAt=t.dueAt,
                 initiatedById=initiator.id if initiator is not None else None,
                 initiatedByName=initiator.name if initiator is not None else None,
+                initiatedByDesignation=(initiator.designation if initiator is not None else None),
+                initiatedByRole=initiator.role if initiator is not None else None,
+                initiatedByDepartment=(initiator.department if initiator is not None else None),
+                initiatedByPlantName=initiator_plant,
                 isOverdue=is_overdue,
+                isRead=t.readAt is not None,
+                readAt=t.readAt,
             )
         )
     return WorkflowTaskListResponse(items=items, total=len(items))
@@ -653,10 +835,14 @@ async def get_record_history(
     if instance is None:
         return WorkflowHistoryResponse(items=[], total=0)
 
+    # Plant is joined explicitly (WorkflowHistory has no ORM relationship to
+    # User, so there is nothing to selectinload) — one round-trip for the whole
+    # actor identity.
     rows = (
         await db.execute(
-            select(WorkflowHistory, User)
+            select(WorkflowHistory, User, Plant.name)
             .outerjoin(User, User.id == WorkflowHistory.performedById)
+            .outerjoin(Plant, Plant.id == User.plantId)
             .where(WorkflowHistory.instanceId == instance)
             .order_by(WorkflowHistory.performedAt.asc())
         )
@@ -669,12 +855,17 @@ async def get_record_history(
             action=h.action.value if hasattr(h.action, "value") else str(h.action),
             performedById=h.performedById,
             performedByName=u.name if u is not None else None,
+            performedByDesignation=u.designation if u is not None else None,
+            performedByRole=u.role if u is not None else None,
+            performedByDepartment=u.department if u is not None else None,
+            performedByPlantName=plant_name,
             comments=h.comments,
+            attachments=h.attachments,
             fromStatus=h.fromStatus,
             toStatus=h.toStatus,
             performedAt=h.performedAt,
         )
-        for h, u in rows
+        for h, u, plant_name in rows
     ]
     return WorkflowHistoryResponse(items=items, total=len(items))
 
@@ -693,9 +884,13 @@ async def get_record_pending_tasks(
 
     Powers the "AWAITING ACTION" callout on every module detail page —
     surfaces who needs to act next, what step they're on, when it's due,
-    and whether the deadline has already passed. Joins the User table so
-    the mobile / web clients can render the assignee's display name,
-    designation and department in a single round-trip.
+    and whether the deadline has already passed. Joins User + Plant so the
+    mobile / web clients can render the assignee's full identity — name,
+    designation, role, department and plant — in a single round-trip.
+
+    Covers every OPEN status, not just PENDING: once the SLA sweep flips a
+    task to OVERDUE / ESCALATED it is *more* urgent, so dropping it from this
+    response would blank the callout exactly when it matters most.
 
     Returns an empty list when the record has no open task (e.g. the
     record is closed, hasn't been submitted, or bypasses the workflow
@@ -715,17 +910,18 @@ async def get_record_pending_tasks(
 
     rows = (
         await db.execute(
-            select(WorkflowTask, User)
+            select(WorkflowTask, User, Plant.name)
             .outerjoin(User, User.id == WorkflowTask.assignedToId)
+            .outerjoin(Plant, Plant.id == User.plantId)
             .where(WorkflowTask.instanceId == instance_id)
-            .where(WorkflowTask.status == TaskStatus.PENDING.value)
+            .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
             .order_by(WorkflowTask.assignedAt.asc())
         )
     ).all()
 
     now = datetime.now(timezone.utc)
     items: list[WorkflowPendingTask] = []
-    for t, u in rows:
+    for t, u, plant_name in rows:
         due_aware = (
             t.dueAt.replace(tzinfo=timezone.utc)
             if t.dueAt is not None and t.dueAt.tzinfo is None
@@ -740,8 +936,10 @@ async def get_record_pending_tasks(
                 priority=t.priority,
                 assignedToId=t.assignedToId,
                 assignedToName=u.name if u is not None else None,
+                assignedToDesignation=u.designation if u is not None else None,
                 assignedToRole=u.role if u is not None else None,
                 assignedToDepartment=u.department if u is not None else None,
+                assignedToPlantName=plant_name,
                 assignedAt=t.assignedAt,
                 dueAt=t.dueAt,
                 isOverdue=is_overdue,
@@ -749,3 +947,61 @@ async def get_record_pending_tasks(
         )
 
     return WorkflowPendingResponse(items=items, total=len(items))
+
+
+# ─── Inbox read state ──────────────────────────────────────────────────────
+#
+# Same contract as /api/notifications: unread until the owner has actually
+# looked at the thing. Read state is keyed on *opening the record*, not on
+# tapping the Inbox row — someone who arrives via a deep link, a push
+# notification or a modal has seen it just as much, and it would be maddening
+# for the row to stay bold afterwards.
+
+
+@router.post("/mark-read/{module}/{record_id}")
+async def mark_record_tasks_read(
+    module: str,
+    record_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Mark the caller's own open tasks on one record as read.
+
+    Scoped to `assignedToId == me`, so there is no request shape that lets one
+    user clear another's queue. Idempotent — the `readAt IS NULL` guard keeps a
+    re-open from churning the timestamp. No-op (marked=0) when the caller holds
+    no task on the record, which is the common case for a passing reader.
+    """
+    result = await db.execute(
+        update(WorkflowTask)
+        .where(WorkflowTask.module == module.upper())
+        .where(WorkflowTask.recordId == record_id)
+        .where(WorkflowTask.assignedToId == user.id)
+        .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
+        .where(WorkflowTask.readAt.is_(None))
+        .values(readAt=datetime.now(timezone.utc))
+    )
+    await db.flush()
+    return {"ok": True, "marked": int(result.rowcount or 0)}
+
+
+@router.post("/read-all")
+async def mark_all_tasks_read(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Clear unread state across the caller's whole inbox.
+
+    The escape hatch for a backlog nobody will open one at a time — notably the
+    first load after read-state shipped, when every pre-existing task is unread
+    because we have no history of what was already seen.
+    """
+    result = await db.execute(
+        update(WorkflowTask)
+        .where(WorkflowTask.assignedToId == user.id)
+        .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
+        .where(WorkflowTask.readAt.is_(None))
+        .values(readAt=datetime.now(timezone.utc))
+    )
+    await db.flush()
+    return {"ok": True, "marked": int(result.rowcount or 0)}

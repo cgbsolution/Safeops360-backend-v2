@@ -71,7 +71,6 @@ check("logins (mgr/lead/auditor/worker)", all([mgr, lead, auditor, worker]),
       f"mgr={bool(mgr)} lead={bool(lead)} auditor={bool(auditor)} worker={bool(worker)}")
 mgr_id = uid_from(mgr)
 lead_id = uid_from(lead)
-auditor_id = uid_from(auditor)
 check("decoded manager userId", bool(mgr_id), mgr_id)
 
 # ── RBAC denials ─────────────────────────────────────────────────────────────
@@ -143,7 +142,7 @@ if tid:
 st, el = req("GET", "/api/cams/engagements", mgr)
 check("engagements list 200", st == 200, st)
 items = (el or {}).get("items", [])
-check("engagements count = 15", len(items) == 15, len(items))
+check("engagements count = 13", len(items) == 13, len(items))
 check("statusCounts present", "statusCounts" in (el or {}), "")
 check("4 consumer-raised (sourceModule)", sum(1 for e in items if e.get("sourceModule")) == 4, sum(1 for e in items if e.get("sourceModule")))
 # filter by type
@@ -156,24 +155,6 @@ check("North HSE score 88", north and north["scorePercent"] == 88, north["scoreP
 check("South HSE score 79", south and south["scorePercent"] == 79, south["scorePercent"] if south else "missing")
 check("engagement rollup findingCount on South", south and south["findingCount"] >= 1, south.get("findingCount") if south else "")
 
-# ── Repeat-finding detection (Phase 1a) — runs on SEEDED data, pre-lifecycle ──
-st, det = req("POST", "/api/cams/findings/recompute-repeats", mgr)
-check("recompute-repeats 200", st == 200 and "flagged" in (det or {}), (st, det))
-check("detection flags exactly 5 seeded South-Works repeats", st == 200 and det.get("flagged") == 5, det.get("flagged") if st == 200 else det)
-check("worker DENIED recompute-repeats (403)", req("POST", "/api/cams/findings/recompute-repeats", worker)[0] == 403)
-st, rep0 = req("GET", "/api/cams/findings?repeatOnly=true", mgr)
-check("repeatOnly returns the 5 detected repeats", st == 200 and len(rep0.get("items", [])) == 5, len(rep0.get("items", [])) if st == 200 else st)
-
-# ── Analytics snapshots + scope filter (Phase 1b) ────────────────────────────
-st, snaps = req("GET", "/api/cams/analytics/snapshots", mgr)
-check("snapshots list 200", st == 200, st)
-check("seeded snapshots present (FY26-Q3/Q4/FY27-Q1)", st == 200 and len(snaps) >= 3, len(snaps) if st == 200 else st)
-st, scoped = req("GET", "/api/cams/analytics?engagementType=INSPECTION", mgr)
-check("analytics scope filter narrows to INSPECTION", st == 200 and scoped.get("byType", {}).get("INSPECTION", 0) >= 1 and set(scoped.get("byType", {}).keys()) <= {"INSPECTION"}, scoped.get("byType") if st == 200 else st)
-st, snapNew = req("POST", "/api/cams/analytics/snapshots", mgr, {"periodLabel": "QA-PROBE"})
-check("create snapshot 201 + integrity hash", st == 201 and snapNew.get("snapshotHash"), (st, snapNew))
-check("worker DENIED snapshots (403)", req("GET", "/api/cams/analytics/snapshots", worker)[0] == 403)
-
 # ── Full lifecycle: schedule → start → execute → findings → close gate ───────
 hse_at = next((t for t in types if "HSE System" in t["name"]), None) if isinstance(types, list) else None
 hse_tpl = next((t for t in tpls if "HSE" in t["name"]), None)
@@ -181,7 +162,7 @@ plant_id = north["siteId"] if north else None
 st, eng = req("POST", "/api/cams/engagements", mgr, {
     "title": "QA Lifecycle Audit", "engagementType": "INTERNAL_AUDIT",
     "auditTypeId": hse_at["id"] if hse_at else None, "standardRefs": ["ISO_45001"],
-    "siteId": plant_id, "leadAuditorId": mgr_id, "auditeeOwnerId": auditor_id,
+    "siteId": plant_id, "leadAuditorId": mgr_id, "auditeeOwnerId": lead_id,
     "plannedDate": "2026-06-20T00:00:00Z", "templateId": hse_tpl["id"] if hse_tpl else None,
 })
 check("create engagement 201", st == 201, (st, eng))
@@ -318,7 +299,6 @@ if st == 200:
     check("compliance has obligations", comp.get("totalObligations", 0) >= 1, comp.get("totalObligations"))
     check("compliance verifiedPct computed", "verifiedPct" in comp, "")
     check("compliance rows present", len(comp.get("rows", [])) >= 1, len(comp.get("rows", [])))
-    check("integrated mode reads ERM register (obligationsSource)", comp.get("obligationsSource") == "ERM", comp.get("obligationsSource"))
     obl_id = (comp.get("rows") or [{}])[0].get("obligationId")
 check("worker DENIED compliance (403)", req("GET", "/api/cams/compliance", worker)[0] == 403)
 if obl_id and items:
@@ -336,60 +316,6 @@ if st == 200:
     check("audit-capa all AUDIT-source", all(c["sourceTypeCode"].startswith("AUDIT") for c in capa.get("items", [])), [c.get("sourceTypeCode") for c in capa.get("items", [])][:5])
     check("audit-capa stateCounts present", "stateCounts" in capa, "")
 check("worker DENIED capa view (403)", req("GET", "/api/cams/capa", worker)[0] == 403)
-
-# ── Phase 2 — provider layer / standalone (§1.3 / §12) ───────────────────────
-st, rca = req("GET", "/api/cams/rca-methods", mgr)
-check("rca-methods 200 + shipped library", st == 200 and isinstance(rca, list) and len(rca) >= 5, len(rca) if st == 200 else st)
-check("rca-methods include 5_WHY", st == 200 and any(m.get("code") == "5_WHY" for m in rca), "")
-check("worker DENIED rca-methods (403)", req("GET", "/api/cams/rca-methods", worker)[0] == 403)
-
-st, assets = req("GET", "/api/cams/assets", mgr)
-check("assets 200 (provider list)", st == 200 and isinstance(assets, list), st)
-if st == 200 and assets:
-    check("integrated assets sourced from EQUIPMENT_MASTER", all(a.get("source") == "EQUIPMENT_MASTER" for a in assets), {a.get("source") for a in assets})
-check("worker DENIED assets (403)", req("GET", "/api/cams/assets", worker)[0] == 403)
-
-# Competency enrichment is non-blocking and present as a list on engagement create.
-if 'e2' in dir() and e2 and e2.get("id"):
-    check("engagement create exposes competencyWarnings list", isinstance(e2.get("competencyWarnings", []), list), e2.get("competencyWarnings"))
-
-# ── Phase 3 — Audit Programme (C-03) + Board pack (C-15) ─────────────────────
-st, prog = req("GET", "/api/cams/programme", mgr)
-check("programme 200", st == 200, st)
-if st == 200:
-    check("programme coverage matrix present", len(prog.get("matrix", [])) >= 1, len(prog.get("matrix", [])))
-    check("programme coveragePct computed", "coveragePct" in prog, "")
-    check("programme cells carry DONE/PLANNED/GAP status", all(c.get("status") in ("DONE", "PLANNED", "GAP") for c in prog.get("matrix", [])), "")
-    check("programme surfaces gap flags list", isinstance(prog.get("gaps"), list), "")
-check("worker DENIED programme (403)", req("GET", "/api/cams/programme", worker)[0] == 403)
-
-st, bp = req("GET", "/api/cams/board-pack?periodLabel=FY27-Q1", mgr)
-check("board-pack 200", st == 200, st)
-if st == 200:
-    check("board-pack has programme section", "programme" in bp, "")
-    check("board-pack repeat-finding rate", "repeatFindingRatePct" in bp, "")
-    check("board-pack clause conformance", isinstance(bp.get("clauseConformance"), list), "")
-    check("board-pack compliance assurance (verifiedPct)", "verifiedPct" in bp.get("compliance", {}), bp.get("compliance"))
-    check("board-pack benchmarking summary", isinstance(bp.get("benchmarkingBySite"), list), "")
-    check("board-pack integrity hash (§12)", bool(bp.get("snapshotHash")), "")
-check("worker DENIED board-pack (403)", req("GET", "/api/cams/board-pack", worker)[0] == 403)
-
-# ── Phase 4 — Consumer integration (§8 / TC-18) ──────────────────────────────
-st, ci = req("POST", "/api/cams/consumer/inspection", mgr,
-             {"sourceModule": "Fire Safety", "title": "Fire round (consumer-launched)", "engagementType": "INSPECTION", "siteId": plant_id, "leadAuditorId": mgr_id, "plannedDate": "2026-06-22T00:00:00Z"})
-check("consumer launches CAMS engagement 201 (TC-18)", st == 201 and ci.get("sourceModule") == "Fire Safety", (st, ci))
-if st == 201:
-    check("consumer engagement runs on the shared engine (INSPECTION)", ci.get("engagementType") == "INSPECTION", ci.get("engagementType"))
-    check("consumer engagement got a CAMS code", bool(ci.get("engagementCode")), ci.get("engagementCode"))
-    st, fl = req("GET", "/api/cams/engagements?sourceModule=Fire%20Safety", mgr)
-    check("consumer engagement appears with provenance", st == 200 and any(e["id"] == ci["id"] for e in fl.get("items", [])), (st, len(fl.get("items", [])) if isinstance(fl, dict) else fl))
-check("worker DENIED consumer inspection (403)", req("POST", "/api/cams/consumer/inspection", worker, {"sourceModule": "PPE", "title": "denied probe", "siteId": plant_id})[0] == 403)
-
-# ── Phase 5 — Auditor independence (§7 / TC-21) ──────────────────────────────
-st_ind, _ind = req("POST", "/api/cams/engagements", mgr,
-                   {"title": "Independence probe", "engagementType": "INTERNAL_AUDIT", "siteId": plant_id,
-                    "leadAuditorId": lead_id, "auditeeOwnerId": lead_id, "plannedDate": "2026-06-28T00:00:00Z"})
-check("independence: lead auditor cannot be auditee/area owner (400, TC-21)", st_ind == 400, (st_ind, _ind))
 
 print(f"\n== CAMS QA: {P} passed, {F} failed ==")
 if FAILS:

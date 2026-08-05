@@ -47,6 +47,7 @@ class KriDefinition(Base, IdMixin):
     linkedRiskIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     unit: Mapped[str] = mapped_column(String, nullable=False)
     direction: Mapped[str] = mapped_column(String, nullable=False, default="HIGHER_IS_WORSE")
+    indicatorType: Mapped[str] = mapped_column(String, nullable=False, default="LAGGING")
     frequency: Mapped[str] = mapped_column(String, nullable=False, default="MONTHLY")
     feedType: Mapped[str] = mapped_column(String, nullable=False, default="MANUAL")
     metricProviderKey: Mapped[str | None] = mapped_column(String)

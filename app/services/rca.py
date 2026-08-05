@@ -19,6 +19,10 @@ _NORMALISE = {
     "TAPROOT": "TAPROOT",
     "Cause Map": "CAUSE_MAP",
     "CAUSE_MAP": "CAUSE_MAP",
+    # NARRATIVE — structured narrative for reputational/external/strategic RCAs
+    # where formal trees don't fit (added for the ERM cross-domain RCA module).
+    "Narrative": "NARRATIVE",
+    "NARRATIVE": "NARRATIVE",
 }
 
 
@@ -51,6 +55,12 @@ def is_empty_rca_data(method: str, data: Any) -> bool:
         return not (data.get("eventDescription") or "").strip() and not (data.get("snapChart") or []) and not (data.get("causalFactors") or [])
     if method == "CAUSE_MAP":
         return not (data.get("rootEvent") or "").strip() and not (data.get("impacts") or []) and not (data.get("causeNodes") or [])
+    if method == "NARRATIVE":
+        factors = data.get("factors") or []
+        return (
+            not (data.get("summary") or "").strip()
+            and not any((f.get("description") or "").strip() for f in factors)
+        )
     return True
 
 
@@ -83,4 +93,9 @@ def generate_rca_summary(method: str | None, data: Any) -> str | None:
     if method == "CAUSE_MAP":
         impacts = ", ".join(data.get("impacts") or []) or "—"
         return f"{data.get('rootEvent') or 'Event'}. Impacts: {impacts}. {len(data.get('causeNodes') or [])} cause node(s) mapped."
+    if method == "NARRATIVE":
+        factors = [(f.get("description") or "").strip() for f in (data.get("factors") or [])]
+        n = len([f for f in factors if f])
+        summary = (data.get("summary") or "Causal narrative").strip()
+        return f"{summary} {n} contributing factor(s) identified." if n else summary
     return None

@@ -214,7 +214,25 @@ async def review_post(post_id: str, payload: ReviewIn, user: User = Depends(get_
         for s in scores:
             await _award_once(db, user_id=s["reviewerId"], plant_id=post.plantId, module="KAIZEN_COMMITTEE", txn=post.id, event="Kaizen Committee Review", base=5, mult=1.0, when=now)
         dist = await distribute_lessons(db, post, now=now)
-        result.update({"status": "APPROVED", "pointsAwarded": points, "finalCommitteeScore": post.finalCommitteeScore, "distribution": dist})
+        # P3-2: an approved Kaizen idea auto-creates an implementation CAPA
+        # (KAIZEN_INITIATIVE) so improvements are tracked to closure. Idempotent.
+        capa_id = None
+        try:
+            from app.services.capa_spawn import existing_capas_for, spawn_capa
+            if not await existing_capas_for(db, "KAIZEN_INITIATIVE", post.id):
+                title = getattr(post, "title", None) or getattr(post, "ideaTitle", None) or f"Kaizen improvement {post.id[:8]}"
+                desc = getattr(post, "description", None) or getattr(post, "ideaDescription", None) or title
+                capa = await spawn_capa(
+                    db, source_code="KAIZEN_INITIATIVE", plant_id=post.plantId,
+                    title=f"Implement Kaizen: {title}", problem=str(desc)[:500], ref_id=post.id,
+                    ref_url=f"/kaizen/{post.id}", ref_summary=f"Kaizen — {title}",
+                    metadata={"kaizenPostId": post.id}, severity="LOW", priority="MEDIUM",
+                    detected_method="KAIZEN_APPROVAL", owner_id=post.submitterUserId, actor_id=user.id, due_days=60,
+                )
+                capa_id = capa.id
+        except Exception:
+            pass
+        result.update({"status": "APPROVED", "pointsAwarded": points, "finalCommitteeScore": post.finalCommitteeScore, "distribution": dist, "implementationCapaId": capa_id})
     elif declines >= 2:
         fb = "; ".join(s["feedback"] for s in scores if s["decision"] == "DECLINE" and s.get("feedback")) or "Did not meet the committee's hazard/learning/action criteria."
         post.status = "DECLINED"

@@ -153,8 +153,8 @@ async def create_kri(body: S.KriUpsert, user: User = Depends(get_current_user), 
     api_token = secrets.token_urlsafe(24) if body.feedType == "API" else None
     k = KriDefinition(
         kriCode=await _next_kri_code(db), name=body.name, description=body.description, categoryId=body.categoryId,
-        linkedRiskIds=body.linkedRiskIds, unit=body.unit, direction=body.direction, frequency=body.frequency,
-        feedType=body.feedType, metricProviderKey=body.metricProviderKey, apiToken=api_token,
+        linkedRiskIds=body.linkedRiskIds, unit=body.unit, direction=body.direction, indicatorType=body.indicatorType,
+        frequency=body.frequency, feedType=body.feedType, metricProviderKey=body.metricProviderKey, apiToken=api_token,
         thresholdGreen=body.thresholdGreen, thresholdAmber=body.thresholdAmber, ownerId=body.ownerId,
         graceDays=body.graceDays, isActive=body.isActive, createdBy=user.id,
     )
@@ -171,7 +171,7 @@ async def update_kri(kri_id: str, body: S.KriUpsert, user: User = Depends(get_cu
     if not k:
         raise HTTPException(404, "KRI not found")
     thresholds_changed = (k.thresholdGreen != body.thresholdGreen or k.thresholdAmber != body.thresholdAmber or k.direction != body.direction)
-    for f in ("name", "description", "categoryId", "linkedRiskIds", "unit", "direction", "frequency", "feedType", "metricProviderKey", "thresholdGreen", "thresholdAmber", "ownerId", "graceDays", "isActive"):
+    for f in ("name", "description", "categoryId", "linkedRiskIds", "unit", "direction", "indicatorType", "frequency", "feedType", "metricProviderKey", "thresholdGreen", "thresholdAmber", "ownerId", "graceDays", "isActive"):
         setattr(k, f, getattr(body, f))
     k.updatedBy = user.id
     if thresholds_changed:
@@ -230,6 +230,9 @@ async def add_reading(kri_id: str, body: S.ReadingCreate, user: User = Depends(g
     r = await svc.record_reading(db, k, body.periodLabel, pe, body.value, "MANUAL", entered_by=user.id, notes=body.notes)
     if k.currentStatus == "RED":
         await svc.evaluate_appetite(db)
+    # A RED KRI flags its linked risks for reassessment (and clears on recovery).
+    from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+    await _sync_kri_alerts(db)
     await db.commit()
     await db.refresh(r)
     return _reading_out(r, await _names(db, [user.id]))
@@ -250,6 +253,8 @@ async def bulk_readings(rows: list[S.BulkReadingRow], user: User = Depends(get_c
             await db.rollback()
             return {"ok": False, "written": 0, "errors": errors}
         await svc.evaluate_appetite(db)
+        from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+        await _sync_kri_alerts(db)
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -304,8 +309,11 @@ async def run_module_fed(period_end: str | None = Query(None, alias="periodEnd")
     await _require(db, user, "KRI.ADMIN")
     pe = datetime.fromisoformat(period_end) if period_end else _now()
     res = await svc.run_module_fed(db, pe)
-    # KRI readings may have turned RED → re-evaluate appetite (MAX_RED_KRI_COUNT bands).
+    # KRI readings may have turned RED → re-evaluate appetite (MAX_RED_KRI_COUNT bands)
+    # and push linked risks into reassessment.
     await svc.evaluate_appetite(db)
+    from app.services.erm import sync_kri_alerts as _sync_kri_alerts
+    await _sync_kri_alerts(db)
     await db.commit()
     return res
 
@@ -513,7 +521,10 @@ async def list_appetite_breaches(open_only: bool = Query(False, alias="openOnly"
     stmt = select(AppetiteBreach)
     if open_only:
         stmt = stmt.where(AppetiteBreach.status != "RESOLVED")
-    rows = (await db.execute(stmt.order_by(AppetiteBreach.detectedAt.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(stmt.order_by(AppetiteBreach.createdAt.desc(), AppetiteBreach.id.desc()))
+    ).scalars().all()
     cats = await _cat_index(db)
     names = await _names(db, [b.decisionBy for b in rows if b.decisionBy])
     risk_ids = {i for b in rows for i in (b.triggeringEntityIds or [])}
@@ -905,7 +916,14 @@ async def _serialise_loss(o, cats, plants) -> S.LossEventOut:
 async def list_loss(category: str | None = Query(None), lstatus: str | None = Query(None, alias="status"), source: str | None = Query(None),
                     user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "LOSS.READ")
-    rows = (await db.execute(select(LossEvent).where(LossEvent.isDeleted.is_(False)).order_by(LossEvent.eventDate.desc()))).scalars().all()
+    # Newest-created first — platform-wide register convention.
+    rows = (
+        await db.execute(
+            select(LossEvent)
+            .where(LossEvent.isDeleted.is_(False))
+            .order_by(LossEvent.createdAt.desc(), LossEvent.id.desc())
+        )
+    ).scalars().all()
     cats = await _cat_index(db)
     plants = await _plant_index(db)
     code_to_id = {c.code: cid for cid, c in cats.items()}
@@ -1066,3 +1084,29 @@ async def export_p2(kind: str, user: User = Depends(get_current_user), db: Async
     else:
         raise HTTPException(404, f"Unknown report kind '{kind}'")
     return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=erm-{kind}.csv"})
+
+
+# ═════════════════════════════════════════════════════════════════════
+# P2-8 Compliance unification — LegalObligation is the single source of truth
+# ═════════════════════════════════════════════════════════════════════
+@router.post("/compliance/link-registrations")
+async def compliance_link_registrations(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Backfill: link every RegulatoryRegistration to a canonical LegalObligation
+    (creating one where none matches). Idempotent."""
+    await _require(db, user, "COMPLIANCE.MANAGE")
+    from app.services.compliance_unification import link_registrations_to_obligations
+    res = await link_registrations_to_obligations(db, actor_id=user.id)
+    await db.commit()
+    return res
+
+
+@router.get("/compliance/statutory-view")
+async def compliance_statutory_view(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Statutory Registers = LegalObligations of statutory types (single source).
+    Same data the CAMS Compliance Tracker surfaces — no second store."""
+    await _require(db, user, "COMPLIANCE.READ")
+    from app.services.access_scope import build_query_scope
+    from app.services.compliance_unification import statutory_view
+    scope = await build_query_scope(db, user.id, "COMPLIANCE.READ")
+    pids = None if scope.all_plants else scope.plant_ids
+    return await statutory_view(db, pids)

@@ -50,6 +50,30 @@ class CamsAuditType(Base, IdMixin):
     defaultRecurrence: Mapped[str | None] = mapped_column(String)
     requiresAssetRef: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     requiresAuditorCompetency: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    # ── WP-49: the audit type is the configuration home ──────────────────
+    #
+    # `MINIMUM_PASS_SCORE = 80.0` was a module-level constant in
+    # `services/audit_compliance.py` applied to every audit of every type (F-22),
+    # while `AuditTemplate.scoring` sat unused. Scoring policy belongs to the
+    # TYPE — a fire-equipment inspection and an SA8000 social audit do not share
+    # a pass mark or a critical-failure tolerance.
+    #
+    # {minimumPassScore, criticalGateThreshold, partialCredit, naHandling}
+    # Null falls back to the historic constant, so existing types are unchanged.
+    scoringRules: Mapped[dict | None] = mapped_column(JSON)
+
+    # WP-47: which buyer regime's severity/result vocabulary this type renders
+    # (SMETA_LIKE, BSCI_LIKE, ...). Null = the engine's native taxonomy.
+    regimeCode: Mapped[str | None] = mapped_column(String, index=True)
+
+    # Warn vs block when an assignee lacks a required competency. ISO 19011
+    # cl.7 wants competence assured, but a hard block on day one would strand
+    # tenants whose Skill Matrix is still being populated — so the default is
+    # WARN and tightening it is a deliberate act.
+    competenceEnforcement: Mapped[str] = mapped_column(
+        String, nullable=False, default="WARN"
+    )
     standardRefs: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
@@ -94,6 +118,7 @@ class CamsEngagement(Base, IdMixin):
     reportAttachmentIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     nextScheduledDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sourceModule: Mapped[str | None] = mapped_column(String)
+    sourceEntityId: Mapped[str | None] = mapped_column(String)  # entity this engagement inspects (e.g. FireEquipment.id)
     recurrenceId: Mapped[str | None] = mapped_column(String)
 
     responses: Mapped[list["CamsResponse"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")
@@ -305,84 +330,6 @@ class CamsComplianceLink(Base, IdMixin):
     )
 
 
-# ── Shared Service ④ — Analytics snapshot (periodic precompute, §5.2) ────────
-class CamsAnalyticsSnapshot(Base, IdMixin):
-    __tablename__ = "CamsAnalyticsSnapshot"
-
-    periodLabel: Mapped[str] = mapped_column(String, nullable=False)
-    periodStart: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    periodEnd: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    scopeSiteId: Mapped[str | None] = mapped_column(String)
-    scopeEngagementType: Mapped[str | None] = mapped_column(String)
-    scopeStandardRef: Mapped[str | None] = mapped_column(String)
-    metrics: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    snapshotHash: Mapped[str | None] = mapped_column(String)
-    generatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    createdAt: Mapped[datetime] = _created()
-    createdBy: Mapped[str | None] = mapped_column(String)
-    updatedAt: Mapped[datetime] = _updated()
-    updatedBy: Mapped[str | None] = mapped_column(String)
-    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-
-    __table_args__ = (
-        Index("ix_CamsAnalyticsSnapshot_period", "periodLabel"),
-        Index("ix_CamsAnalyticsSnapshot_site", "scopeSiteId"),
-    )
-
-
-# ── Standalone-mode bundled providers (§1.3 / §12) ───────────────────────────
-class CamsObligation(Base, IdMixin):
-    """CAMS-owned obligations register — bundled fallback used when the ERM
-    Phase-2 register is absent (standalone). Mirrors LegalObligation."""
-    __tablename__ = "CamsObligation"
-
-    obligationCode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    title: Mapped[str] = mapped_column(String, nullable=False)
-    obligationType: Mapped[str] = mapped_column(String, nullable=False, default="STATUTORY")
-    statuteReference: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    regulatorName: Mapped[str] = mapped_column(String, nullable=False, default="")
-    siteId: Mapped[str | None] = mapped_column(String)
-    ownerId: Mapped[str | None] = mapped_column(String)
-    frequency: Mapped[str] = mapped_column(String, nullable=False, default="ANNUAL")
-    validFrom: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    validUntil: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    renewalLeadDays: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
-    status: Mapped[str] = mapped_column(String, nullable=False, default="COMPLIANT")
-    isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
-    createdAt: Mapped[datetime] = _created()
-    createdBy: Mapped[str | None] = mapped_column(String)
-    updatedAt: Mapped[datetime] = _updated()
-    updatedBy: Mapped[str | None] = mapped_column(String)
-    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-
-    __table_args__ = (
-        Index("ix_CamsObligation_site", "siteId"),
-        Index("ix_CamsObligation_status", "status"),
-    )
-
-
-class CamsAssetLite(Base, IdMixin):
-    """Lite asset register — bundled fallback used when the platform Equipment
-    Master is absent (standalone). Same interface as Equipment (TC-16)."""
-    __tablename__ = "CamsAssetLite"
-
-    assetCode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    category: Mapped[str] = mapped_column(String, nullable=False, default="EQUIPMENT")
-    siteId: Mapped[str | None] = mapped_column(String)
-    location: Mapped[str] = mapped_column(String, nullable=False, default="")
-    isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
-    createdAt: Mapped[datetime] = _created()
-    createdBy: Mapped[str | None] = mapped_column(String)
-    updatedAt: Mapped[datetime] = _updated()
-    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-
-    __table_args__ = (Index("ix_CamsAssetLite_site", "siteId"),)
-
-
 __all__ = [
     "CamsAuditType",
     "CamsEngagement",
@@ -393,7 +340,4 @@ __all__ = [
     "CamsResponse",
     "CamsFinding",
     "CamsComplianceLink",
-    "CamsAnalyticsSnapshot",
-    "CamsObligation",
-    "CamsAssetLite",
 ]

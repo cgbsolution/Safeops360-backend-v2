@@ -66,7 +66,9 @@ async def _users_with_role(db: AsyncSession, role_code: str, plant_id: str | Non
 async def _notify_critical(db: AsyncSession, *, nm: NearMiss, incident_number: str) -> None:
     """Send SMS + email to Plant HSE Manager + Plant Head + Corporate HSE."""
     plant = await db.get(Plant, nm.plantId)
-    plant_name = plant.name if plant else nm.plantId
+    # This lands in an SMS and an email subject. A cuid there is unreadable —
+    # say "Unknown site" and let the recipient open the record.
+    plant_name = plant.name if plant else "Unknown site"
 
     recipients: list[User] = []
     for role in ("HSE_MANAGER", "PLANT_HEAD"):

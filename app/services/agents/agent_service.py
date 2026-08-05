@@ -31,14 +31,16 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.db import AsyncSessionLocal
 from app.models.agent import Agent, AgentInvocation, AgentPrompt, AgentToolCall
 from app.models.capa import Capa
 from app.models.hira import HiraEntry, HiraStudy
@@ -215,21 +217,40 @@ async def run_invocation(
             source_record_id=invocation.sourceRecordId,
         )
         invocation.inputContext = context
-        await db.flush()
+        # Commit the context now instead of holding it open until the end.
+        # It is durable evidence of what the agent was handed, and it means
+        # the row no longer depends on the tool loop surviving.
+        await db.commit()
     except Exception as e:  # noqa: BLE001
         await _mark_errored(db, invocation, "INTERNAL", f"Context build failed: {e}")
         return _result_from(invocation)
 
     tool_definitions = get_tool_definitions(list(agent.availableTools))
 
+    # Tools run on their OWN session — never the one that persists the
+    # result. A tool that trips a DB error (an invalid enum literal, a
+    # constraint violation, …) aborts its Postgres transaction; when that
+    # was the shared session, every later tool failed with "current
+    # transaction is aborted" AND the final flush blew up, stranding the
+    # invocation in RUNNING with no error recorded. Isolating the session
+    # and rolling back on failure caps the blast radius at one tool call.
+    tool_db = AsyncSessionLocal()
+
     async def dispatch_tool(tool_name: str, tool_input: dict[str, Any]) -> Any:
         handler = get_tool_handler(tool_name)
-        return await handler(
-            tool_input,
-            db=db,
-            source_record_id=invocation.sourceRecordId,
-            source_module=invocation.sourceModule,
-        )
+        try:
+            return await handler(
+                tool_input,
+                db=tool_db,
+                source_record_id=invocation.sourceRecordId,
+                source_module=invocation.sourceModule,
+            )
+        except Exception:
+            # Clear the aborted transaction so the *next* tool still works.
+            # The exception continues to the loop, which reports it back to
+            # the model as a tool error.
+            await tool_db.rollback()
+            raise
 
     try:
         loop_result: ToolLoopResult = await complete_with_tools(
@@ -248,64 +269,120 @@ async def run_invocation(
     except Exception as e:  # noqa: BLE001
         await _mark_errored(db, invocation, "INTERNAL", f"Unexpected runtime error: {e}")
         return _result_from(invocation)
+    finally:
+        await tool_db.close()
 
-    # Persist tool calls
-    for record in loop_result.tool_calls:
-        db.add(
-            AgentToolCall(
-                invocationId=invocation.id,
-                toolName=record.name,
-                toolInput=record.input,
-                toolOutput=record.output,
-                executionMs=record.execution_ms,
-                hadError=record.had_error,
-                errorDetails=record.error_details,
-                sequence=record.sequence,
+    # Everything from here writes the result. It is wrapped because a
+    # failure in this block used to escape run_invocation entirely and get
+    # swallowed by the background-task catch — leaving the row RUNNING
+    # forever. Any failure now lands the invocation in ERRORED instead.
+    try:
+        # Persist tool calls
+        for record in loop_result.tool_calls:
+            db.add(
+                AgentToolCall(
+                    invocationId=invocation.id,
+                    toolName=record.name,
+                    toolInput=record.input,
+                    toolOutput=record.output,
+                    executionMs=record.execution_ms,
+                    hadError=record.had_error,
+                    errorDetails=record.error_details,
+                    sequence=record.sequence,
+                )
             )
+
+        # Parse the final response into reasoning / suggestion / confidence
+        parsed = _parse_final_response(loop_result.final_text)
+        invocation.agentReasoning = parsed["reasoning"]
+        invocation.agentSuggestion = parsed["suggestion"]
+        invocation.agentConfidence = parsed["confidence"]
+        invocation.rawApiResponse = loop_result.raw_last_response
+
+        # Token / cost accounting
+        invocation.inputTokens = loop_result.input_tokens_total
+        invocation.outputTokens = loop_result.output_tokens_total
+        invocation.totalCostUsd = _compute_cost(
+            invocation.modelUsed,
+            loop_result.input_tokens_total,
+            loop_result.output_tokens_total,
+        )
+        invocation.latencyMs = int(
+            (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
         )
 
-    # Parse the final response into reasoning / suggestion / confidence
-    parsed = _parse_final_response(loop_result.final_text)
-    invocation.agentReasoning = parsed["reasoning"]
-    invocation.agentSuggestion = parsed["suggestion"]
-    invocation.agentConfidence = parsed["confidence"]
-    invocation.rawApiResponse = loop_result.raw_last_response
+        # Hallucination detection — scan the agent's text for plausible
+        # record IDs and verify each. The full text includes reasoning +
+        # suggestion JSON; cast a wide net.
+        hallucinations = await _detect_hallucinations(db, loop_result.final_text)
+        if hallucinations:
+            invocation.hallucinationFlagged = True
+            invocation.hallucinationDetails = hallucinations
 
-    # Token / cost accounting
-    invocation.inputTokens = loop_result.input_tokens_total
-    invocation.outputTokens = loop_result.output_tokens_total
-    invocation.totalCostUsd = _compute_cost(
-        invocation.modelUsed,
-        loop_result.input_tokens_total,
-        loop_result.output_tokens_total,
-    )
-    invocation.latencyMs = int(
-        (datetime.now(timezone.utc) - started_at).total_seconds() * 1000
-    )
+        # Soft-fail if the loop hit its iteration cap. Still PENDING_REVIEW
+        # so the human can decide whether to accept what we have.
+        if loop_result.hit_iteration_cap:
+            invocation.errorType = "ITERATION_CAP"
+            invocation.errorDetails = "Agent loop hit max_iterations without end_turn"
 
-    # Hallucination detection — scan the agent's text for plausible
-    # record IDs and verify each. The full text includes reasoning +
-    # suggestion JSON; cast a wide net.
-    hallucinations = await _detect_hallucinations(db, loop_result.final_text)
-    if hallucinations:
-        invocation.hallucinationFlagged = True
-        invocation.hallucinationDetails = hallucinations
+        invocation.status = "PENDING_REVIEW"
+        await db.flush()
 
-    # Soft-fail if the loop hit its iteration cap. Still PENDING_REVIEW
-    # so the human can decide whether to accept what we have.
-    if loop_result.hit_iteration_cap:
-        invocation.errorType = "ITERATION_CAP"
-        invocation.errorDetails = "Agent loop hit max_iterations without end_turn"
-
-    invocation.status = "PENDING_REVIEW"
-    await db.flush()
-
-    # Rolling metric: total invocations only (decision-dependent counters
-    # update in record_human_decision()).
-    agent.totalInvocations += 1
-    await db.commit()
+        # Rolling metric: total invocations only (decision-dependent counters
+        # update in record_human_decision()).
+        agent.totalInvocations += 1
+        await db.commit()
+    except Exception as e:  # noqa: BLE001
+        await _mark_errored(
+            db, invocation, "INTERNAL", f"Failed to persist agent result: {e}"
+        )
+        return _result_from(invocation)
 
     return _result_from(invocation)
+
+
+# How long an invocation may sit in RUNNING before the reaper calls it
+# dead. Healthy runs finish in ~60s; the Anthropic client caps a single
+# call at 90s with one retry, so anything past this is not coming back.
+STALE_RUNNING_AFTER = timedelta(minutes=15)
+
+
+async def expire_stale_invocations(
+    db: AsyncSession, *, older_than: timedelta = STALE_RUNNING_AFTER
+) -> int:
+    """Mark long-abandoned RUNNING invocations as ERRORED and return how
+    many were swept.
+
+    An invocation is only moved off RUNNING by its own background task. If
+    that task dies — process restart, deploy, unhandled error — nothing
+    else ever touches the row, and the UI polls it forever (the card shows
+    a spinner counting up for days). This is the backstop: it guarantees
+    every invocation reaches a terminal state.
+
+    Safe to run against a genuinely in-flight invocation: the background
+    task writes its own status at the end and simply overwrites this.
+    Idempotent, and commits only when it actually changed something.
+    """
+    cutoff = datetime.now(timezone.utc) - older_than
+    result = await db.execute(
+        update(AgentInvocation)
+        .where(AgentInvocation.status == "RUNNING")
+        .where(AgentInvocation.invokedAt < cutoff)
+        .values(
+            status="ERRORED",
+            hadError=True,
+            errorType="TIMED_OUT",
+            errorDetails=(
+                "The agent run was abandoned before it finished (most often a "
+                "backend restart mid-run). No result was produced — start a "
+                "new analysis."
+            ),
+        )
+    )
+    swept = result.rowcount or 0
+    if swept:
+        await db.commit()
+    return swept
 
 
 async def record_human_decision(
@@ -549,6 +626,42 @@ async def _build_context(
     }
 
 
+def _coerce_suggestion_json(raw: str) -> Any:
+    """Best-effort parse of the JSON inside a <suggestion> block.
+
+    Models very often wrap the JSON in a markdown code fence
+    (```json ... ```) or add a stray sentence around it. A bare
+    json.loads() then fails and the whole draft was being stored as an
+    unrenderable "_unparsed" blob. We strip fences and, as a last resort,
+    extract the outermost {...}/[...] span before giving up.
+    """
+    s = raw.strip()
+
+    # 1) Strip a surrounding markdown fence: ```json\n...\n``` or ```...```
+    fence = re.match(r"^```(?:json|JSON)?\s*([\s\S]*?)\s*```$", s)
+    if fence:
+        s = fence.group(1).strip()
+
+    # 2) Direct parse.
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # 3) Last resort: the outermost object/array span, ignoring any prose
+    #    the model wrote before or after it.
+    starts = [i for i in (s.find("{"), s.find("[")) if i != -1]
+    end = max(s.rfind("}"), s.rfind("]"))
+    if starts and end > min(starts):
+        try:
+            return json.loads(s[min(starts) : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Genuinely unparseable — keep the raw text so the UI can still show it.
+    return {"_unparsed": raw}
+
+
 def _parse_final_response(text: str) -> dict[str, Any]:
     """Extract <reasoning>, <suggestion>, and <confidence> blocks from
     the agent's final assistant turn. Missing blocks return None — the
@@ -561,14 +674,16 @@ def _parse_final_response(text: str) -> dict[str, Any]:
 
     suggestion_match = re.search(r"<suggestion>([\s\S]*?)</suggestion>", text)
     if suggestion_match:
-        raw = suggestion_match.group(1).strip()
-        try:
-            out["suggestion"] = json.loads(raw)
-        except json.JSONDecodeError:
-            # The agent emitted a suggestion block that wasn't valid JSON.
-            # Store the raw text under an "_unparsed" key so the UI can
-            # still surface it and the prompt engineer can investigate.
-            out["suggestion"] = {"_unparsed": raw}
+        out["suggestion"] = _coerce_suggestion_json(suggestion_match.group(1))
+    else:
+        # Model skipped the <suggestion> tags but may have emitted a fenced
+        # JSON block (or a bare object) anyway — recover it rather than
+        # reporting a null draft.
+        fenced = re.search(r"```(?:json|JSON)?\s*([\s\S]*?)\s*```", text)
+        if fenced:
+            recovered = _coerce_suggestion_json(fenced.group(1))
+            if "_unparsed" not in recovered:
+                out["suggestion"] = recovered
 
     confidence_match = re.search(r"<confidence>([\d.]+)</confidence>", text)
     if confidence_match:
@@ -629,12 +744,57 @@ async def _mark_errored(
     error_type: str,
     detail: str,
 ) -> None:
-    """Land an invocation in ERRORED status with the failure cause."""
-    invocation.status = "ERRORED"
-    invocation.hadError = True
-    invocation.errorType = error_type
-    invocation.errorDetails = detail
-    await db.commit()
+    """Land an invocation in ERRORED status with the failure cause.
+
+    This has to work even when the session that got us here is broken —
+    which is the common case, since a DB error is one of the things that
+    lands us in ERRORED. So: capture the id first, roll the session back,
+    then write through a Core UPDATE rather than the ORM. (After a
+    rollback the ORM instance is expired, and touching an expired
+    attribute on an async session raises MissingGreenlet.)
+    """
+    invocation_id = invocation.id  # read BEFORE the rollback expires it
+
+    try:
+        await db.rollback()
+    except Exception:  # noqa: BLE001
+        pass  # already rolled back / connection gone — the UPDATE will tell us
+
+    try:
+        await db.execute(
+            update(AgentInvocation)
+            .where(AgentInvocation.id == invocation_id)
+            .values(
+                status="ERRORED",
+                hadError=True,
+                errorType=error_type,
+                errorDetails=detail,
+            )
+        )
+        await db.commit()
+        # Repopulate the expired instance so _result_from() can read it.
+        await db.refresh(invocation)
+    except Exception as e:  # noqa: BLE001
+        # Last resort: a completely unusable session. Use a fresh one so the
+        # row still reaches a terminal state — leaving it RUNNING is the one
+        # outcome we must never allow.
+        print(
+            f"[agents] _mark_errored fell back to a new session for "
+            f"{invocation_id}: {e}",
+            file=sys.stderr,
+        )
+        async with AsyncSessionLocal() as rescue:
+            await rescue.execute(
+                update(AgentInvocation)
+                .where(AgentInvocation.id == invocation_id)
+                .values(
+                    status="ERRORED",
+                    hadError=True,
+                    errorType=error_type,
+                    errorDetails=detail,
+                )
+            )
+            await rescue.commit()
 
 
 def _result_from(invocation: AgentInvocation) -> InvocationResult:
@@ -646,15 +806,34 @@ def _result_from(invocation: AgentInvocation) -> InvocationResult:
     unless the relationship was explicitly eager-loaded. Callers who
     need the count should query AgentToolCall directly.
     """
-    return InvocationResult(
-        invocation_id=invocation.id,
-        invocation_number=invocation.invocationNumber,
-        status=invocation.status,
-        suggestion=invocation.agentSuggestion,
-        reasoning=invocation.agentReasoning,
-        confidence=invocation.agentConfidence,
-        tool_call_count=0,
-        cost_usd=invocation.totalCostUsd,
-        latency_ms=invocation.latencyMs,
-        hallucination_flagged=invocation.hallucinationFlagged,
-    )
+    try:
+        return InvocationResult(
+            invocation_id=invocation.id,
+            invocation_number=invocation.invocationNumber,
+            status=invocation.status,
+            suggestion=invocation.agentSuggestion,
+            reasoning=invocation.agentReasoning,
+            confidence=invocation.agentConfidence,
+            tool_call_count=0,
+            cost_usd=invocation.totalCostUsd,
+            latency_ms=invocation.latencyMs,
+            hallucination_flagged=invocation.hallucinationFlagged,
+        )
+    except Exception:  # noqa: BLE001
+        # The instance is expired or detached because its session died, and
+        # re-reading an attribute would need a DB round-trip we can't make
+        # here. The row itself was already written; read what's still in
+        # __dict__ (never triggers a load) and report the rest as unknown.
+        d = invocation.__dict__
+        return InvocationResult(
+            invocation_id=d.get("id", ""),
+            invocation_number=d.get("invocationNumber", ""),
+            status=d.get("status", "ERRORED"),
+            suggestion=None,
+            reasoning=None,
+            confidence=None,
+            tool_call_count=0,
+            cost_usd=None,
+            latency_ms=None,
+            hallucination_flagged=False,
+        )

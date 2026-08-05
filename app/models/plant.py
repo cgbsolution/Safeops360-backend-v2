@@ -36,6 +36,12 @@ class Area(Base, IdMixin):
 
     name: Mapped[str] = mapped_column(String, nullable=False)
     plantId: Mapped[str] = mapped_column(ForeignKey("Plant.id"), nullable=False)
+    # Responsible owner for this area (docs/cams/09 §2.1.4, open question Q17).
+    # Before this column the platform had NO area-level ownership at all, which
+    # meant the audit own-work independence guard could only reason at site and
+    # department granularity. Nullable: most areas are unowned, and an absent
+    # owner must degrade the guard to "no signal", never to "no conflict".
+    ownerUserId: Mapped[str | None] = mapped_column(String, index=True)
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

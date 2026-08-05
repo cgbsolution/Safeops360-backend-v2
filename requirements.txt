@@ -1,0 +1,6 @@
+fpdf2
+openpyxl>=3.1.0
+
+# zoneinfo has no tz database on Windows (and on slim Linux images without
+# tzdata), so report timestamps silently fell back to UTC while labelled IST.
+tzdata>=2024.1

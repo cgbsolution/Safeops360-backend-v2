@@ -25,7 +25,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.incident import Incident
-from app.models.permit import Permit, PermitStatus
+from app.models.permit import Permit, PermitStatus, PermitType
+from app.services.agents.tools._enums import coerce_enum
 
 
 DEFINITION: dict[str, Any] = {
@@ -59,10 +60,14 @@ DEFINITION: dict[str, Any] = {
             "permitType": {
                 "type": "string",
                 "description": (
-                    "Optional filter on Permit.type (e.g. HOT_WORK, CONFINED_SPACE, "
-                    "WORK_AT_HEIGHT, LOTO, EXCAVATION, GENERAL). Useful when you "
-                    "have a hypothesis about the kind of work being done."
+                    "Optional filter on Permit.type. Must be exactly one of: "
+                    "HOT_WORK, CONFINED_SPACE, WORK_AT_HEIGHT, EXCAVATION, "
+                    "ELECTRICAL_LOTO, LIFTING, GENERAL_COLD. Note lock-out/tag-out "
+                    "is ELECTRICAL_LOTO (not 'LOTO') and general cold work is "
+                    "GENERAL_COLD (not 'GENERAL'). Useful when you have a "
+                    "hypothesis about the kind of work being done."
                 ),
+                "enum": [t.value for t in PermitType],
             },
         },
         "required": [],
@@ -73,7 +78,7 @@ DEFINITION: dict[str, Any] = {
 # Statuses where the permit covers active work. Pre-approval (DRAFT,
 # AWAITING_*) and post-completion (CLOSED, EXPIRED, REJECTED) are
 # excluded — only "approved, in validity window" counts as covering.
-_ACTIVE_STATUSES = ("ACTIVE", "PLANT_HEAD_APPROVED", "SUSPENDED")
+_ACTIVE_STATUSES = ("ACTIVE", "ISSUED", "PLANT_HEAD_APPROVED", "SUSPENDED")
 
 
 async def handle(
@@ -120,8 +125,11 @@ async def handle(
         .where(Permit.status.in_([PermitStatus(s) for s in _ACTIVE_STATUSES] + [PermitStatus.CLOSED]))
     )
 
+    # Validate BEFORE the value can reach the enum column — an invalid
+    # string here would abort the Postgres transaction and poison the
+    # rest of the agent run. See tools/_enums.py.
     if permit_type := input.get("permitType"):
-        stmt = stmt.where(Permit.type == permit_type)
+        stmt = stmt.where(Permit.type == coerce_enum(permit_type, PermitType, "permitType"))
 
     stmt = stmt.order_by(Permit.validFrom.desc()).limit(20)
     rows = (await db.execute(stmt)).scalars().all()

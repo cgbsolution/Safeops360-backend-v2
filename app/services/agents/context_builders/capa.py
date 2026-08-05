@@ -100,7 +100,38 @@ async def build_context(db: AsyncSession, record_id: str) -> dict[str, Any]:
         )
     ).scalars().all()
 
+    # Pick the task the assistant should perform, based on where the CAPA is in
+    # its lifecycle. The system prompt is built around exactly one of these three
+    # task types and expects a `task` discriminator in the payload — WITHOUT it
+    # the model can't tell which job to do and returns prose with no
+    # <suggestion> block, which the parser stores as a null suggestion.
+    executed_actions = [a for a in actions if a.status == "COMPLETED"]
+    if not root_causes or not capa.rcaCompleted:
+        # No confirmed root causes yet → help identify them.
+        task = "suggest_root_causes"
+    elif not actions:
+        # Root causes are in, but no actions planned → propose actions.
+        task = "suggest_actions"
+    elif executed_actions and capa.state in (
+        "ACTIONS_IN_PROGRESS",
+        "PENDING_VERIFICATION",
+        "VERIFIED",
+    ):
+        # Actions executed and verification is the next gate.
+        task = "suggest_verification"
+    else:
+        task = "suggest_actions"
+
     return {
+        "task": task,
+        "instruction": (
+            f"Perform the '{task}' task for the CAPA below using the source-aware "
+            "framing in your system prompt. Always wrap the result in a "
+            "<suggestion>...</suggestion> block containing the JSON shape defined "
+            "for this task type. If the record is already complete and there is "
+            "genuinely nothing to add, still emit a <suggestion> block with an "
+            "empty suggestions array and a one-line note explaining why."
+        ),
         "sourceModule": "CAPA",
         "sourceRecordId": capa.id,
         "capa": {

@@ -64,11 +64,15 @@ DEFINITION: dict[str, Any] = {
 
 
 _LIVE_STATUSES: tuple[PermitStatus, ...] = (
+    # Closed-loop states
+    PermitStatus.APPROVED,
+    PermitStatus.ISSUED,
+    PermitStatus.ACTIVE,
+    PermitStatus.SUSPENDED,
+    # Deprecated pre-rebuild intermediates (kept for old rows)
     PermitStatus.ISSUER_APPROVED,
     PermitStatus.SAFETY_APPROVED,
     PermitStatus.PLANT_HEAD_APPROVED,
-    PermitStatus.ACTIVE,
-    PermitStatus.SUSPENDED,
 )
 
 

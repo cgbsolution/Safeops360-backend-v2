@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models._base import Base, IdMixin
+from app.models._base import Base, IdMixin, SoftDeleteMixin
 from app.models.user import User
 
 
@@ -45,7 +45,7 @@ class IncidentStatus(str, enum.Enum):
     CLOSED = "CLOSED"
 
 
-class Incident(Base, IdMixin):
+class Incident(Base, IdMixin, SoftDeleteMixin):
     """SQLAlchemy mirror of the Prisma `Incident` model.
 
     Phase 1 of the production-depth refactor adds ~50 new columns covering
@@ -131,6 +131,34 @@ class Incident(Base, IdMixin):
     classifiedById: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
     severity: Mapped[str | None] = mapped_column(String)  # LOW | MEDIUM | HIGH | CRITICAL
     classificationRationale: Mapped[str | None] = mapped_column(Text)
+
+    # ─── Incident Intelligence (Slice 1) ───
+    # Feature 5 — numeric 5×5 severity scoring + escalation ledger. `severity`
+    # (above) stays the derived label mirror; the numbers live here.
+    #   { score, likelihoodOfRecurrence, consequenceScore, band,
+    #     linkedRiskRegisterId, escalationTriggered, escalationLog[], computedAt }
+    severityDetail: Mapped[dict | None] = mapped_column(JSON)
+    # Feature 2 — AI-assist provenance. Every AI-touched field is marked here so
+    # an auditor can see which content originated from a model.
+    #   { summarySource, summary, summaryGeneratedAt,
+    #     rootCauseSuggestion: { text, confidence, basedOnIncidentIds,
+    #                            generatedAt, status } }
+    aiAssist: Mapped[dict | None] = mapped_column(JSON)
+    # Feature 1 (Slice 2) — the shared cause-analysis canvas model. Both the
+    # Fishbone and 5-Why views read/write this one `causes[]` array (switching
+    # method never loses data). `rootCauseData`/`rootCauses` stay in sync.
+    #   { method, causes: [{ id, category, whyLevel, text, isRootCause,
+    #     source, confidence, acceptedBy, acceptedAt, linkedCapaId }],
+    #     lastEditedBy, lastEditedAt }
+    causeAnalysis: Mapped[dict | None] = mapped_column(JSON)
+    # Feature 4 (Slice 2) — statutory obligation determined at classification.
+    #   { required: bool, forms: [formType], jurisdiction }
+    statutoryObligation: Mapped[dict | None] = mapped_column(JSON)
+    # Feature 8 (Slice 2) — derived cost-of-unsafety breakdown (computed on
+    # closure). { directRepairCost, estimatedDowntimeCost,
+    #   investigationLaborCost, estimatedInsuranceImpact, totalCost,
+    #   costConfidence }
+    costImpact: Mapped[dict | None] = mapped_column(JSON)
 
     # ─── Phase 2 / Statutory ───
     isReportable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -455,6 +483,9 @@ class IncidentCapa(Base, IdMixin):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String, nullable=False)  # CORRECTIVE | PREVENTIVE
     rootCauseAddressed: Mapped[str | None] = mapped_column(String)
+    # Feature 1 — back-link to the RCA cause node this CAPA was raised from
+    # (the node inside rootCauseData carries the reverse `linkedCapaId`).
+    linkedCauseId: Mapped[str | None] = mapped_column(String)
     ownerId: Mapped[str] = mapped_column(ForeignKey("User.id"), nullable=False, index=True)
     targetDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING", index=True)
