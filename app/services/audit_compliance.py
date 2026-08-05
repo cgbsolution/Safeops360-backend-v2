@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -515,6 +516,309 @@ async def import_library(db: AsyncSession, *, user: User, payload: dict[str, Any
         created = False
     await db.flush()
     return {"ok": True, "created": created, "industryCode": code, "checkpointCount": cp_count, "disciplines": len(cats)}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Library editing — the checkpoint set as an editable template.
+#
+# The library arrived as a bulk JSON import, which is the right tool for
+# authoring 1,500 checkpoints in one go and the wrong one for fixing a typo in
+# question 37. Re-pasting the whole document to change one line risks losing
+# every other edit made since, so these are surgical operations on one
+# checkpoint or one discipline at a time.
+#
+# THE IMPORTANT SEMANTIC: editing a library does NOT change audits already
+# materialised from it. Every audit snapshots its checkpoints at creation
+# (`AuditCheckpointResponse` carries its own copy of the question, criticality
+# and requirement type), precisely so a wording change in November cannot
+# restate what an auditor assessed in March. Edits reach the NEXT audit.
+# ─────────────────────────────────────────────────────────────────────
+
+# Fields a caller may set on a library checkpoint, and how each is coerced.
+_CP_TEXT_FIELDS = ("question", "guidance", "requirement_reference", "standard")
+_CP_BOOL_FIELDS = ("requires_photo_on_fail", "auto_trigger_capa_on_fail")
+_CRITICALITIES = ("critical", "major", "minor", "informational")
+
+
+async def _load_library(db: AsyncSession, industry_code: str) -> AuditCheckpointLibrary:
+    lib = (
+        await db.execute(
+            select(AuditCheckpointLibrary).where(
+                AuditCheckpointLibrary.industryCode == industry_code
+            )
+        )
+    ).scalar_one_or_none()
+    if lib is None:
+        raise ValueError(f"Checkpoint library '{industry_code}' not found")
+    return lib
+
+
+def _bump_version(version: str | None) -> str:
+    """`2026.1` -> `2026.2`. The version is what tells an auditor whether two
+    audits were run against the same criteria, so every edit moves it."""
+    v = (version or "").strip() or "2026.1"
+    head, _, tail = v.rpartition(".")
+    if head and tail.isdigit():
+        return f"{head}.{int(tail) + 1}"
+    return f"{v}.1"
+
+
+def _apply_cp_fields(cp: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Merge a validated patch into a library checkpoint, in place."""
+    for f in _CP_TEXT_FIELDS:
+        if f in patch:
+            cp[f] = (patch[f] or "").strip()
+    for f in _CP_BOOL_FIELDS:
+        if f in patch:
+            cp[f] = bool(patch[f])
+    if "criticality" in patch:
+        crit = (patch["criticality"] or "").strip().lower()
+        if crit not in _CRITICALITIES:
+            raise ValueError(f"criticality must be one of {', '.join(_CRITICALITIES)}")
+        cp["criticality"] = crit
+        # Severity drives the CAPA the checkpoint raises. Left unsynced, a
+        # checkpoint downgraded to minor would keep spawning critical CAPAs.
+        cp["capa_severity_if_triggered"] = (
+            "critical" if crit == "critical" else "major" if crit == "major" else "minor"
+        )
+    if "requirement_type" in patch:
+        raw = patch["requirement_type"]
+        if raw in (None, ""):
+            cp["requirement_type"] = None
+        else:
+            code = page_grading.normalise_requirement_type(raw)
+            if code is None:
+                raise ValueError(
+                    "requirement_type must be STATUTORY_REGULATORY or INTERNAL_REQUIREMENT"
+                )
+            cp["requirement_type"] = code
+    if "linked_safeops_module" in patch:
+        cp["linked_safeops_module"] = patch["linked_safeops_module"] or None
+
+
+def _find_cp(cats: list[dict], code: str) -> tuple[dict, dict, int] | None:
+    for cat in cats:
+        for i, cp in enumerate(cat.get("checkpoints") or []):
+            if cp.get("code") == code:
+                return cat, cp, i
+    return None
+
+
+def _recount(lib: AuditCheckpointLibrary, cats: list[dict]) -> int:
+    total = sum(len(c.get("checkpoints") or []) for c in cats)
+    # Reassigned rather than mutated in place: `categories` is a JSON column and
+    # SQLAlchemy does not track in-place mutation of a plain list/dict, so an
+    # edit that only mutated would flush nothing and silently do nothing.
+    lib.categories = cats
+    lib.checkpointCount = total
+    lib.version = _bump_version(lib.version)
+    return total
+
+
+async def update_library_checkpoint(
+    db: AsyncSession, *, industry_code: str, code: str, patch: dict[str, Any]
+) -> dict[str, Any]:
+    """Edit one checkpoint in place. Only the supplied fields change."""
+    lib = await _load_library(db, industry_code)
+    cats = [dict(c) for c in (lib.categories or [])]
+    for c in cats:
+        c["checkpoints"] = [dict(cp) for cp in (c.get("checkpoints") or [])]
+
+    found = _find_cp(cats, code)
+    if found is None:
+        raise ValueError(f"Checkpoint '{code}' is not in this library")
+    cat, cp, idx = found
+
+    if "question" in patch and len((patch["question"] or "").strip()) < 4:
+        raise ValueError("The question must be at least 4 characters")
+    _apply_cp_fields(cp, patch)
+
+    # Moving a checkpoint between disciplines is an edit, not a delete-recreate:
+    # the code is what links it to history, so it has to survive the move.
+    target = patch.get("category_code")
+    if target and target != cat.get("category_code"):
+        dest = next((c for c in cats if c.get("category_code") == target), None)
+        if dest is None:
+            raise ValueError(f"Discipline '{target}' is not in this library")
+        cat["checkpoints"].pop(idx)
+        dest["checkpoints"].append(cp)
+
+    _recount(lib, cats)
+    await db.flush()
+    return {"ok": True, "code": code, "version": lib.version, "checkpoint": cp}
+
+
+async def add_library_checkpoint(
+    db: AsyncSession, *, industry_code: str, discipline_code: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Append a checkpoint to a discipline, minting its code if none is given."""
+    lib = await _load_library(db, industry_code)
+    cats = [dict(c) for c in (lib.categories or [])]
+    for c in cats:
+        c["checkpoints"] = [dict(cp) for cp in (c.get("checkpoints") or [])]
+
+    cat = next((c for c in cats if c.get("category_code") == discipline_code), None)
+    if cat is None:
+        raise ValueError(f"Discipline '{discipline_code}' is not in this library")
+
+    question = (data.get("question") or "").strip()
+    if len(question) < 4:
+        raise ValueError("The question must be at least 4 characters")
+
+    code = (data.get("code") or "").strip() or _next_cp_code(cats, cat)
+    if _find_cp(cats, code) is not None:
+        raise ValueError(f"Checkpoint code '{code}' is already used in this library")
+
+    crit = (data.get("criticality") or "major").strip().lower()
+    if crit not in _CRITICALITIES:
+        raise ValueError(f"criticality must be one of {', '.join(_CRITICALITIES)}")
+
+    cp: dict[str, Any] = {
+        "code": code,
+        "question": question,
+        "guidance": (data.get("guidance") or "").strip(),
+        "requirement_reference": (data.get("requirement_reference") or "").strip(),
+        "standard": (data.get("standard") or "").strip() or "Page Industries Internal Audit",
+        "criticality": crit,
+        "response_type": "page_grading",
+        "requires_photo_on_fail": bool(
+            data.get("requires_photo_on_fail", crit in ("critical", "major"))
+        ),
+        "auto_trigger_capa_on_fail": bool(
+            data.get("auto_trigger_capa_on_fail", crit == "critical")
+        ),
+        "capa_severity_if_triggered": (
+            "critical" if crit == "critical" else "major" if crit == "major" else "minor"
+        ),
+        "linked_safeops_module": data.get("linked_safeops_module") or None,
+        "requirement_type": page_grading.normalise_requirement_type(
+            data.get("requirement_type")
+        ),
+    }
+    cat["checkpoints"].append(cp)
+    total = _recount(lib, cats)
+    await db.flush()
+    return {"ok": True, "checkpoint": cp, "version": lib.version, "checkpointCount": total}
+
+
+def _next_cp_code(cats: list[dict], cat: dict) -> str:
+    """`PI-HR-041` after `PI-HR-040`. Derived from the discipline's existing
+    codes so a hand-added checkpoint is indistinguishable from a seeded one;
+    falls back to the discipline code when the set is empty."""
+    codes = [cp.get("code", "") for cp in cat.get("checkpoints") or []]
+    prefix, highest = None, 0
+    for c in codes:
+        m = re.match(r"^(.*?)(\d+)$", c or "")
+        if m:
+            prefix = prefix or m.group(1)
+            highest = max(highest, int(m.group(2)))
+    if prefix is None:
+        prefix = f"{cat.get('category_code', 'CP')}-"
+    width = 3
+    while True:
+        candidate = f"{prefix}{highest + 1:0{width}d}"
+        if _find_cp(cats, candidate) is None:
+            return candidate
+        highest += 1
+
+
+async def delete_library_checkpoint(
+    db: AsyncSession, *, industry_code: str, code: str
+) -> dict[str, Any]:
+    """Remove a checkpoint from the library.
+
+    Safe by construction: audits already materialised keep their own snapshot
+    rows, so removing a line here retires it from FUTURE audits and changes no
+    record of a past one.
+    """
+    lib = await _load_library(db, industry_code)
+    cats = [dict(c) for c in (lib.categories or [])]
+    for c in cats:
+        c["checkpoints"] = [dict(cp) for cp in (c.get("checkpoints") or [])]
+
+    found = _find_cp(cats, code)
+    if found is None:
+        raise ValueError(f"Checkpoint '{code}' is not in this library")
+    cat, _cp, idx = found
+    if len(cat["checkpoints"]) == 1:
+        raise ValueError(
+            f"'{cat.get('category_name') or cat.get('category_code')}' would be left with no "
+            "checkpoints — remove the discipline instead."
+        )
+    cat["checkpoints"].pop(idx)
+    total = _recount(lib, cats)
+    await db.flush()
+    return {"ok": True, "code": code, "version": lib.version, "checkpointCount": total}
+
+
+async def upsert_library_discipline(
+    db: AsyncSession, *, industry_code: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Add a discipline, or rename / recolour an existing one.
+
+    `category_code` is the identity and is never rewritten by this call: it is
+    what every materialised checkpoint row, every discipline-scoped allocation
+    and every programme coverage join is keyed on. The display name is free to
+    change; the code is not.
+    """
+    lib = await _load_library(db, industry_code)
+    cats = [dict(c) for c in (lib.categories or [])]
+    for c in cats:
+        c["checkpoints"] = [dict(cp) for cp in (c.get("checkpoints") or [])]
+
+    code = (data.get("category_code") or "").strip().upper()
+    if not code:
+        raise ValueError("A discipline needs a category_code")
+    name = (data.get("category_name") or "").strip()
+
+    existing = next((c for c in cats if c.get("category_code") == code), None)
+    if existing is not None:
+        if name:
+            existing["category_name"] = name
+        if data.get("category_color"):
+            existing["category_color"] = data["category_color"]
+        if data.get("category_icon"):
+            existing["category_icon"] = data["category_icon"]
+        created = False
+    else:
+        if len(name) < 2:
+            raise ValueError("A new discipline needs a name")
+        cats.append({
+            "category_code": code,
+            "category_name": name,
+            "category_color": data.get("category_color") or "#64748B",
+            "category_icon": data.get("category_icon") or "list",
+            "sequence": len(cats) + 1,
+            "checkpoints": [],
+        })
+        created = True
+
+    _recount(lib, cats)
+    await db.flush()
+    return {"ok": True, "created": created, "categoryCode": code, "version": lib.version}
+
+
+async def delete_library_discipline(
+    db: AsyncSession, *, industry_code: str, discipline_code: str
+) -> dict[str, Any]:
+    """Remove a discipline and every checkpoint in it. Refuses to empty the
+    library — a checklist with no disciplines cannot materialise an audit, and
+    the failure would surface at scheduling rather than here."""
+    lib = await _load_library(db, industry_code)
+    cats = [dict(c) for c in (lib.categories or [])]
+    if len(cats) <= 1:
+        raise ValueError("A library must keep at least one discipline")
+    target = next((c for c in cats if c.get("category_code") == discipline_code), None)
+    if target is None:
+        raise ValueError(f"Discipline '{discipline_code}' is not in this library")
+    removed = len(target.get("checkpoints") or [])
+    cats = [c for c in cats if c.get("category_code") != discipline_code]
+    total = _recount(lib, cats)
+    await db.flush()
+    return {
+        "ok": True, "categoryCode": discipline_code, "removedCheckpoints": removed,
+        "version": lib.version, "checkpointCount": total,
+    }
 
 
 async def list_templates(db: AsyncSession) -> list[dict[str, Any]]:
@@ -2176,19 +2480,38 @@ async def _fork_template_with_checkpoint(
 
 
 async def allocate_checkpoints(
-    db: AsyncSession, *, user: User, audit_id: str, owner_id: str | None,
+    db: AsyncSession, *, user: User, audit_id: str,
+    owner_id: str | None = None, auditor_id: str | None = None,
+    set_owner: bool = True, set_auditor: bool = False,
     checkpoint_ids: list[str] | None = None, discipline_id: str | None = None,
 ) -> dict[str, Any]:
-    """Plant Head / Lead Auditor allocates checkpoints to an owner — per-row,
-    bulk (checkpoint_ids), or whole-discipline (discipline_id). owner_id=None
-    unassigns. Sets assignedOwnerId + keeps routedToUserId in sync; each change
-    logs a ROUTED_TO_OWNER interaction (reassignment carries any in-flight
-    iteration with it)."""
+    """Allocate checkpoints to an AUDITEE (`owner_id`), an AUDITOR
+    (`auditor_id`), or both — per-row, bulk (`checkpoint_ids`), or whole
+    discipline (`discipline_id`).
+
+    Discipline-wide allocation is the fast path, not the only one. A discipline
+    is a convenient default because one department usually owns it, but real
+    audits cut across that constantly: a single HR checkpoint about crèche
+    staffing belongs to the welfare officer rather than the HR head, and one
+    electrical item inside Production is the maintenance engineer's. Passing
+    `checkpoint_ids` allocates exactly those rows and nothing else.
+
+    `set_owner` / `set_auditor` say which axis this call is changing, so that
+    passing `owner_id=None` UNASSIGNS the auditee rather than being mistaken for
+    "leave the auditee alone" — the two are different intentions and a null
+    cannot express both.
+
+    Each owner change logs a ROUTED_TO_OWNER interaction, so a reassignment
+    carries any in-flight iteration with it visibly. Auditor changes are a work
+    split with no thread state, so they are not logged as interactions.
+    """
     audit = await _load_audit(db, audit_id, with_responses=True)
     if audit is None:
         raise ValueError("Audit not found")
     if audit.status in ("closed", "cancelled"):
         raise ValueError(f"Audit is {audit.status}; allocation is locked")
+    if not set_owner and not set_auditor:
+        raise ValueError("Nothing to allocate — specify an auditee, an auditor, or both")
 
     ids = set(checkpoint_ids or [])
     targets = [
@@ -2197,6 +2520,39 @@ async def allocate_checkpoints(
     ]
     if not targets:
         raise ValueError("No matching checkpoints to allocate")
+
+    # ── Auditor axis ─────────────────────────────────────────────────────
+    auditor_changed = 0
+    if set_auditor:
+        if auditor_id:
+            au = await db.get(User, auditor_id)
+            if au is None:
+                raise ValueError("Auditor not found")
+            if au.plantId and au.plantId != audit.plantId:
+                raise ValueError("Auditor belongs to a different plant")
+            # Conducting a checkpoint is an auditor act, so the person doing it
+            # must not be an auditee on this same engagement. Without this,
+            # per-checkpoint allocation would be a way around the segregation
+            # rule the team screen enforces.
+            if auditor_id in {a.get("userId") for a in (audit.auditees or []) if isinstance(a, dict)}:
+                raise ValueError(
+                    f"{au.name} is an auditee on this audit and cannot also conduct checkpoints."
+                )
+        for r in targets:
+            if r.workflowState == "FINALIZED":
+                continue
+            # Null falls back to the lead, who covers everything not explicitly
+            # assigned — leaving it null would strand the row with no conductor.
+            new_auditor = auditor_id or audit.leadAuditorUserId
+            if r.assignedAuditorId != new_auditor:
+                r.assignedAuditorId = new_auditor
+                auditor_changed += 1
+        if not set_owner:
+            await db.flush()
+            return {
+                "ok": True, "updated": auditor_changed, "auditorId": auditor_id,
+                "auditorReassignments": auditor_changed,
+            }
 
     owner_name = owner_id
     if owner_id:
@@ -2257,7 +2613,196 @@ async def allocate_checkpoints(
         updated += 1
 
     await db.flush()
-    return {"ok": True, "updated": updated, "ownerId": owner_id}
+    return {
+        "ok": True, "updated": updated, "ownerId": owner_id,
+        "auditorId": auditor_id if set_auditor else None,
+        "auditorReassignments": auditor_changed,
+    }
+
+
+async def update_audit_team(
+    db: AsyncSession, *, user: User, audit_id: str, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-seat the audit team AFTER the audit exists — and re-route the
+    checkpoints to match.
+
+    The team used to be fixed at creation, which does not survive contact with a
+    real audit. Auditees are very often unknown when the audit is scheduled and
+    are only identified at (or after) the opening meeting, once the auditor has
+    met the departments and knows who actually owns what. Forcing that
+    information to be supplied a week early meant it was either guessed — every
+    finding routing to the plant manager — or the audit was cancelled and
+    rescheduled to correct the cast.
+
+    Seating someone is only half the job. `assignedAuditorId` and
+    `assignedOwnerId` were written onto every checkpoint at materialisation from
+    the team as it stood then, so a team change that did not re-route would seat
+    a new auditee who owns nothing and leave findings routing to the old one.
+
+    What is deliberately NOT overwritten:
+
+      • Hand-allocated checkpoints (`assignedById` set). Someone opened the
+        allocation screen and made a per-checkpoint decision; a discipline-level
+        default must not silently undo it. `overrideManualAllocations` opts in.
+      • FINALIZED checkpoints. The audit is closed over them and their owner is
+        part of the record.
+
+    In-flight findings ARE re-routed, and each carries a ROUTED_TO_OWNER
+    interaction, so the thread shows the handover rather than the finding
+    silently appearing in a different inbox.
+    """
+    audit = await _load_audit(db, audit_id, with_responses=True)
+    if audit is None:
+        raise ValueError("Audit not found")
+    if audit.status in ("closed", "cancelled"):
+        raise ValueError(f"Audit is {audit.status}; the team is locked")
+
+    override_manual = bool(data.get("overrideManualAllocations"))
+
+    # Only the keys actually supplied are touched, so a call that names auditees
+    # cannot blank the co-auditors it never mentioned.
+    co_in = data.get("coAuditors")
+    au_in = data.get("auditees")
+    pm_in = data.get("plantManagerUserId", ...)
+
+    co_auditors = (
+        [
+            {"userId": c["userId"] if isinstance(c, dict) else c,
+             "disciplineIds": (c.get("disciplineIds") or []) if isinstance(c, dict) else []}
+            for c in co_in
+        ]
+        if co_in is not None else list(audit.coAuditors or [])
+    )
+    auditees = (
+        [
+            {"userId": a["userId"] if isinstance(a, dict) else a,
+             "responsibleCategories": (a.get("responsibleCategories") or []) if isinstance(a, dict) else []}
+            for a in au_in
+        ]
+        if au_in is not None else list(audit.auditees or [])
+    )
+    plant_manager = audit.plantManagerUserId if pm_in is ... else (pm_in or None)
+
+    co_ids = [c["userId"] for c in co_auditors if c.get("userId")]
+    au_ids = [a["userId"] for a in auditees if a.get("userId")]
+
+    # No duplicate seats — the same person twice in one slot produces two
+    # routing rules for one discipline and a silently arbitrary winner.
+    for label, ids in (("co-auditor", co_ids), ("auditee", au_ids)):
+        dupes = {i for i in ids if ids.count(i) > 1}
+        if dupes:
+            names = await _names_for(db, dupes)
+            raise ValueError(f"Duplicate {label}: {', '.join(names)}")
+
+    # Segregation of duties, checked here and not only at creation — otherwise
+    # this endpoint is a way around the rule create_audit enforces.
+    clash = (set(co_ids) | {audit.leadAuditorUserId}) & set(au_ids)
+    if clash:
+        names = await _names_for(db, clash)
+        raise ValueError(
+            f"{', '.join(names)} cannot be both auditor and auditee on the same audit."
+        )
+
+    # Seat the PROPOSED team before deriving the scope: `scope_for_audit` reads
+    # the audit's own team fields, so checking independence against the stored
+    # team would be checking the arrangement we are replacing. A blocking
+    # verdict raises, the router turns that into a 400, and the session is
+    # rolled back — so nothing assigned here survives a rejection.
+    #
+    # `include_allocation=False` for the same reason: the per-checkpoint owners
+    # still on the rows belong to the OLD cast and are re-routed below.
+    audit.coAuditors = co_auditors
+    audit.auditees = auditees
+    audit.plantManagerUserId = plant_manager
+
+    scope = await independence.scope_for_audit(db, audit, include_allocation=False)
+    verdicts = await independence.check_many(
+        db, user_ids=[audit.leadAuditorUserId, *co_ids], scope=scope, assigning_as="AUDITOR"
+    )
+    # Recorded BEFORE the raise, on its own session — a blocked attempt is
+    # evidence and has to outlive the transaction that never committed.
+    await independence_events.record_verdicts(
+        verdicts=verdicts,
+        engagement_kind="AUDIT",
+        origin="UPDATE_AUDIT_TEAM",
+        attempted_by_user_id=user.id,
+        site_id=audit.plantId,
+    )
+    blocked = {uid: v for uid, v in verdicts.items() if v.blocking}
+    if blocked:
+        ids = list(blocked)
+        names = await _names_for(db, ids)
+        parts = [f"{n}: {blocked[i].blocking[0].reason}" for i, n in zip(ids, names)]
+        raise ValueError("Auditor independence — " + " | ".join(parts))
+
+    # ── Re-route the checkpoints ─────────────────────────────────────────
+    now = _utcnow()
+    default_owner = plant_manager or audit.leadAuditorUserId
+    auditor_changed = owner_changed = 0
+
+    for r in audit.responses:
+        if r.workflowState == "FINALIZED":
+            continue
+
+        # Who conducts it. Purely a work-split among auditors, with no state
+        # attached, so it is always recomputed.
+        new_auditor = _route_auditor_for_category(
+            r.categoryId, co_auditors, audit.leadAuditorUserId
+        )
+        if new_auditor != r.assignedAuditorId:
+            r.assignedAuditorId = new_auditor
+            auditor_changed += 1
+
+        # Who answers for it.
+        if r.assignedById and not override_manual:
+            continue  # hand-allocated — leave it alone
+        new_owner = _route_for_category(r.categoryId, auditees)
+        if new_owner == r.assignedOwnerId:
+            continue
+        prev = r.assignedOwnerId
+        r.assignedOwnerId = new_owner
+        if new_owner:
+            r.routedToUserId = new_owner
+        elif r.overallStatus in _PRE_SUBMIT_STATUSES:
+            r.routedToUserId = None
+        else:
+            # An in-flight finding must never be left un-routable.
+            r.routedToUserId = default_owner
+        owner_changed += 1
+
+        owner_name = (await _names_for(db, [new_owner]))[0] if new_owner else None
+        await _log_interaction(
+            db, instance=r, audit_id=audit.id, actor_id=user.id,
+            actor_role=_actor_role_for(user, audit), action="ROUTED_TO_OWNER",
+            resulting_state=r.workflowState,
+            comment=(
+                "Unassigned by a team change" if not new_owner
+                else f"Reassigned to {owner_name} by a team change" if prev
+                else f"Assigned to {owner_name} by a team change"
+            ),
+            at=now,
+        )
+
+    await db.flush()
+    return {
+        "ok": True,
+        "coAuditors": len(co_auditors),
+        "auditees": len(auditees),
+        "checkpointsRerouted": owner_changed,
+        "auditorReassignments": auditor_changed,
+    }
+
+
+async def _names_for(db: AsyncSession, ids) -> list[str]:
+    """Display names for an id collection, in the order given. A missing user
+    still renders — an audit that names someone must not collapse because the
+    account was later removed."""
+    ids = list(ids)
+    if not ids:
+        return []
+    rows = (await db.execute(select(User).where(User.id.in_(ids)))).scalars().all()
+    by_id = {u.id: u.name for u in rows}
+    return [by_id.get(i, "Unknown user") for i in ids]
 
 
 async def my_assigned_checkpoints(
