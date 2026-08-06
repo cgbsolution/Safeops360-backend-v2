@@ -211,6 +211,15 @@ class Incident(Base, IdMixin, SoftDeleteMixin):
     lessonsDistributedTo: Mapped[dict | None] = mapped_column(JSON)
     closedById: Mapped[str | None] = mapped_column(String)
 
+    # Post-closure trigger audit — the same JSONB shape NearMiss and Observation
+    # already carry ([{ruleId, ruleName, fired, status, reason, failureReason}]).
+    # Incidents previously only LOGGED their rule outcomes, which is why the
+    # question "how often has the HIRA review trigger actually fired?" could not
+    # be answered without a production investigation. Written by
+    # app.services.trigger_engine via json_column_sink("closureTriggers").
+    # DDL: prisma/apply-trigger-reliability-ddl.ts
+    closureTriggers: Mapped[list | None] = mapped_column(JSON)
+
     # ─── 90-day Effectiveness Review ───
     effectivenessReviewDueAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     effectivenessReviewedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

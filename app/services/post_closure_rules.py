@@ -1,8 +1,16 @@
 """Post-closure rules engine for Safety Observation (Dimension 4 of the
 brief). Ports the Node `src/lib/observation/post-closure-rules.ts` shape
-to Python. Each rule is independent — failures are caught and logged, so
-one bad rule can't block another from firing. Audit entries are appended
-to Observation.closureTriggers (JSONB column).
+to Python.
+
+Reliability comes from the shared `app.services.trigger_engine`, not from
+per-runner try/except. Before that engine existed this file caught a rule
+crash with `print(..., file=sys.stderr)` and — worse — wrapped the
+*persistence of the audit itself* in a bare try/except that printed and moved
+on. A failed write therefore left no trace that the run had happened at all,
+which is indistinguishable from a trigger that never fired. Both paths now go
+through `run_trigger_rules`: stack traces are logged, failures become explicit
+FAILED audit entries, an HSE Manager is notified, and a sink failure is
+reported to the caller instead of printed.
 
 Currently wired:
   • LessonsDistributionAgent (Anthropic) — generates a sharable lesson
@@ -16,13 +24,54 @@ for now and can be ported here as the modules they touch land in Python.
 
 from __future__ import annotations
 
-import sys
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.observation import Observation
 from app.services.ai.agents.lessons import run_lessons_distribution
+from app.services.trigger_engine import (
+    TriggerOutcome,
+    TriggerResult,
+    json_column_sink,
+    run_trigger_rules,
+)
+
+
+async def _rule_lessons_distribution(db: AsyncSession, obs: Observation) -> TriggerResult:
+    """AI lesson generation. Raising is fine — the engine converts it to a
+    FAILED entry with the stack trace logged and the HSE Manager told, which is
+    what this rule's old self-catching `except` could not do."""
+    lesson = await run_lessons_distribution(db, observation_id=obs.id)
+    if lesson is None:
+        return TriggerResult(
+            rule_name="Lessons Distribution (AI)",
+        rule_id="rule_lessons_distribution",
+            outcome=TriggerOutcome.SKIPPED,
+            reason="Agent produced no lesson.",
+        )
+    if lesson.get("skipped"):
+        return TriggerResult(
+            rule_name="Lessons Distribution (AI)",
+        rule_id="rule_lessons_distribution",
+            outcome=TriggerOutcome.SKIPPED,
+            reason=str(lesson.get("reason") or "skipped"),
+            data=lesson,
+        )
+    return TriggerResult(
+        rule_name="Lessons Distribution (AI)",
+        rule_id="rule_lessons_distribution",
+        outcome=TriggerOutcome.FIRED,
+        reason=(
+            f"Lesson generated, {len(lesson.get('audience') or [])} audience, "
+            f"{len(lesson.get('actions') or [])} actions"
+        ),
+        spawned_record_type="AI_LESSON",
+        data=lesson,
+    )
+
+
+_RULES = (_rule_lessons_distribution,)
 
 
 async def run_post_closure_rules(
@@ -35,48 +84,13 @@ async def run_post_closure_rules(
     if obs is None:
         return []
 
-    events: list[dict[str, Any]] = []
-
-    # ── Rule: LessonsDistributionAgent ────────────────────────────────
-    try:
-        lesson = await run_lessons_distribution(db, observation_id=observation_id)
-        if lesson is not None:
-            events.append(
-                {
-                    "ruleId": "rule_lessons_distribution",
-                    "ruleName": "Lessons Distribution (AI)",
-                    "fired": not lesson.get("skipped", False),
-                    "reason": (
-                        f"Lesson generated, {len(lesson.get('audience') or [])} audience, "
-                        f"{len(lesson.get('actions') or [])} actions"
-                        if not lesson.get("skipped")
-                        else lesson.get("reason") or "skipped"
-                    ),
-                    "spawnedRecordType": "AI_LESSON",
-                    "data": lesson,
-                }
-            )
-    except Exception as e:  # noqa: BLE001
-        events.append(
-            {
-                "ruleId": "rule_lessons_distribution",
-                "ruleName": "Lessons Distribution (AI)",
-                "fired": False,
-                "error": str(e),
-            }
-        )
-        print(f"[post-closure] lessons agent crashed: {e}", file=sys.stderr)
-
-    # Persist all events onto the observation. Append to existing
-    # closureTriggers if any (so re-runs are visible side-by-side).
-    if events:
-        try:
-            existing = obs.closureTriggers or []
-            if not isinstance(existing, list):
-                existing = []
-            obs.closureTriggers = [*existing, *events]
-            await db.flush()
-        except Exception as e:  # noqa: BLE001
-            print(f"[post-closure] persist failed: {e}", file=sys.stderr)
-
-    return events
+    run = await run_trigger_rules(
+        db,
+        _RULES,
+        obs,
+        source_kind="Observation",
+        source_id=observation_id,
+        sink=json_column_sink("closureTriggers"),
+        site_id=getattr(obs, "plantId", None),
+    )
+    return run.audit_entries()

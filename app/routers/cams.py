@@ -42,6 +42,7 @@ from app.models.cams import (
 )
 from app.models.user import User
 from app.schemas import cams as S
+from app.services import calendar_booking
 from app.services import cams as svc
 from app.services.permissions import PermissionContext, can
 
@@ -562,6 +563,13 @@ async def create_engagement(body: S.EngagementCreate, user: User = Depends(get_c
         status="SCHEDULED" if body.scheduledStart else "PLANNED", createdBy=user.id,
     )
     db.add(e)
+    await db.flush()
+    # Claim the participants' time as soon as the engagement exists. Best-effort
+    # by contract — `sync_engagement` never raises, so an unreachable calendar
+    # server cannot fail the creation.
+    await calendar_booking.sync_engagement(
+        db, engagement_kind="INSPECTION", engagement_id=e.id, actor_id=user.id
+    )
     await db.commit()
     await db.refresh(e)
     return await _engagement_out(db, e)
@@ -591,6 +599,14 @@ async def update_engagement(engagement_id: str, body: S.EngagementUpdate, user: 
     for k, v in body.model_dump(exclude_unset=True).items():
         setattr(e, k, v)
     e.updatedBy = user.id
+    await db.flush()
+    # Re-sync unconditionally rather than guarding on which fields changed: the
+    # sync already diffs against what was delivered and sends nothing when the
+    # result is identical, so a field-by-field guard here would be a second,
+    # divergent copy of that decision.
+    await calendar_booking.sync_engagement(
+        db, engagement_kind="INSPECTION", engagement_id=e.id, actor_id=user.id
+    )
     await db.commit()
     await db.refresh(e)
     return await _engagement_out(db, e)
@@ -636,6 +652,14 @@ async def transition_engagement(engagement_id: str, body: S.EngagementTransition
 
     e.status = body.toStatus
     e.updatedBy = user.id
+    await db.flush()
+    # CANCELLED withdraws every booking; CLOSED releases only the time still in
+    # the future. Both decisions live in the sync, keyed off the status it reads
+    # back — this call simply tells it the status moved.
+    if body.toStatus in ("CANCELLED", "CLOSED"):
+        await calendar_booking.sync_engagement(
+            db, engagement_kind="INSPECTION", engagement_id=e.id, actor_id=user.id
+        )
     await db.commit()
     await db.refresh(e)
     return await _engagement_out(db, e)

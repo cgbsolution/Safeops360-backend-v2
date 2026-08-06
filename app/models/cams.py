@@ -292,6 +292,34 @@ class CamsFinding(Base, IdMixin):
     verificationNote: Mapped[str | None] = mapped_column(Text)
     evidenceAttachmentIds: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
+    # ── Fire & Life Safety additions (generic on purpose) ─────────────────────
+    #
+    # A fire "Defect" in the build spec IS a CamsFinding — same lifecycle, same
+    # CAPA link, same independence rules. Rather than fork a Defect table, the
+    # two things the spec needs that findings lacked are added here, and both are
+    # useful to every CAMS consumer:
+    #
+    # `requiresCapa` — opt-in hard constraint. Spec §5.4 wants "CRITICAL defect
+    # ⇒ linked CAPA" enforced by the DB, not by the UI, so it cannot repeat the
+    # HIRA gap where a column existed and nothing enforced it. A blanket CHECK on
+    # `severity='CRITICAL_NC' ⇒ capaId IS NOT NULL` would retroactively invalidate
+    # existing CAMS findings and break every audit path that writes a finding
+    # before spawning its CAPA. Instead the fire path sets this flag, and a
+    # DEFERRABLE INITIALLY DEFERRED constraint trigger validates it at COMMIT —
+    # so the spawn-then-link ordering inside one transaction is legal, but a
+    # transaction that ends with an unlinked required-CAPA finding cannot commit.
+    # (Postgres will not accept a deferrable CHECK; a constraint trigger is the
+    # only way to get a deferred assertion.)
+    requiresCapa: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # `verificationEngagementId` — spec §4.3: a defect cannot go OPEN → CLOSED
+    # without a linked *verification inspection*. `verificationNote` above is
+    # free text and proves nothing; this points at the CamsEngagement that
+    # re-inspected the asset, mirroring the re-approval-on-edit lock decided for
+    # HIRA. Enforced in services/fire_defects.py, not by a DB constraint: a
+    # non-fire finding may legitimately close on documentary evidence alone.
+    verificationEngagementId: Mapped[str | None] = mapped_column(String)
+
     createdAt: Mapped[datetime] = _created()
     createdBy: Mapped[str | None] = mapped_column(String)
     updatedAt: Mapped[datetime] = _updated()
@@ -305,6 +333,9 @@ class CamsFinding(Base, IdMixin):
         Index("ix_CamsFinding_clause", "standardClauseRef"),
         Index("ix_CamsFinding_site", "siteId"),
         Index("ix_CamsFinding_repeat", "isRepeatFinding"),
+        # The fire defect board filters by asset; without this the kanban
+        # seq-scans every finding the tenant has ever raised.
+        Index("ix_CamsFinding_assetRef", "areaOrAssetRef"),
     )
 
 

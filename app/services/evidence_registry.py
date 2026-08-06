@@ -20,6 +20,7 @@ from app.models.audit_compliance import (
     ComplianceAudit,
 )
 from app.models.cams import CamsFinding
+from app.models.chemical import ChemicalDisposalRecord, ChemicalMaster
 from app.models.programme import ProgrammeCycle
 
 
@@ -98,6 +99,34 @@ REGISTRY: dict[str, EntitySpec] = {
             {"PROGRAMME_DOCUMENT", "REVIEW_MINUTES", "EXTERNAL_SCHEDULE",
              "CORRESPONDENCE", "OTHER"}
         ),
+    ),
+    # ── Chemical / Hazmat: SDS sheets and disposal manifests ────────────────
+    #
+    # BASIC TIER ONLY. The SDS is attached as supporting evidence and is never
+    # opened by the platform: hazard classification, flash point and NFPA
+    # ratings are entered by a human who has read the sheet. `extraction` stays
+    # null on these rows — AI/OCR extraction of SDS content is a separate
+    # airgapped commercial add-on and is deliberately out of scope for the
+    # Chemical module (its build spec §0/§8). If a future change starts
+    # populating `extraction` for documentCategory=SDS, that is a licensing
+    # decision, not a refactor.
+    "chemical_master": EntitySpec(
+        label="Chemical",
+        model=ChemicalMaster,
+        # A ChemicalMaster is tenant-scoped, not plant-scoped: the same
+        # substance is one master row used across every site.
+        plant_attr=None,
+        read_perm="INCIDENT.READ",
+        write_perm="INCIDENT.UPDATE",
+        categories=frozenset({"SDS_SHEET", "CERTIFICATE", "LICENSE", "REPORT", "OTHER"}),
+    ),
+    "chemical_disposal": EntitySpec(
+        label="Disposal record",
+        model=ChemicalDisposalRecord,
+        plant_attr="plantId",
+        read_perm="INCIDENT.READ",
+        write_perm="INCIDENT.UPDATE",
+        categories=frozenset({"DISPOSAL_MANIFEST", "CERTIFICATE", "CORRESPONDENCE", "OTHER"}),
     ),
     # ── Follow-ups (spec §5.3 #2-4) — each is a single line once wired: ──────
     #   "eai_entry":        EAI SDS sheets      → read EAI.READ  / write EAI.UPDATE

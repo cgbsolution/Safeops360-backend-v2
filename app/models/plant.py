@@ -23,6 +23,15 @@ class Plant(Base, IdMixin):
     location: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)
     unitType: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Exchange resource mailbox booked for this site's audit opening/closing
+    # meetings. A site-level default rather than a per-audit choice because the
+    # client's requirement is that scheduling an audit books everything at once
+    # — asking a scheduler to pick a room every time would mean the room is the
+    # one thing that is usually forgotten. Overridable per booking.
+    defaultMeetingRoomEmail: Mapped[str | None] = mapped_column(String)
+    defaultMeetingRoomName: Mapped[str | None] = mapped_column(String)
+
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

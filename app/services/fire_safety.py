@@ -1,6 +1,8 @@
-"""Fire Safety & Emergency Response engines (P1-4).
+"""Fire Safety & Emergency Response engines (P1-4, extended by Fire & Life Safety).
 
-  • equipment status engine (ACTIVE / DUE_INSPECTION / OVERDUE from next-due date)
+  • equipment status engine — now driven by the config-resolved inspection
+    frequency (`services/fire_frequency`) rather than a per-row integer, with
+    open CRITICAL defects as a second input (spec §5.2)
   • CAMS-engine inspection integration (engagement sourceModule='FIRE'); on close,
     advance the equipment's inspection dates and flip status back to ACTIVE
   • drill MAJOR_GAP gate (a drill can't complete with an unaccounted-persons or
@@ -21,6 +23,19 @@ from app.models.fire_safety import AssemblyPoint, FireDrill, FireDrillFinding, F
 
 DUE_SOON_DAYS = 30
 
+# Statuses a human sets deliberately, which no batch job may overwrite. Held in
+# `statusOverride` rather than in `status` itself: the P1-4 engine inferred
+# stickiness from the computed column, so a recompute could not tell "an operator
+# decommissioned this" from "the engine last wrote DECOMMISSIONED", and there was
+# nowhere to record who decided or why.
+STICKY_STATUSES = ("OUT_OF_SERVICE", "DECOMMISSIONED")
+
+# The shipped vocabulary is kept (ACTIVE ≡ the spec's COMPLIANT, DUE_INSPECTION ≡
+# its DUE) so existing dashboard filters and the equipment register keep working.
+# NON_COMPLIANT is genuinely new: it is what an asset is when it has been
+# inspected on time and FAILED, which the old three-state engine could not say.
+VALID_STATUSES = ("ACTIVE", "DUE_INSPECTION", "OVERDUE", "NON_COMPLIANT", *STICKY_STATUSES)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -32,10 +47,35 @@ def _aware(d: datetime | None) -> datetime | None:
     return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d
 
 
-def compute_status(equipment: FireEquipment, now: datetime | None = None) -> str:
-    """Derived equipment status. Manual OUT_OF_SERVICE / DECOMMISSIONED are sticky."""
-    if equipment.status in ("OUT_OF_SERVICE", "DECOMMISSIONED"):
-        return equipment.status
+def compute_status(
+    equipment: FireEquipment,
+    now: datetime | None = None,
+    *,
+    has_open_critical_defect: bool = False,
+) -> str:
+    """Derived equipment status.
+
+    Precedence, and the reasoning for it:
+
+      1. A manual override wins over everything. Someone physically removed the
+         asset from service; no derived state should contradict them.
+      2. An open CRITICAL defect beats the schedule. An extinguisher inspected
+         yesterday and found discharged is NON_COMPLIANT, not ACTIVE — reading it
+         as compliant because its next inspection is 89 days away is precisely
+         the reading that gets someone hurt.
+      3. Never inspected → DUE_INSPECTION, never ACTIVE. An asset with no
+         inspection history has not demonstrated anything.
+      4. Otherwise: overdue / due-soon / active from the next-due date.
+
+    Note what is deliberately absent: AMC lapse. Spec §4.4 makes it
+    informational, so it is reported on the asset and never folded into status —
+    letting a lapsed service contract mark an on-schedule asset non-compliant
+    would make the overdue count mean two different things at once.
+    """
+    if equipment.statusOverride:
+        return equipment.statusOverride
+    if has_open_critical_defect:
+        return "NON_COMPLIANT"
     now = now or _now()
     due = _aware(equipment.nextInspectionDueDate)
     if due is None:
@@ -47,16 +87,88 @@ def compute_status(equipment: FireEquipment, now: datetime | None = None) -> str
     return "ACTIVE"
 
 
+async def set_status_override(
+    db: AsyncSession,
+    equipment: FireEquipment,
+    *,
+    status: str | None,
+    reason: str,
+    actor_id: str | None,
+) -> dict[str, Any]:
+    """Apply or clear a manual status override, with a reason, audit-logged.
+
+    Spec §5.2: status must not be manually overridable "without an audit-logged
+    reason". `FireEquipment` is already in the tamper-evident hash chain via
+    `register_audited`, so the column write is captured automatically — but the
+    chain records *what changed*, not *why*, so the reason is recorded explicitly
+    as its own event. Passing `status=None` clears the override and hands the
+    asset back to the engine.
+    """
+    from app.services.audit_log import record_event
+
+    if status is not None and status not in STICKY_STATUSES:
+        raise ValueError(
+            f"{status} is a derived status; only {' / '.join(STICKY_STATUSES)} may be set manually."
+        )
+    if not (reason or "").strip():
+        raise ValueError("A reason is required to override or restore equipment status.")
+
+    previous = equipment.statusOverride
+    equipment.statusOverride = status
+    equipment.statusOverrideReason = reason
+    equipment.statusOverriddenBy = actor_id
+    equipment.statusOverriddenAt = _now()
+    if status == "OUT_OF_SERVICE":
+        equipment.outOfServiceReason = reason
+    equipment.status = compute_status(equipment)
+    equipment.updatedBy = actor_id
+
+    # `record_event` reads the actor from the request-scoped audit context, so
+    # `actor_id` is not passed — it is already on the chain entry.
+    await record_event(
+        db,
+        entity_type="FireEquipment",
+        entity_id=equipment.id,
+        entity_code=equipment.equipmentCode,
+        plant_id=equipment.plantId,
+        action="STATUS_OVERRIDE_CLEARED" if status is None else "STATUS_OVERRIDE_SET",
+        before={"statusOverride": previous},
+        after={"statusOverride": status, "status": equipment.status},
+        reason=reason,
+    )
+    return {
+        "equipmentId": equipment.id,
+        "statusOverride": equipment.statusOverride,
+        "status": equipment.status,
+        "reason": reason,
+    }
+
+
 async def recompute_all_statuses(db: AsyncSession, plant_id: str | None = None) -> dict[str, Any]:
-    """Recompute every active equipment's status from its next-due date (on-demand,
-    scheduler substitute). Also pulls the latest CLOSED FIRE inspection engagement
-    per equipment and advances its inspection dates."""
+    """Recompute every active asset's status. The nightly batch job of spec §5.2.
+
+    Three inputs, all resolved in bulk rather than per asset — this runs over the
+    whole register, so an N+1 here is the difference between a job that finishes
+    overnight and one that does not:
+
+      • latest COMPLETED FIRE inspection per asset (advances lastInspectionDate)
+      • the config-resolved frequency per asset (sets nextInspectionDueDate, and
+        records WHICH rule was applied in `frequencyMasterId` so the due date is
+        explicable, not just present)
+      • open CRITICAL defects per asset (forces NON_COMPLIANT)
+
+    Returns a per-status breakdown plus the unresolved-frequency count, because
+    "1,400 assets fell back to the 30-day default" is an operational fact the
+    caller needs and a bare `statusChanged` number hides.
+    """
     from app.models.cams import CamsEngagement
+    from app.services import fire_defects, fire_frequency
 
     q = select(FireEquipment).where(FireEquipment.isActive.is_(True)).where(FireEquipment.isDeleted.is_(False))
     if plant_id:
         q = q.where(FireEquipment.plantId == plant_id)
     equip = (await db.execute(q)).scalars().all()
+
     # latest closed FIRE inspection per equipment
     insp = (
         await db.execute(
@@ -72,18 +184,44 @@ async def recompute_all_statuses(db: AsyncSession, plant_id: str | None = None) 
         d = _aware(getattr(e, "conductedDate", None) or getattr(e, "plannedDate", None))
         if d and (e.sourceEntityId not in latest_by_eq or d > latest_by_eq[e.sourceEntityId]):
             latest_by_eq[e.sourceEntityId] = d
+
+    frequencies = await fire_frequency.resolve_many(db, equip)
+    critical_assets = await fire_defects.open_critical_defect_asset_ids(db, plant_id)
+
     changed = 0
+    unresolved = 0
+    by_status: dict[str, int] = {}
     for eq in equip:
-        latest = latest_by_eq.get(eq.id)
-        if latest and (eq.lastInspectionDate is None or latest > _aware(eq.lastInspectionDate)):
-            eq.lastInspectionDate = latest
-            eq.nextInspectionDueDate = latest + timedelta(days=eq.inspectionFrequencyDays)
-        new_status = compute_status(eq)
+        freq = frequencies.get(eq.id)
+        if freq is not None:
+            if not freq.resolved:
+                unresolved += 1
+            eq.frequencyMasterId = freq.masterId
+            latest = latest_by_eq.get(eq.id)
+            if latest and (eq.lastInspectionDate is None or latest > _aware(eq.lastInspectionDate)):
+                eq.lastInspectionDate = latest
+            # Recompute the due date from the CURRENT rule every night, not only
+            # when a new inspection lands. Otherwise a frequency change in config
+            # would not reach existing assets until each was next inspected —
+            # which is the same "remap needs a code change" problem in a new hat.
+            base = _aware(eq.lastInspectionDate)
+            if base:
+                eq.nextInspectionDueDate = base + timedelta(days=freq.days)
+
+        new_status = compute_status(eq, has_open_critical_defect=eq.id in critical_assets)
         if new_status != eq.status:
             eq.status = new_status
             changed += 1
+        by_status[new_status] = by_status.get(new_status, 0) + 1
+
     await db.flush()
-    return {"evaluated": len(equip), "statusChanged": changed}
+    return {
+        "evaluated": len(equip),
+        "statusChanged": changed,
+        "byStatus": by_status,
+        "unresolvedFrequency": unresolved,
+        "openCriticalDefectAssets": len(critical_assets),
+    }
 
 
 # ── Drill gate ──────────────────────────────────────────────────────────────

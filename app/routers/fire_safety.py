@@ -18,16 +18,21 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.core.db import get_db
-from app.models.cams import CamsEngagement
+from app.models.cams import CamsEngagement, CamsFinding
 from app.models.fire_safety import (
-    AssemblyPoint, FireDrill, FireDrillFinding, FireEmergencyPlan, FireEquipment, FireIncidentLink,
+    AssemblyPoint, FireAmcContract, FireAssetCertificate, FireDrill, FireDrillFinding,
+    FireEmergencyPlan, FireEquipment, FireFalseAlarmLog, FireIncidentLink, FireZone,
+    InspectionFrequencyMaster,
 )
 from app.models.user import User
+from app.services import fire_certificates as certsvc
+from app.services import fire_defects as defectsvc
+from app.services import fire_frequency as freqsvc
 from app.services import fire_safety as svc
 from app.services.access_scope import build_query_scope
 from app.services.permissions import can
@@ -59,6 +64,11 @@ def _eq(e: FireEquipment) -> dict[str, Any]:
         "inspectionFrequencyDays": e.inspectionFrequencyDays, "status": e.status, "capacitySpec": e.capacitySpec,
         "maintenanceContractor": e.maintenanceContractor, "qrCode": e.qrCode, "isActive": e.isActive,
         "outOfServiceReason": e.outOfServiceReason,
+        "zoneId": e.zoneId, "assetSubtype": e.assetSubtype, "amcContractId": e.amcContractId,
+        "frequencyMasterId": e.frequencyMasterId, "frequencyOverrideReason": e.frequencyOverrideReason,
+        "statusOverride": e.statusOverride, "statusOverrideReason": e.statusOverrideReason,
+        "statusOverriddenBy": e.statusOverriddenBy,
+        "statusOverriddenAt": e.statusOverriddenAt.isoformat() if e.statusOverriddenAt else None,
     }
 
 
@@ -177,16 +187,55 @@ class OutOfServiceBody(BaseModel):
 
 @router.post("/equipment/{eid}/out-of-service")
 async def out_of_service(eid: str, body: OutOfServiceBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Take an asset out of service.
+
+    Routes through `set_status_override` rather than writing `status` directly:
+    spec §5.2 requires an audit-logged reason for any manual status, and the old
+    direct write left no record of who decided or why — the next nightly
+    recompute could not even tell it was a human decision.
+    """
     e = await db.get(FireEquipment, eid)
     if not e or e.isDeleted:
         raise HTTPException(404, "Equipment not found")
     await _require(db, user, _WRITE, plant_id=e.plantId)
-    e.status = "OUT_OF_SERVICE"
-    e.outOfServiceReason = body.reason
-    e.updatedBy = user.id
+    await svc.set_status_override(db, e, status="OUT_OF_SERVICE", reason=body.reason, actor_id=user.id)
     await db.commit()
     await db.refresh(e)
     return _eq(e)
+
+
+class StatusOverrideBody(BaseModel):
+    # None clears the override and returns the asset to the engine.
+    status: str | None = None
+    reason: str = Field(min_length=5)
+
+
+@router.post("/equipment/{eid}/status-override")
+async def status_override(eid: str, body: StatusOverrideBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Set or clear a manual status override (spec §5.2). Reason mandatory, audit-logged."""
+    e = await db.get(FireEquipment, eid)
+    if not e or e.isDeleted:
+        raise HTTPException(404, "Equipment not found")
+    await _require(db, user, _WRITE, plant_id=e.plantId)
+    try:
+        res = await svc.set_status_override(db, e, status=body.status, reason=body.reason, actor_id=user.id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    return res
+
+
+@router.get("/equipment/{eid}/frequency")
+async def equipment_frequency(eid: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Why this asset is on the cadence it is on — the answer an inspector shows
+    a regulator. Returns the matched rule, its regulatory citation, and whether it
+    resolved at all (an unresolved asset is silently on the 30-day fallback)."""
+    e = await db.get(FireEquipment, eid)
+    if not e or e.isDeleted:
+        raise HTTPException(404, "Equipment not found")
+    await _require(db, user, _READ, plant_id=e.plantId)
+    res = await freqsvc.resolve_for_equipment(db, e)
+    return {"equipmentId": e.id, "equipmentCode": e.equipmentCode, **res.as_dict()}
 
 
 @router.post("/equipment/{eid}/trigger-inspection", status_code=201)
@@ -332,3 +381,567 @@ async def escalate_crisis(incident_id: str, body: EscalateBody, user: User = Dep
 async def fser(plant_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     await _require(db, user, _READ, plant_id=plant_id)
     return await svc.fser_panel(db, plant_id)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fire & Life Safety extension
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Zones ────────────────────────────────────────────────────────────────────
+def _zone(z: FireZone) -> dict[str, Any]:
+    return {
+        "id": z.id, "zoneCode": z.zoneCode, "name": z.name, "plantId": z.plantId,
+        "buildingId": z.buildingId, "areaId": z.areaId, "parentZoneId": z.parentZoneId,
+        "floor": z.floor, "areaSqm": z.areaSqm, "coverageType": z.coverageType,
+        "criticality": z.criticality, "requiredAssetTypes": z.requiredAssetTypes,
+        "panelAssetId": z.panelAssetId, "isActive": z.isActive,
+    }
+
+
+@router.get("/zones")
+async def list_zones(
+    buildingId: str | None = Query(None), criticality: str | None = Query(None),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await _require(db, user, _READ)
+    scope = await build_query_scope(db, user.id, _READ)
+    stmt = scope.apply(select(FireZone).where(FireZone.isDeleted.is_(False)), FireZone)
+    if buildingId:
+        stmt = stmt.where(FireZone.buildingId == buildingId)
+    if criticality:
+        stmt = stmt.where(FireZone.criticality == criticality)
+    rows = (await db.execute(stmt.order_by(FireZone.zoneCode))).scalars().all()
+    # Asset counts per zone in one query — the zone list is the map legend and
+    # rendering "0 assets" because the count was too expensive to fetch is worse
+    # than not showing it.
+    counts = dict(
+        (
+            await db.execute(
+                select(FireEquipment.zoneId, func.count())
+                .where(FireEquipment.isDeleted.is_(False))
+                .where(FireEquipment.isActive.is_(True))
+                .group_by(FireEquipment.zoneId)
+            )
+        ).all()
+    )
+    return {
+        "items": [{**_zone(z), "assetCount": counts.get(z.id, 0)} for z in rows],
+        "total": len(rows),
+    }
+
+
+class ZoneCreate(BaseModel):
+    name: str = Field(min_length=2)
+    plantId: str
+    buildingId: str | None = None
+    areaId: str | None = None
+    parentZoneId: str | None = None
+    floor: str | None = None
+    areaSqm: float | None = None
+    coverageType: str = "BOTH"
+    criticality: str = "STANDARD"
+    requiredAssetTypes: list[str] = []
+    panelAssetId: str | None = None
+
+
+@router.post("/zones", status_code=201)
+async def create_zone(body: ZoneCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    await _require(db, user, _WRITE, plant_id=body.plantId)
+    if body.coverageType not in ("DETECTION", "SUPPRESSION", "BOTH"):
+        raise HTTPException(400, "coverageType must be DETECTION, SUPPRESSION or BOTH")
+    if body.criticality not in ("CRITICAL", "HIGH", "STANDARD"):
+        raise HTTPException(400, "criticality must be CRITICAL, HIGH or STANDARD")
+    n = (await db.execute(select(func.count()).select_from(FireZone).where(FireZone.plantId == body.plantId))).scalar() or 0
+    z = FireZone(
+        zoneCode=f"FZ-{body.plantId[:4].upper()}-{n + 1:03d}", name=body.name, plantId=body.plantId,
+        buildingId=body.buildingId, areaId=body.areaId, parentZoneId=body.parentZoneId, floor=body.floor,
+        areaSqm=body.areaSqm, coverageType=body.coverageType, criticality=body.criticality,
+        requiredAssetTypes=body.requiredAssetTypes, panelAssetId=body.panelAssetId, createdBy=user.id,
+    )
+    db.add(z)
+    await db.commit()
+    await db.refresh(z)
+    return _zone(z)
+
+
+@router.get("/zones/{zid}/compliance")
+async def zone_compliance(zid: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Suppression/detection readiness of one zone.
+
+    This is the read the hot-work PTW guard (spec §4.6) will consume. It lives
+    here rather than in the PTW router so there is one definition of "is this
+    zone covered", and it already reports `recommendedAction` — block for
+    CRITICAL zones, warn otherwise — so the PTW screen renders a decision rather
+    than re-deriving one.
+    """
+    z = await db.get(FireZone, zid)
+    if not z or z.isDeleted:
+        raise HTTPException(404, "Zone not found")
+    await _require(db, user, _READ, plant_id=z.plantId)
+    assets = (
+        await db.execute(
+            select(FireEquipment).where(FireEquipment.zoneId == zid)
+            .where(FireEquipment.isDeleted.is_(False)).where(FireEquipment.isActive.is_(True))
+        )
+    ).scalars().all()
+    impaired = [a for a in assets if a.status in ("OVERDUE", "NON_COMPLIANT", "OUT_OF_SERVICE")]
+    required = set(z.requiredAssetTypes or [])
+    present = {a.type for a in assets if a.status not in ("OVERDUE", "NON_COMPLIANT", "OUT_OF_SERVICE")}
+    missing = sorted(required - present)
+    compliant = not impaired and not missing
+    return {
+        "zoneId": z.id, "zoneCode": z.zoneCode, "name": z.name, "criticality": z.criticality,
+        "assetCount": len(assets), "compliant": compliant,
+        "impairedAssets": [_eq(a) for a in impaired],
+        "missingRequiredTypes": missing,
+        "recommendedAction": (
+            "ALLOW" if compliant else ("BLOCK" if z.criticality == "CRITICAL" else "WARN")
+        ),
+    }
+
+
+# ── Inspection frequency master (admin config) ───────────────────────────────
+def _ifm(r: InspectionFrequencyMaster) -> dict[str, Any]:
+    return {
+        "id": r.id, "plantId": r.plantId, "region": r.region, "assetType": r.assetType,
+        "assetSubtype": r.assetSubtype, "frequency": r.frequency, "customIntervalDays": r.customIntervalDays,
+        "intervalDays": freqsvc.interval_days(r), "regulatoryReference": r.regulatoryReference,
+        "checklistTemplateId": r.checklistTemplateId, "auditTypeId": r.auditTypeId,
+        "leadTimeDays": r.leadTimeDays, "isActive": r.isActive,
+    }
+
+
+@router.get("/frequency-master")
+async def list_frequency_master(
+    region: str = Query(freqsvc.DEFAULT_REGION), plantId: str | None = Query(None),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await _require(db, user, _READ)
+    stmt = (
+        select(InspectionFrequencyMaster)
+        .where(InspectionFrequencyMaster.isDeleted.is_(False))
+        .where(InspectionFrequencyMaster.region == region)
+    )
+    if plantId:
+        stmt = stmt.where(
+            (InspectionFrequencyMaster.plantId == plantId) | (InspectionFrequencyMaster.plantId.is_(None))
+        )
+    rows = (await db.execute(stmt.order_by(InspectionFrequencyMaster.assetType))).scalars().all()
+    return {
+        "items": [_ifm(r) for r in rows],
+        "total": len(rows),
+        "region": region,
+        # An asset type in the register with no rule is a silent 30-day fallback.
+        # Surfaced beside the rules rather than on a separate screen nobody opens.
+        "coverageGaps": await freqsvc.coverage_gaps(db, region=region),
+    }
+
+
+class FrequencyMasterCreate(BaseModel):
+    assetType: str
+    frequency: str
+    region: str = freqsvc.DEFAULT_REGION
+    plantId: str | None = None
+    assetSubtype: str | None = None
+    customIntervalDays: int | None = None
+    regulatoryReference: str | None = None
+    checklistTemplateId: str | None = None
+    auditTypeId: str | None = None
+    leadTimeDays: int = 7
+
+
+@router.post("/frequency-master", status_code=201)
+async def create_frequency_master(body: FrequencyMasterCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    await _require(db, user, _WRITE, plant_id=body.plantId)
+    if body.frequency not in (*freqsvc.FREQUENCY_DAYS, "CUSTOM"):
+        raise HTTPException(400, f"frequency must be one of {', '.join(freqsvc.FREQUENCY_DAYS)} or CUSTOM")
+    if body.frequency == "CUSTOM" and not body.customIntervalDays:
+        raise HTTPException(400, "CUSTOM frequency requires customIntervalDays")
+    r = InspectionFrequencyMaster(
+        plantId=body.plantId, region=body.region, assetType=body.assetType, assetSubtype=body.assetSubtype,
+        frequency=body.frequency, customIntervalDays=body.customIntervalDays,
+        regulatoryReference=body.regulatoryReference, checklistTemplateId=body.checklistTemplateId,
+        auditTypeId=body.auditTypeId, leadTimeDays=body.leadTimeDays, createdBy=user.id,
+    )
+    db.add(r)
+    await db.commit()
+    await db.refresh(r)
+    return _ifm(r)
+
+
+# ── AMC contracts ────────────────────────────────────────────────────────────
+def _amc(c: FireAmcContract) -> dict[str, Any]:
+    return {
+        "id": c.id, "contractCode": c.contractCode, "plantId": c.plantId, "vendorName": c.vendorName,
+        "vendorContactId": c.vendorContactId, "vendorEmail": c.vendorEmail, "vendorPhone": c.vendorPhone,
+        "scopeSummary": c.scopeSummary, "status": c.status, "annualValueInr": c.annualValueInr,
+        "startDate": c.startDate.isoformat() if c.startDate else None,
+        "endDate": c.endDate.isoformat() if c.endDate else None,
+        "daysRemaining": certsvc.days_remaining(c.endDate),
+        "renewalReminderDays": certsvc.tiers_for(c.renewalReminderDays),
+        "lastReminderTierSent": c.lastReminderTierSent,
+        "escalatedAt": c.escalatedAt.isoformat() if c.escalatedAt else None,
+        "contractDocumentIds": c.contractDocumentIds,
+        # Stated on every payload so no UI has to remember spec §4.4.
+        "affectsComplianceStatus": False,
+    }
+
+
+@router.get("/amc-contracts")
+async def list_amc(
+    status_filter: str | None = Query(None, alias="status"),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await _require(db, user, _READ)
+    scope = await build_query_scope(db, user.id, _READ)
+    stmt = scope.apply(select(FireAmcContract).where(FireAmcContract.isDeleted.is_(False)), FireAmcContract)
+    if status_filter:
+        stmt = stmt.where(FireAmcContract.status == status_filter)
+    rows = (await db.execute(stmt.order_by(FireAmcContract.endDate.asc()))).scalars().all()
+    return {"items": [_amc(c) for c in rows], "total": len(rows)}
+
+
+class AmcCreate(BaseModel):
+    plantId: str
+    vendorName: str = Field(min_length=2)
+    startDate: datetime
+    endDate: datetime
+    vendorContactId: str | None = None
+    vendorEmail: str | None = None
+    vendorPhone: str | None = None
+    scopeSummary: str | None = None
+    annualValueInr: float | None = None
+    renewalReminderDays: list[int] = []
+    assetIds: list[str] = []
+
+
+@router.post("/amc-contracts", status_code=201)
+async def create_amc(body: AmcCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    await _require(db, user, _WRITE, plant_id=body.plantId)
+    if body.endDate <= body.startDate:
+        raise HTTPException(400, "endDate must be after startDate")
+    n = (await db.execute(select(func.count()).select_from(FireAmcContract).where(FireAmcContract.plantId == body.plantId))).scalar() or 0
+    c = FireAmcContract(
+        contractCode=f"AMC-{body.plantId[:4].upper()}-{_now().year}-{n + 1:03d}", plantId=body.plantId,
+        vendorName=body.vendorName, vendorContactId=body.vendorContactId, vendorEmail=body.vendorEmail,
+        vendorPhone=body.vendorPhone, scopeSummary=body.scopeSummary, startDate=body.startDate,
+        endDate=body.endDate, annualValueInr=body.annualValueInr,
+        renewalReminderDays=certsvc.tiers_for(body.renewalReminderDays), createdBy=user.id,
+    )
+    db.add(c)
+    await db.flush()
+    # Assets point at the contract, not the reverse — one indexed column update
+    # per asset, and re-assigning an asset never rewrites the contract row.
+    if body.assetIds:
+        assets = (await db.execute(select(FireEquipment).where(FireEquipment.id.in_(body.assetIds)))).scalars().all()
+        for a in assets:
+            a.amcContractId = c.id
+            a.updatedBy = user.id
+    c.status = certsvc.status_for(c.endDate, certsvc.tiers_for(c.renewalReminderDays))
+    await db.commit()
+    await db.refresh(c)
+    return _amc(c)
+
+
+# ── Asset certificates ───────────────────────────────────────────────────────
+def _cert(c: FireAssetCertificate) -> dict[str, Any]:
+    return {
+        "id": c.id, "assetId": c.assetId, "plantId": c.plantId, "certificateType": c.certificateType,
+        "certificateNo": c.certificateNo, "issuingAuthority": c.issuingAuthority, "status": c.status,
+        "issueDate": c.issueDate.isoformat() if c.issueDate else None,
+        "expiryDate": c.expiryDate.isoformat() if c.expiryDate else None,
+        "daysRemaining": certsvc.days_remaining(c.expiryDate),
+        "escalationTierDays": certsvc.tiers_for(c.escalationTierDays),
+        "documentIds": c.documentIds, "notes": c.notes,
+    }
+
+
+@router.get("/certificates")
+async def list_certificates(
+    assetId: str | None = Query(None), status_filter: str | None = Query(None, alias="status"),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Asset-level certificates only.
+
+    Site-level statutory certificates (Fire NOC, PESO licence) are NOT served
+    here — they live in the Statutory Register (`RegulatoryRegistration`) and are
+    read from `/api/factory-ext/registrations`. Two endpoints returning the same
+    certificate would be the second source of truth spec §6 rules out.
+    """
+    await _require(db, user, _READ)
+    scope = await build_query_scope(db, user.id, _READ)
+    stmt = scope.apply(
+        select(FireAssetCertificate).where(FireAssetCertificate.isDeleted.is_(False)), FireAssetCertificate
+    )
+    if assetId:
+        stmt = stmt.where(FireAssetCertificate.assetId == assetId)
+    if status_filter:
+        stmt = stmt.where(FireAssetCertificate.status == status_filter)
+    rows = (await db.execute(stmt.order_by(FireAssetCertificate.expiryDate.asc().nulls_last()))).scalars().all()
+    return {"items": [_cert(c) for c in rows], "total": len(rows)}
+
+
+class CertificateCreate(BaseModel):
+    assetId: str
+    certificateType: str
+    plantId: str | None = None
+    certificateNo: str | None = None
+    issuingAuthority: str | None = None
+    issueDate: datetime | None = None
+    expiryDate: datetime | None = None
+    escalationTierDays: list[int] = []
+    documentIds: list[str] = []
+    notes: str | None = None
+
+
+@router.post("/certificates", status_code=201)
+async def create_certificate(body: CertificateCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    asset = await db.get(FireEquipment, body.assetId)
+    if not asset or asset.isDeleted:
+        raise HTTPException(404, "Asset not found")
+    await _require(db, user, _WRITE, plant_id=asset.plantId)
+    c = FireAssetCertificate(
+        assetId=asset.id, plantId=body.plantId or asset.plantId, certificateType=body.certificateType,
+        certificateNo=body.certificateNo, issuingAuthority=body.issuingAuthority, issueDate=body.issueDate,
+        expiryDate=body.expiryDate, escalationTierDays=certsvc.tiers_for(body.escalationTierDays),
+        documentIds=body.documentIds, notes=body.notes, createdBy=user.id,
+    )
+    c.status = certsvc.status_for(c.expiryDate, certsvc.tiers_for(c.escalationTierDays))
+    db.add(c)
+    await db.commit()
+    await db.refresh(c)
+    return _cert(c)
+
+
+@router.post("/expiry-sweep")
+async def expiry_sweep(plantId: str | None = Query(None), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Run the AMC + certificate + statutory-registration tier sweep (spec §4.4, §5.6).
+
+    Idempotent: each tier fires once. Exposed as an endpoint so the nightly job
+    and an operator running it on demand take the identical code path.
+    """
+    await _require(db, user, _WRITE, plant_id=plantId)
+    res = await certsvc.sweep_all(db, plantId)
+    await db.commit()
+    return res
+
+
+# ── Defects (CamsFinding on a FIRE engagement) ───────────────────────────────
+def _defect(f: CamsFinding) -> dict[str, Any]:
+    return {
+        "id": f.id, "findingCode": f.findingCode, "engagementId": f.engagementId, "assetId": f.areaOrAssetRef,
+        "title": f.title, "description": f.description, "severity": f.severity, "status": f.status,
+        "ownerId": f.ownerId, "capaId": f.capaId, "requiresCapa": f.requiresCapa,
+        "verificationEngagementId": f.verificationEngagementId, "verificationNote": f.verificationNote,
+        "dueDate": f.dueDate.isoformat() if f.dueDate else None,
+        "closedBy": f.closedBy, "closedAt": f.closedAt.isoformat() if f.closedAt else None,
+        "evidenceAttachmentIds": f.evidenceAttachmentIds,
+        "createdAt": f.createdAt.isoformat() if f.createdAt else None,
+    }
+
+
+@router.get("/defects")
+async def list_defects(
+    assetId: str | None = Query(None), zoneId: str | None = Query(None),
+    status_filter: str | None = Query(None, alias="status"), severity: str | None = Query(None),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The defect kanban feed. Defects are CamsFindings raised on FIRE engagements —
+    one findings register, filtered, not a parallel defect store."""
+    await _require(db, user, _READ)
+    fire_engagements = (
+        await db.execute(select(CamsEngagement.id).where(CamsEngagement.sourceModule == "FIRE"))
+    ).scalars().all()
+    if not fire_engagements:
+        return {"items": [], "total": 0, "byStatus": {}}
+    stmt = (
+        select(CamsFinding)
+        .where(CamsFinding.engagementId.in_(fire_engagements))
+        .where(CamsFinding.isDeleted.is_(False))
+    )
+    if assetId:
+        stmt = stmt.where(CamsFinding.areaOrAssetRef == assetId)
+    if zoneId:
+        zone_assets = (
+            await db.execute(select(FireEquipment.id).where(FireEquipment.zoneId == zoneId))
+        ).scalars().all()
+        stmt = stmt.where(CamsFinding.areaOrAssetRef.in_(zone_assets or ["__none__"]))
+    if status_filter:
+        stmt = stmt.where(CamsFinding.status == status_filter)
+    if severity:
+        stmt = stmt.where(CamsFinding.severity == defectsvc.normalise_severity(severity))
+    rows = (await db.execute(stmt.order_by(CamsFinding.createdAt.desc()))).scalars().all()
+    by_status: dict[str, int] = {}
+    for f in rows:
+        by_status[f.status] = by_status.get(f.status, 0) + 1
+    return {"items": [_defect(f) for f in rows], "total": len(rows), "byStatus": by_status}
+
+
+class DefectCreate(BaseModel):
+    engagementId: str
+    assetId: str
+    title: str = Field(min_length=3)
+    description: str = ""
+    severity: str = "MAJOR"
+    ownerId: str | None = None
+    sourceQuestionId: str | None = None
+    evidenceAttachmentIds: list[str] = []
+
+
+@router.post("/defects", status_code=201)
+async def create_defect(body: DefectCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Raise a defect. A CRITICAL one spawns its CAPA in this same transaction —
+    spec §5.4 — and the deferred DB constraint refuses the commit if it did not."""
+    eng = await db.get(CamsEngagement, body.engagementId)
+    if not eng or eng.isDeleted:
+        raise HTTPException(404, "Inspection engagement not found")
+    asset = await db.get(FireEquipment, body.assetId)
+    if not asset or asset.isDeleted:
+        raise HTTPException(404, "Asset not found")
+    await _require(db, user, _WRITE, plant_id=asset.plantId)
+    res = await defectsvc.raise_defect(
+        db, engagement=eng, asset=asset, title=body.title, description=body.description,
+        severity=body.severity, owner_id=body.ownerId, actor_id=user.id,
+        source_question_id=body.sourceQuestionId, evidence_attachment_ids=body.evidenceAttachmentIds,
+    )
+    await db.commit()
+    return res
+
+
+@router.get("/defects/{fid}/closure-gate")
+async def defect_closure_gate(fid: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Every reason this defect cannot close yet, all at once — so the UI renders
+    one panel instead of surfacing blockers one failed submit at a time."""
+    f = await db.get(CamsFinding, fid)
+    if not f or f.isDeleted:
+        raise HTTPException(404, "Defect not found")
+    await _require(db, user, _READ, plant_id=f.siteId)
+    blockers = await defectsvc.closure_blockers(db, f, actor_id=user.id)
+    return {
+        "defectId": f.id,
+        "canClose": not [b for b in blockers if b.severity == "ERROR"],
+        "blockers": [b.as_dict() for b in blockers],
+    }
+
+
+class DefectCloseBody(BaseModel):
+    verificationEngagementId: str | None = None
+    note: str | None = None
+
+
+@router.post("/defects/{fid}/close")
+async def close_defect(fid: str, body: DefectCloseBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    f = await db.get(CamsFinding, fid)
+    if not f or f.isDeleted:
+        raise HTTPException(404, "Defect not found")
+    await _require(db, user, _WRITE, plant_id=f.siteId)
+    res = await defectsvc.close_defect(
+        db, f, actor_id=user.id, verification_engagement_id=body.verificationEngagementId, note=body.note,
+    )
+    if not res["ok"]:
+        # 409, not 400: the request is well-formed, the record's state refuses it.
+        raise HTTPException(409, detail=res)
+    await db.commit()
+    return res
+
+
+@router.post("/defects/{fid}/verify")
+async def verify_defect(fid: str, body: DefectCloseBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    f = await db.get(CamsFinding, fid)
+    if not f or f.isDeleted:
+        raise HTTPException(404, "Defect not found")
+    await _require(db, user, _WRITE, plant_id=f.siteId)
+    res = await defectsvc.verify_defect(db, f, actor_id=user.id, note=body.note)
+    if not res["ok"]:
+        raise HTTPException(409, detail=res)
+    await db.commit()
+    return res
+
+
+# ── False alarm log ──────────────────────────────────────────────────────────
+class FalseAlarmCreate(BaseModel):
+    panelAssetId: str
+    occurredAt: datetime
+    cause: str
+    zoneId: str | None = None
+    causeNotes: str | None = None
+    correctiveAction: str | None = None
+    evacuationTriggered: bool = False
+    fireServiceCalled: bool = False
+
+
+@router.get("/false-alarms")
+async def list_false_alarms(
+    panelAssetId: str | None = Query(None), days: int = Query(365, ge=1, le=1825),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    await _require(db, user, _READ)
+    scope = await build_query_scope(db, user.id, _READ)
+    since = _now() - timedelta(days=days)
+    stmt = scope.apply(
+        select(FireFalseAlarmLog).where(FireFalseAlarmLog.occurredAt >= since), FireFalseAlarmLog
+    )
+    if panelAssetId:
+        stmt = stmt.where(FireFalseAlarmLog.panelAssetId == panelAssetId)
+    rows = (await db.execute(stmt.order_by(FireFalseAlarmLog.occurredAt.desc()))).scalars().all()
+    by_cause: dict[str, int] = {}
+    for r in rows:
+        by_cause[r.cause] = by_cause.get(r.cause, 0) + 1
+    return {
+        "items": [
+            {"id": r.id, "panelAssetId": r.panelAssetId, "plantId": r.plantId, "zoneId": r.zoneId,
+             "occurredAt": r.occurredAt.isoformat(), "cause": r.cause, "causeNotes": r.causeNotes,
+             "correctiveAction": r.correctiveAction, "evacuationTriggered": r.evacuationTriggered,
+             "fireServiceCalled": r.fireServiceCalled, "reportedBy": r.reportedBy}
+            for r in rows
+        ],
+        "total": len(rows),
+        "byCause": by_cause,
+        "windowDays": days,
+    }
+
+
+@router.post("/false-alarms", status_code=201)
+async def create_false_alarm(body: FalseAlarmCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    panel = await db.get(FireEquipment, body.panelAssetId)
+    if not panel or panel.isDeleted:
+        raise HTTPException(404, "Panel asset not found")
+    await _require(db, user, _WRITE, plant_id=panel.plantId)
+    row = FireFalseAlarmLog(
+        panelAssetId=panel.id, plantId=panel.plantId, zoneId=body.zoneId or panel.zoneId,
+        occurredAt=body.occurredAt, cause=body.cause, causeNotes=body.causeNotes,
+        correctiveAction=body.correctiveAction, evacuationTriggered=body.evacuationTriggered,
+        fireServiceCalled=body.fireServiceCalled, reportedBy=user.id, createdBy=user.id,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {"id": row.id, "panelAssetId": row.panelAssetId, "occurredAt": row.occurredAt.isoformat()}
+
+
+# ── Integrity check ──────────────────────────────────────────────────────────
+@router.get("/integrity/capa-constraint")
+async def capa_constraint_integrity(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Verify the §5.4 guarantee still holds.
+
+    Should always report zero. It is checked anyway because the constraint trigger
+    lives in hand-applied DDL on a schema Prisma also touches — a future
+    `prisma db push` could drop it, and a guarantee nobody verifies is one nobody
+    notices losing.
+    """
+    await _require(db, user, _READ)
+    orphans = await defectsvc.unlinked_required_capa_findings(db)
+    trigger = (
+        await db.execute(
+            text(
+                "SELECT count(*) FROM pg_trigger "
+                "WHERE tgname = 'trg_CamsFinding_requires_capa' AND NOT tgisinternal"
+            )
+        )
+    ).scalar() or 0
+    return {
+        "triggerInstalled": bool(trigger),
+        "unlinkedRequiredCapaCount": len(orphans),
+        "unlinkedFindingCodes": [f.findingCode for f in orphans][:50],
+        "healthy": bool(trigger) and not orphans,
+    }

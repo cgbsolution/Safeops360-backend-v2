@@ -32,7 +32,15 @@ def _env(*names: str) -> str | None:
 # ─── Email (SMTP / nodemailer-compatible) ────────────────────────────
 
 
-def _send_email_sync(to_addrs: list[str], subject: str, body: str, html: str | None = None) -> bool:
+def _send_email_sync(
+    to_addrs: list[str],
+    subject: str,
+    body: str,
+    html: str | None = None,
+    ics: str | None = None,
+    ics_method: str = "REQUEST",
+    ics_filename: str = "invite.ics",
+) -> bool:
     # Prefer typed settings (loaded from `.env`), fall back to raw env vars so
     # container deployments that only export OS env vars keep working.
     try:
@@ -52,11 +60,34 @@ def _send_email_sync(to_addrs: list[str], subject: str, body: str, html: str | N
         )
         return False
     port = int((getattr(_s, "smtp_port", None) if _s else None) or _env("SMTP_PORT") or 587)
-    if html:
+    if ics:
+        # A calendar invite Outlook/Teams will actually act on needs the iCalendar
+        # payload as an ALTERNATIVE part carrying `method=` — not merely as a file
+        # attachment. Without the method parameter the client renders a download
+        # link instead of Accept/Decline buttons, and nothing reaches the calendar.
+        # The .ics is attached as well so mail clients that ignore the alternative
+        # part (and every archive) still have the artefact.
+        from email.mime.application import MIMEApplication
+        from email.mime.multipart import MIMEMultipart
+
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))
+        if html:
+            alt.attach(MIMEText(html, "html", "utf-8"))
+        cal = MIMEText(ics, "calendar", "utf-8")
+        cal.replace_header("Content-Type", f'text/calendar; charset="utf-8"; method={ics_method}')
+        alt.attach(cal)
+
+        msg: MIMEText | MIMEMultipart = MIMEMultipart("mixed")
+        msg.attach(alt)
+        part = MIMEApplication(ics.encode("utf-8"), _subtype="ics", name=ics_filename)
+        part.add_header("Content-Disposition", "attachment", filename=ics_filename)
+        msg.attach(part)
+    elif html:
         # multipart/alternative: plain-text fallback + HTML (Daily Brief digest)
         from email.mime.multipart import MIMEMultipart
 
-        msg: MIMEText | MIMEMultipart = MIMEMultipart("alternative")
+        msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body, "plain", "utf-8"))
         msg.attach(MIMEText(html, "html", "utf-8"))
     else:
@@ -80,12 +111,24 @@ def _send_email_sync(to_addrs: list[str], subject: str, body: str, html: str | N
         return False
 
 
-async def send_email(to_addrs: Iterable[str], subject: str, body: str, html: str | None = None) -> bool:
+async def send_email(
+    to_addrs: Iterable[str],
+    subject: str,
+    body: str,
+    html: str | None = None,
+    ics: str | None = None,
+    ics_method: str = "REQUEST",
+    ics_filename: str = "invite.ics",
+) -> bool:
+    """Best-effort email. `ics` turns it into a calendar invite (METHOD REQUEST
+    to book or update, CANCEL to withdraw) — see `_send_email_sync`."""
     addrs = [a for a in to_addrs if a]
     if not addrs:
         return False
     # smtplib is sync — run in default thread pool to keep the event loop free.
-    return await asyncio.to_thread(_send_email_sync, addrs, subject, body, html)
+    return await asyncio.to_thread(
+        _send_email_sync, addrs, subject, body, html, ics, ics_method, ics_filename
+    )
 
 
 # ─── SMS (MSG91 first; Twilio fallback) ──────────────────────────────

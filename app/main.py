@@ -27,10 +27,12 @@ from app.routers import (
     audit_compliance,
     audit_log,
     auth,
+    calendar,
     cams,
     cams_completion,
     capa,
     capture,
+    chemical,
     supplier_portal,
     competency,
     training_engine,
@@ -146,6 +148,10 @@ _ROUTERS = {
     # Waves 3-5 completion (docs/cams/09 §3.3/3.5/3.6, §2.6): suppliers, field
     # i18n, evidence packs, notification preferences. Same CAMS.* codes.
     "cams_completion": cams_completion,
+    # Calendar bookings — the audit's claim on participants' Microsoft 365 time.
+    # Sits above BOTH engines through the same AUDIT|INSPECTION discriminator as
+    # assurance, and reuses the CAMS.* codes for the same reason it does.
+    "calendar": calendar,
     # Supplier portal (WP-45 stage 2) — the ONLY unauthenticated router. A
     # vendor factory manager holds no seat, so access is a signed, expiring,
     # single-audit token instead of a session. Mounted ungated for the same
@@ -171,6 +177,12 @@ _ROUTERS = {
     # fire_safety: registered in the licensing model, mounted ungated until a
     # CAPTURE-inclusive licence is issued ("capture": "CAPTURE" in ROUTER_MODULE).
     "capture": capture,
+    # Chemical / Hazmat Management. Same dev-licence situation as fire_safety and
+    # capture: mounted ungated, with per-endpoint RBAC (INCIDENT.READ/UPDATE plus
+    # ADMIN.MANAGE for the threshold/incompatibility masters) as the real gate.
+    # Add "chemical": "CHEMICAL" to ROUTER_MODULE once a CHEMICAL-inclusive
+    # licence is issued.
+    "chemical": chemical,
     # Daily Alert Brief (ALERTS module) — same dev-licence situation; add
     # "alerts": "ALERTS" to ROUTER_MODULE once a licence including it is issued.
     "alerts": alerts,
@@ -270,7 +282,15 @@ def create_app() -> FastAPI:
         PermitIsolation,
         PermitSuspension,
     )
-    from app.models.fire_safety import FireDrill, FireEmergencyPlan, FireEquipment
+    from app.models.fire_safety import (
+        FireAmcContract,
+        FireAssetCertificate,
+        FireDrill,
+        FireEmergencyPlan,
+        FireEquipment,
+        FireZone,
+        InspectionFrequencyMaster,
+    )
     from app.models.rca import RcaIdentifiedCause, RcaRiskLink, RootCauseAnalysis
     from app.models.safety_culture import (
         CultureMaturityProfile,
@@ -290,6 +310,12 @@ def create_app() -> FastAPI:
         PermitActionEvidence, PermitAttachment, PermitIsolation, PermitGasTestReading,
         PermitSuspension, PermitExtension, PermitCrewMember,
         FireEquipment, FireEmergencyPlan, FireDrill,
+        # Fire & Life Safety: the frequency master is the reason a due date is
+        # what it is, and the AMC/certificate rows are what a regulator asks to
+        # see — all three are worth as much tamper-evidence as the asset itself.
+        # FireZone joins because moving an asset between zones changes which
+        # hot-work permits it guards.
+        FireZone, InspectionFrequencyMaster, FireAmcContract, FireAssetCertificate,
         RootCauseAnalysis, RcaIdentifiedCause, RcaRiskLink,
         CaptureSubmission, RcaFieldRequest, Alert,
         # Incident Intelligence Slice 2 — golden-thread links, generated statutory

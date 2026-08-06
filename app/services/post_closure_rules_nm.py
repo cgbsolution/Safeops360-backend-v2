@@ -30,7 +30,6 @@ that the UI surfaces in the Related Items section.
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -43,6 +42,11 @@ from app.models.masters import Department
 from app.models.near_miss import NearMiss
 from app.models.plant import Plant
 from app.models.permit import Permit
+from app.services.trigger_engine import (
+    adapt_dict_rule,
+    json_column_sink,
+    run_trigger_rules,
+)
 
 
 # ─── Tunable thresholds (would normally live in a master table) ──────
@@ -404,20 +408,20 @@ async def run_near_miss_post_closure_rules(
     if nm is None:
         return []
 
-    results: list[dict[str, Any]] = []
-    for rule in _RULES:
-        try:
-            r = await rule(db, nm)
-            results.append(r)
-        except Exception as e:  # noqa: BLE001
-            print(f"[nm post-closure] {rule.__name__} crashed: {e}", file=sys.stderr)
-            results.append(_entry(rule.__name__, rule.__name__, fired=False, error=str(e)))
-
-    # Persist audit + dedicated trigger ID columns
-    existing = nm.closureTriggers or []
-    if not isinstance(existing, list):
-        existing = []
-    nm.closureTriggers = [*existing, *results]
+    # Reliability contract now comes from the shared engine (SAVEPOINT per rule,
+    # logged stack trace, explicit FIRED/FAILED/SKIPPED, HSE notification on
+    # failure, DomainEvent per outcome). Previously a crash here was a
+    # `print()` to stderr — on Azure App Service, somewhere nobody looks.
+    run = await run_trigger_rules(
+        db,
+        [adapt_dict_rule(r) for r in _RULES],
+        nm,
+        source_kind="NearMiss",
+        source_id=near_miss_id,
+        sink=json_column_sink("closureTriggers"),
+        site_id=getattr(nm, "plantId", None),
+    )
+    results = run.audit_entries()
 
     # Mirror specific spawn IDs into the dedicated columns so the UI / SQL
     # filters don't need to parse JSON.

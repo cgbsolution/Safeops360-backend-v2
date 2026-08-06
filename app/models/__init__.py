@@ -11,6 +11,18 @@ from app.models.agent import (
     AgentToolCall,
 )
 from app.models.anomaly import Anomaly
+from app.models.chemical import (
+    ChemicalDisposalRecord,
+    ChemicalIncompatibilityRule,
+    ChemicalInventoryItem,
+    ChemicalInventoryTransaction,
+    ChemicalMaster,
+    ChemicalStorageLocation,
+    ChemicalStorageOverride,
+    ChemicalThresholdRule,
+    ChemicalThresholdState,
+    MocTriggerLog,
+)
 from app.models.equipment import Equipment, Inspection
 from app.models.capa import (
     Capa,
@@ -65,6 +77,7 @@ from app.models.audit_compliance import (
     CheckpointInteraction,
     ComplianceAudit,
 )
+from app.models.calendar import CalendarBooking
 from app.models.cams import (
     CamsAuditType,
     CamsComplianceLink,
@@ -337,6 +350,7 @@ __all__ = [
     "AuditCheckpointResponse",
     "AuditReport",
     "AuditTemplate",
+    "CalendarBooking",
     "CheckpointInteraction",
     "ComplianceAudit",
     "DisciplineOwner",
@@ -363,6 +377,16 @@ __all__ = [
     "SlotScopeUnit",
     "Anomaly",
     "Area",
+    "ChemicalDisposalRecord",
+    "ChemicalIncompatibilityRule",
+    "ChemicalInventoryItem",
+    "ChemicalInventoryTransaction",
+    "ChemicalMaster",
+    "ChemicalStorageLocation",
+    "ChemicalStorageOverride",
+    "ChemicalThresholdRule",
+    "ChemicalThresholdState",
+    "MocTriggerLog",
     "Capa",
     "CapaAction",
     "Competency",

@@ -49,6 +49,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.incident import Incident, IncidentEquipment, IncidentPerson
+from app.services.trigger_engine import (
+    adapt_dict_rule,
+    json_column_sink,
+    run_trigger_rules,
+)
 
 
 # Severity → contractor score deduction (per company per incident).
@@ -589,32 +594,40 @@ _ALL_RULES = [
 async def run_incident_post_closure_rules(
     db: AsyncSession, incident_id: str
 ) -> list[dict[str, Any]]:
-    """Run all post-closure rules for an incident. Each rule runs inside
-    its own SAVEPOINT so one failure doesn't poison the others. Returns
-    the audit log of {ruleName, fired, reason} entries."""
+    """Run all post-closure rules for an incident. Returns the audit log of
+    {ruleName, fired, status, reason} entries.
+
+    Delegates to the shared ``trigger_engine`` so incidents, near misses,
+    observations and the Chemical module's threshold→MOC trigger all obey one
+    reliability contract. The behaviour this runner already had (SAVEPOINT per
+    rule, logged stack trace, ``error: True`` audit entry) is preserved; three
+    things are new and are the reason the migration is worth doing:
+
+      * the audit is now PERSISTED to ``Incident.closureTriggers`` instead of
+        only being logged, so "how many of the last 22 closures fired this
+        rule?" is a SQL question — the exact question that previously required
+        a production investigation;
+      * a failed rule notifies the HSE Manager rather than only writing to the
+        application log;
+      * every FIRED/FAILED outcome emits a DomainEvent for the Daily Brief.
+    """
 
     incident = await db.get(Incident, incident_id)
     if incident is None:
-        return [{"ruleName": "Bootstrap", "fired": False, "reason": "Incident not found."}]
+        return [{
+            "ruleName": "Bootstrap",
+            "fired": False,
+            "status": "SKIPPED",
+            "reason": "Incident not found.",
+        }]
 
-    audit_log: list[dict[str, Any]] = []
-    for rule in _ALL_RULES:
-        try:
-            async with db.begin_nested():
-                entry = await rule(db, incident)
-                audit_log.append(entry)
-        except Exception as e:  # noqa: BLE001
-            logger.exception(
-                "[incident post-closure] rule %s failed for incident %s",
-                rule.__name__,
-                incident_id,
-            )
-            audit_log.append({
-                "ruleName": rule.__name__.replace("_rule_", "").replace("_", " ").title(),
-                "fired": False,
-                "reason": f"Rule errored: {str(e)[:120]}",
-                "error": True,
-            })
-
-    await db.flush()
-    return audit_log
+    run = await run_trigger_rules(
+        db,
+        [adapt_dict_rule(r) for r in _ALL_RULES],
+        incident,
+        source_kind="Incident",
+        source_id=incident_id,
+        sink=json_column_sink("closureTriggers"),
+        site_id=getattr(incident, "plantId", None),
+    )
+    return run.audit_entries()

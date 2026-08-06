@@ -83,6 +83,7 @@ def rule_registry() -> list[ImpactRule]:
     new rules are additive — drop a file in rules/ and list it here."""
     from app.services.alerts.rules import (
         capa_overdue,
+        chemical_signals,
         hira_control_failed,
         observation_cluster,
         ptw_changed,
@@ -99,6 +100,9 @@ def rule_registry() -> list[ImpactRule]:
         capa_overdue.RULE,
         observation_cluster.RULE,
         hira_control_failed.RULE,
+        # Chemical / Hazmat: failed MOC trigger, threshold breached/approaching,
+        # unreviewed co-storage override.
+        *chemical_signals.ALL_RULES,
     ]
 
 

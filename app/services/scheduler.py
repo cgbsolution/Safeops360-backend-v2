@@ -267,6 +267,63 @@ async def _job_observation_weekly_insights(db) -> dict:
     return await compute_weekly(db, module="safety_observation")
 
 
+async def _job_calendar_booking_retry(db) -> dict:
+    """Drain calendar bookings whose delivery has not landed yet.
+
+    Booking a calendar is a network call to somebody else's Exchange, made from
+    inside the transaction that schedules an audit. That call is allowed to fail
+    — the audit must not — so a failed booking stays PENDING and this job is what
+    eventually gets it delivered. Only future bookings are retried; an invitation
+    for a window that has already closed cannot block anything.
+    """
+    from app.services.calendar_booking import run_booking_retry
+    return await run_booking_retry(db)
+
+
+async def _job_chemical_sds_review(db) -> dict:
+    """Nightly SDS review sweep (Chemical module §4.5).
+
+    Flags chemicals whose SDS review date has passed and clears the flag on any
+    whose sheet has since been renewed. It deliberately does NOT deactivate a
+    chemical: business rule §6 makes an overdue review a visible compliance
+    signal rather than an operational stop, because hard-deactivating every
+    chemical with stale paperwork would halt production over a filing lapse —
+    and the predictable response to that is someone disabling this job.
+    """
+    from app.services.chemical_sds import flag_overdue_sds_reviews
+    return await flag_overdue_sds_reviews(db)
+
+
+async def _job_chemical_threshold_sweep(db) -> dict:
+    """Full-estate threshold re-evaluation (Chemical module §4.3).
+
+    The threshold engine is edge-triggered on every receipt and transfer, so
+    this job is a safety net rather than the primary path. It exists because the
+    hot path can only see movements that happened: a threshold rule EDITED by an
+    admin (a tightened GCC limit, say) changes which sites are in breach without
+    any inventory moving at all, and nothing else would notice.
+    """
+    from sqlalchemy import select
+
+    from app.models.chemical import ChemicalInventoryItem
+    from app.services.chemical_threshold import evaluate_thresholds
+
+    pairs = (
+        await db.execute(
+            select(ChemicalInventoryItem.tenantId, ChemicalInventoryItem.plantId)
+            .where(ChemicalInventoryItem.isDeleted.is_(False))
+            .where(ChemicalInventoryItem.quantityLedger > 0)
+            .distinct()
+        )
+    ).all()
+    breached = 0
+    for tenant_id, plant_id in pairs:
+        evals = await evaluate_thresholds(db, tenant_id=tenant_id, plant_id=plant_id)
+        breached += sum(1 for e in evals if e.status == "BREACHED")
+    await db.commit()
+    return {"sitesEvaluated": len(pairs), "rulesBreached": breached}
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -280,6 +337,8 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("incident_risk_alerts", "Incident → ERM risk review flag (I-04)", 6 * HOUR, _job_incident_alerts),
     Job("cams_repeat_findings", "CAMS repeat-finding detection", 12 * HOUR, _job_cams_repeats),
     Job("fire_equipment_status", "Fire equipment status recompute", 1 * DAY, _job_fire_status),
+    Job("chemical_sds_review", "Chemical SDS review-due sweep", 1 * DAY, _job_chemical_sds_review),
+    Job("chemical_threshold_sweep", "Chemical regulatory-threshold re-evaluation", 6 * HOUR, _job_chemical_threshold_sweep),
     Job("compliance_tasks", "Compliance status + task generation", 1 * DAY, _job_compliance),
     Job("audit_trail_integrity", "Audit-trail hash-chain integrity check", 7 * DAY, _job_audit_integrity),
     Job("capture_voice_pipeline", "Field-capture voice transcription + translation", HOUR // 4, _job_capture_voice),
@@ -299,6 +358,10 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("person_risk_scan", "Training — person-risk repeat-involvement flag + auto-assign", 6 * HOUR, _job_person_risk_scan),
     Job("observation_weekly_insights", "Weekly Insight Engine — observation hero + row recompute", 1 * DAY, _job_observation_weekly_insights),
     Job("deroster_escalation", "Observation — deroster review SLA escalation", 15 * 60, _job_deroster_escalation),
+    # 15 min: an invite that arrives a quarter of an hour late is fine; one that
+    # arrives the next day is not, because the person it blocks has already
+    # booked something else over the audit.
+    Job("calendar_booking_retry", "CAMS — calendar booking delivery retry", 15 * 60, _job_calendar_booking_retry),
 ]}
 
 

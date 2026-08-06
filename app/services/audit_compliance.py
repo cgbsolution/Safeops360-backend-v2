@@ -2144,6 +2144,24 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
             captured_by=user.id,
         )
     await db.flush()
+
+    # ── The moment the audit is set, the time is claimed ──────────────────
+    #
+    # Scheduling an audit used to produce a date in this table and nothing in
+    # anybody's calendar, so the first the auditee heard of it was often the
+    # auditor arriving. This books the fieldwork window plus the opening and
+    # closing meetings for whoever is named so far — usually just the lead
+    # auditor at this point, which is correct: `update_audit_team` re-syncs and
+    # picks up the auditees when they are actually identified.
+    #
+    # Best-effort by contract (`sync_engagement` never raises). An unreachable
+    # Exchange leaves the bookings PENDING for the retry job; it must not be
+    # able to fail the creation of the audit itself.
+    from app.services import calendar_booking as _cal
+
+    await _cal.sync_engagement(
+        db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
+    )
     return audit
 
 
@@ -2784,12 +2802,25 @@ async def update_audit_team(
         )
 
     await db.flush()
+
+    # Newly seated people get their calendars booked; people already booked are
+    # not re-invited, because the sync diffs against what was delivered rather
+    # than re-sending the whole cast. This is the half of the client's request
+    # that the create-time booking cannot cover on its own — auditees are named
+    # here, days after the audit was set.
+    from app.services import calendar_booking as _cal
+
+    cal = await _cal.sync_engagement(
+        db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
+    )
     return {
         "ok": True,
         "coAuditors": len(co_auditors),
         "auditees": len(auditees),
         "checkpointsRerouted": owner_changed,
         "auditorReassignments": auditor_changed,
+        "calendarInvitesSent": cal.get("attendeesAdded", 0),
+        "calendarInvitesWithdrawn": cal.get("attendeesRemoved", 0),
     }
 
 
@@ -3441,6 +3472,17 @@ async def close_audit(db: AsyncSession, *, user: User, audit_id: str, closing_re
     if closing_remarks:
         audit.closingRemarks = closing_remarks
     await db.flush()
+
+    # Release any audit time still in the future. A closed audit that leaves
+    # nine people blocked for a window nobody intends to use is how a booking
+    # feature earns the reputation of being something to work around. Bookings
+    # that have already started are left alone — they are the record that the
+    # time was held.
+    from app.services import calendar_booking as _cal
+
+    await _cal.sync_engagement(
+        db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
+    )
 
     out: dict[str, Any] = {"ok": True, "status": "closed", "score": score}
 

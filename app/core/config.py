@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 from dotenv import load_dotenv
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load `.env` into the process environment as early as possible (import-time).
@@ -82,6 +82,102 @@ class Settings(BaseSettings):
     smtp_user: str | None = None
     smtp_pass: str | None = None
     email_from: str | None = None
+
+    # ── Calendar bookings (CAMS) ────────────────────────────────────────────
+    # An audit that books nobody's calendar is a date in a database. These
+    # settings decide HOW the booking reaches the participant, and the code
+    # degrades one step at a time rather than all-or-nothing:
+    #
+    #   Graph credentials present  → real Teams meetings written into mailboxes
+    #   SMTP only                  → .ics REQUEST invites (accept to block)
+    #   neither                    → bookings recorded as SKIPPED, nothing sent
+    #
+    # The middle rung matters: it is what makes the feature demonstrable before
+    # a client's IT completes an Azure app registration, which is never same-day.
+    calendar_bookings_enabled: bool = True
+    # Azure app registration (client credentials). Requires exactly one
+    # APPLICATION permission — Calendars.ReadWrite — with tenant admin consent.
+    # That one grant also produces the Teams join link, because Exchange honours
+    # `isOnlineMeeting` at event creation; OnlineMeetings.ReadWrite governs the
+    # standalone /onlineMeetings API, which this feature never calls. Delegated
+    # permissions will not work at all — nobody is signed in when a scheduler
+    # job books a calendar.
+    #
+    # Three accepted names each, because CGB's existing deployments already
+    # carry these credentials under `MICROSOFT_APP_*` (app-only) and
+    # `MICROSOFT_*` (the same registration used for delegated login). Aliasing
+    # is not indulgence: one credential set under two names in one .env is a
+    # config trap — the day they drift, the failure is a 401 nobody can explain.
+    # Precedence is most-specific-first: MS_GRAPH_* → MICROSOFT_APP_* → MICROSOFT_*.
+    ms_graph_tenant_id: str | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "MS_GRAPH_TENANT_ID", "MICROSOFT_APP_TENANT_ID", "MICROSOFT_TENANT_ID"
+        ),
+    )
+    ms_graph_client_id: str | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "MS_GRAPH_CLIENT_ID", "MICROSOFT_APP_CLIENT_ID", "MICROSOFT_CLIENT_ID"
+        ),
+    )
+    ms_graph_client_secret: str | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "MS_GRAPH_CLIENT_SECRET", "MICROSOFT_APP_CLIENT_SECRET", "MICROSOFT_CLIENT_SECRET"
+        ),
+    )
+    # Mailbox that organises a booking when the lead auditor has no routable
+    # address (external lead, service account, seat removed). Must be a real
+    # mailbox in the tenant — Graph writes events INTO it.
+    calendar_organizer_email: str | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "CALENDAR_ORGANIZER_EMAIL", "MICROSOFT_ORGANIZER_USER_ID"
+        ),
+    )
+    # IANA zone the audit's local start time is composed in. Site-level zones do
+    # not exist on Plant yet; when they do, this stays the fallback.
+    calendar_default_timezone: str = "Asia/Kolkata"
+    calendar_opening_meeting_minutes: int = 30
+    calendar_closing_meeting_minutes: int = 30
+    # How far ahead an Exchange room mailbox will accept a booking. Exchange's
+    # own default is 180 days (`BookingWindowInDays`), and a room DECLINES
+    # anything beyond it — verified against the CGB tenant, where 30 days was
+    # accepted and 200 declined.
+    #
+    # This matters here more than in most products: the Annual Audit Programme
+    # schedules audits up to a year out, so without this the room on every
+    # long-lead audit would be declined at creation and never asked for again.
+    # Instead the request is DEFERRED and the maintenance job attaches the room
+    # once the date comes inside the window. Raise it if the tenant's rooms are
+    # configured more generously.
+    calendar_room_booking_window_days: int = 180
+    # Give up delivering a booking after this many attempts. It stays FAILED and
+    # visible on the audit screen rather than being retried forever in silence.
+    calendar_max_attempts: int = 6
+    # Attach a Teams join link (Graph only; ICS invites cannot create one).
+    calendar_online_meetings: bool = True
+    # Graph endpoint. Overridable because the sovereign clouds are not on the
+    # commercial host — GCC High is graph.microsoft.us, China is
+    # microsoftgraph.chinacloudapi.cn — and a hardcoded host would make this
+    # feature simply unusable there rather than merely unconfigured.
+    ms_graph_base: str = Field(
+        "https://graph.microsoft.com/v1.0",
+        validation_alias=AliasChoices("MS_GRAPH_BASE", "MICROSOFT_GRAPH_BASE"),
+    )
+    # Matching login host for the token endpoint. Kept alongside the Graph base
+    # because changing one without the other is always a mistake.
+    ms_login_base: str = Field(
+        "https://login.microsoftonline.com",
+        validation_alias=AliasChoices("MS_LOGIN_BASE", "MICROSOFT_LOGIN_BASE"),
+    )
+
+    @property
+    def graph_configured(self) -> bool:
+        return bool(
+            self.ms_graph_tenant_id and self.ms_graph_client_id and self.ms_graph_client_secret
+        )
 
     # AI agents (Anthropic Claude). Optional — when unset, the
     # workflow-rule agents (Pattern A: triage / lessons) log a warning
