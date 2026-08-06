@@ -697,7 +697,49 @@ async def _deliver(b: CalendarBooking, *, force: bool = False) -> str:
     return "failed"
 
 
-async def sync_engagement(
+class _Savepoint:
+    """Run best-effort calendar work inside a SAVEPOINT.
+
+    Catching the exception is NOT sufficient on PostgreSQL. A failed statement
+    aborts the whole transaction, so every later statement raises
+    `InFailedSqlTransaction` — meaning a swallowed calendar error would still
+    take down the audit creation that called us. Verified against the live
+    database: with `CalendarBooking` absent, a caught error left the session
+    unusable and the next query failed.
+
+    A savepoint scopes the damage: rolling back to it leaves the enclosing
+    transaction — the one that is actually creating the audit — intact.
+
+    This is what makes "best-effort" true rather than merely intended, and it is
+    what lets this feature be deployed before its migration has run.
+    """
+
+    def __init__(self, db: AsyncSession, label: str) -> None:
+        self._db = db
+        self._label = label
+        self._sp = None
+        self.error: str | None = None
+
+    async def __aenter__(self):
+        self._sp = await self._db.begin_nested()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if self._sp is None:
+            return False
+        if exc_type is None:
+            await self._sp.commit()
+            return False
+        try:
+            await self._sp.rollback()
+        except Exception as e:  # noqa: BLE001
+            log.debug("savepoint rollback failed (%s): %s", self._label, e)
+        self.error = str(exc)[:400]
+        log.warning("calendar %s failed, rolled back to savepoint: %s", self._label, exc)
+        return True  # handled — the caller's transaction continues
+
+
+async def _sync_engagement_inner(
     db: AsyncSession,
     *,
     engagement_kind: str,
@@ -727,7 +769,7 @@ async def sync_engagement(
             return {"ok": False, "error": "Engagement not found"}
 
         if cancelled:
-            return await cancel_engagement(
+            return await _cancel_engagement_inner(
                 db,
                 engagement_kind=kind,
                 engagement_id=engagement_id,
@@ -848,11 +890,13 @@ async def sync_engagement(
             "attendeesAdded": len(attendees_added),
             "attendeesRemoved": len(attendees_removed),
         }
-    except Exception as e:  # noqa: BLE001
-        # The contract every caller relies on: booking a calendar can fail, the
-        # thing that triggered it cannot be allowed to.
-        log.warning("calendar sync failed for %s/%s: %s", kind, engagement_id, e)
-        return {"ok": False, "error": str(e)[:400]}
+    except Exception:  # noqa: BLE001
+        # Deliberately re-raised, not swallowed. The savepoint wrapper above is
+        # what makes this best-effort: it must SEE the exception to roll back to
+        # the savepoint. Returning a value here would leave the transaction
+        # aborted and the wrapper would then fail trying to release a savepoint
+        # inside it — which is exactly the bug this replaced.
+        raise
 
 
 async def _load_subject(
@@ -924,7 +968,7 @@ async def _cancel_one(b: CalendarBooking, reason: str, actor_id: str | None) -> 
     return ok
 
 
-async def cancel_engagement(
+async def _cancel_engagement_inner(
     db: AsyncSession,
     *,
     engagement_kind: str,
@@ -950,9 +994,8 @@ async def cancel_engagement(
                 cancelled += 1
         await db.flush()
         return {"ok": True, "cancelled": cancelled, "total": len(rows)}
-    except Exception as e:  # noqa: BLE001
-        log.warning("calendar cancel failed for %s/%s: %s", kind, engagement_id, e)
-        return {"ok": False, "error": str(e)[:400]}
+    except Exception:  # noqa: BLE001
+        raise  # see _sync_engagement_inner — the savepoint must see it
 
 
 async def cancel_booking(
@@ -1286,6 +1329,57 @@ async def run_booking_retry(db: AsyncSession) -> dict[str, Any]:
             f"rooms {accepted} accepted / {declined} declined / {attached} now requested"
         ),
     }
+
+
+async def sync_engagement(
+    db: AsyncSession,
+    *,
+    engagement_kind: str,
+    engagement_id: str,
+    actor_id: str | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Recompute and deliver every booking for one engagement.
+
+    The public entry point. Everything it does happens inside a SAVEPOINT, so a
+    calendar failure — a missing table before the migration has run, a bad row,
+    anything — rolls back only the calendar work and leaves the caller's
+    transaction healthy. `create_audit` calls this mid-transaction; an audit
+    must never fail to be created because a calendar could not be booked.
+    """
+    out: dict[str, Any] = {"ok": False, "error": "Calendar bookings are unavailable"}
+    sp = _Savepoint(db, f"sync {engagement_kind}/{engagement_id}")
+    async with sp:
+        out = await _sync_engagement_inner(
+            db,
+            engagement_kind=engagement_kind,
+            engagement_id=engagement_id,
+            actor_id=actor_id,
+            force=force,
+        )
+    return {"ok": False, "error": sp.error} if sp.error else out
+
+
+async def cancel_engagement(
+    db: AsyncSession,
+    *,
+    engagement_kind: str,
+    engagement_id: str,
+    reason: str = "",
+    actor_id: str | None = None,
+) -> dict[str, Any]:
+    """Withdraw every booking for an engagement. Savepoint-scoped, as above."""
+    out: dict[str, Any] = {"ok": False, "error": "Calendar bookings are unavailable"}
+    sp = _Savepoint(db, f"cancel {engagement_kind}/{engagement_id}")
+    async with sp:
+        out = await _cancel_engagement_inner(
+            db,
+            engagement_kind=engagement_kind,
+            engagement_id=engagement_id,
+            reason=reason,
+            actor_id=actor_id,
+        )
+    return {"ok": False, "error": sp.error} if sp.error else out
 
 
 __all__ = [

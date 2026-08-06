@@ -29,8 +29,19 @@ class Plant(Base, IdMixin):
     # client's requirement is that scheduling an audit books everything at once
     # — asking a scheduler to pick a room every time would mean the room is the
     # one thing that is usually forgotten. Overridable per booking.
-    defaultMeetingRoomEmail: Mapped[str | None] = mapped_column(String)
-    defaultMeetingRoomName: Mapped[str | None] = mapped_column(String)
+    #
+    # DEFERRED, and that is not a performance decision. `Plant` is on the login
+    # path (`/api/auth/login` resolves the user's plant), so if these columns
+    # were in the default SELECT, deploying this model before running
+    # `scripts/add_calendar_bookings.py` would make EVERY login fail with
+    # "column does not exist". Deferring them keeps them out of every ordinary
+    # Plant query; only the calendar's room lookup touches them, and that call
+    # is already wrapped to degrade to "no default room".
+    #
+    # A meeting-room convenience must never be able to lock people out of the
+    # product.
+    defaultMeetingRoomEmail: Mapped[str | None] = mapped_column(String, deferred=True)
+    defaultMeetingRoomName: Mapped[str | None] = mapped_column(String, deferred=True)
 
     createdAt: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
