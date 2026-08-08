@@ -135,6 +135,11 @@ class EquipmentCreate(BaseModel):
     floorLevel: int | None = None
     maintenanceContractor: str | None = None
     installationDate: datetime | None = None
+    # Fire & Life Safety fields. Absent from the P1-4 body, so a client sending
+    # them had them silently dropped by Pydantic's default extra-ignore — the
+    # asset saved, unzoned, with no error to explain why.
+    zoneId: str | None = None
+    assetSubtype: str | None = None
 
 
 async def _next_code(db: AsyncSession, plant_id: str) -> str:
@@ -145,19 +150,44 @@ async def _next_code(db: AsyncSession, plant_id: str) -> str:
 @router.post("/equipment", status_code=201)
 async def create_equipment(body: EquipmentCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     await _require(db, user, _WRITE, plant_id=body.plantId)
+    # A zone from another plant would break the hot-work guard silently: the
+    # asset would count toward a zone it is nowhere near.
+    if body.zoneId:
+        z = await db.get(FireZone, body.zoneId)
+        if not z or z.isDeleted:
+            raise HTTPException(404, "Zone not found")
+        if z.plantId != body.plantId:
+            raise HTTPException(400, f"Zone {z.zoneCode} belongs to a different plant.")
     code = await _next_code(db, body.plantId)
     e = FireEquipment(
         equipmentCode=code, type=body.type, location=body.location, plantId=body.plantId, buildingId=body.buildingId,
         make=body.make, model=body.model, serialNo=body.serialNo, capacitySpec=body.capacitySpec,
         inspectionFrequencyDays=body.inspectionFrequencyDays, latitude=body.latitude, longitude=body.longitude,
         floorLevel=body.floorLevel, maintenanceContractor=body.maintenanceContractor, installationDate=body.installationDate,
+        zoneId=body.zoneId, assetSubtype=body.assetSubtype,
         qrCode=f"SAFEOPS-FIRE-{code}", createdBy=user.id,
     )
+    # Record which frequency rule governs this asset at create time, so the
+    # register can show "quarterly per NBC 2016" before the first nightly run.
+    # nextInspectionDueDate stays NULL deliberately — a brand-new asset has never
+    # been inspected, and compute_status reads that as DUE_INSPECTION rather than
+    # inventing a due date from an inspection that never happened.
+    #
+    # Non-fatal: InspectionFrequencyMaster is created by apply-firelifesafety-ddl,
+    # and registering an asset must not depend on that config table existing.
+    # Losing the provenance stamp costs a label on the detail screen; losing the
+    # asset costs the inspection.
+    freq = None
+    try:
+        freq = await freqsvc.resolve_for_equipment(db, e)
+        e.frequencyMasterId = freq.masterId
+    except Exception:  # noqa: BLE001 — see above; the nightly recompute backfills it
+        await db.rollback()
     e.status = svc.compute_status(e)
     db.add(e)
     await db.commit()
     await db.refresh(e)
-    return _eq(e)
+    return {**_eq(e), "frequency": freq.as_dict() if freq else None}
 
 
 @router.get("/equipment/{eid}")
