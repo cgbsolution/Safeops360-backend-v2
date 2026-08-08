@@ -34,11 +34,18 @@ Run from the backend root:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+# Running a FILE puts `scripts/` on sys.path, not the backend root, so `app` is
+# not importable however sensible the cwd is. Same bootstrap as
+# scripts/seed_fire_frequency_master.py, so the command in the docstring above
+# actually works instead of needing PYTHONPATH=. in front of it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.config import get_settings
+from sqlalchemy import create_engine, text  # noqa: E402
+
+from app.core.config import get_settings  # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "app" / "seed" / "data"
 
