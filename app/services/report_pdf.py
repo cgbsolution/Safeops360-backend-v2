@@ -611,7 +611,11 @@ def render_audit_report_pdf(
                 meta.append(f"CAPA: {cp['capaNumber']}")
             ev = len(cp.get("auditorEvidenceIds") or []) + len(cp.get("auditeeEvidenceIds") or [])
             if ev:
-                meta.append(f"Evidence: {ev} photo(s)")
+                # "file(s)", not "photo(s)": evidence is photographs AND
+                # documents (licences, certificates, test reports), and the PDF
+                # carries only the count — it must not assert a kind it cannot
+                # see from a list of storage paths.
+                meta.append(f"Evidence: {ev} file(s)")
             if meta:
                 pdf.set_font("Helvetica", "", 7.5)
                 pdf.set_text_color(*GREY)

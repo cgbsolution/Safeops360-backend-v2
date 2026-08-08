@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -400,6 +401,67 @@ def library_subject_scope(industry_code: str, categories: list[dict[str, Any]]) 
     if (industry_code or "").startswith("REGIME_"):
         return "VENDOR"
     return "OWN_SITE"
+
+
+# ── Checkpoint evidence: what may be attached, and where it lands ────
+#
+# Domain policy, not an HTTP concern, which is why it lives here rather than in
+# the router that happens to enforce it: "a factory licence is acceptable audit
+# evidence" is a statement about auditing. Keeping it here also makes it
+# testable without a storage client.
+#
+# Photographs were the only thing this flow was built for, but half of an audit's
+# evidence is paperwork — a licence, a calibration certificate, a test report, a
+# wage register extract. Those arrive as PDFs and Office files, and while they
+# were rejected at the door the evidence for exactly the statutory checkpoints
+# that need it hardest had nowhere to go but email.
+#
+# An allowlist, not a widening to anything. Same document set the rest of the
+# product already accepts (`routers/attachments.py`, `routers/erm_attachments.py`)
+# so the audit module is not the one place with its own idea of a safe upload.
+# `image/svg+xml` is deliberately absent: it looks like an image, can carry
+# script, and is never a photograph of a shop floor.
+ALLOWED_IMAGE_MIME = frozenset({
+    "image/jpeg", "image/png", "image/webp", "image/heic", "image/gif",
+})
+ALLOWED_DOCUMENT_MIME = frozenset({
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
+    "application/msword",  # legacy .doc
+    "application/vnd.ms-excel",  # legacy .xls
+    "text/csv",
+    "text/plain",
+})
+ALLOWED_UPLOAD_MIME = ALLOWED_IMAGE_MIME | ALLOWED_DOCUMENT_MIME
+
+UNSUPPORTED_UPLOAD_MESSAGE = (
+    "Attach a photo (JPEG, PNG, WebP, HEIC) or a document (PDF, Word, Excel, CSV, text)."
+)
+
+
+def attachment_storage_path(
+    audit_id: str | None, checkpoint_code: str | None, file_name: str
+) -> str:
+    """Where one piece of checkpoint evidence is stored.
+
+    Two properties this must hold, both load-bearing:
+
+    * The file name comes from a browser, so `../`, `..\\` and separators are
+      flattened — a path is built from it, and it must not escape its prefix.
+    * The extension SURVIVES. Attachments stored before `mimeType` was recorded
+      are classified by extension on the client, so stripping it would make an
+      old PDF indistinguishable from a photograph — which renders as a broken
+      thumbnail where a reviewer expects evidence.
+
+    The random prefix is what stops a second upload of `licence.pdf` on the same
+    checkpoint silently overwriting the first auditor's evidence.
+    """
+    safe = re.sub(r"[\\/]", "_", file_name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80] or "file"
+    seg = re.sub(r"[^a-z0-9._-]", "_", (checkpoint_code or "general").lower())[:40]
+    short = secrets.token_hex(4)
+    return f"audit-compliance/{audit_id or 'unassigned'}/{seg}/{short}-{safe}"
 
 
 # ── Audit categories ─────────────────────────────────────────────────

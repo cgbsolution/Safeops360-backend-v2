@@ -8,8 +8,6 @@ module. The service flushes; the get_db dependency commits at request end.
 
 from __future__ import annotations
 
-import re
-import secrets
 from datetime import datetime
 from typing import Any, Literal
 
@@ -38,10 +36,12 @@ from app.services.storage import (
     is_storage_configured,
 )
 
-# Photo upload: images + PDF, 10 MB cap. Photos live inline in each
-# checkpoint response's JSONB; the binary goes to Supabase Storage under an
-# audit-compliance/ prefix in the shared attachments bucket.
-_ALLOWED_PHOTO_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/gif", "application/pdf"}
+# Evidence upload: photographs AND documents. The binary goes to Supabase
+# Storage under an audit-compliance/ prefix in the shared attachments bucket;
+# the reference lives inline in each checkpoint response's JSONB. Which types
+# are acceptable, and the storage path they land on, are domain policy and live
+# in `services.audit_compliance` (ALLOWED_UPLOAD_MIME, attachment_storage_path)
+# — this router only enforces them.
 
 # How many checkpoints the PDF register prints. Every ordinary audit (10-100
 # checkpoints) is far under this and prints in full. The cap exists only for the
@@ -49,14 +49,6 @@ _ALLOWED_PHOTO_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "i
 # thread would run to hundreds of pages and take minutes to render. When it
 # bites, the PDF says so on the page — it never stops silently.
 _PDF_REGISTER_CAP = 600
-
-
-def _audit_photo_path(audit_id: str | None, checkpoint_code: str | None, file_name: str) -> str:
-    safe = re.sub(r"[\\/]", "_", file_name)
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", safe)[:80] or "photo"
-    seg = re.sub(r"[^a-z0-9._-]", "_", (checkpoint_code or "general").lower())[:40]
-    short = secrets.token_hex(4)
-    return f"audit-compliance/{audit_id or 'unassigned'}/{seg}/{short}-{safe}"
 
 router = APIRouter(prefix="/api/audit-compliance", tags=["audit-compliance"])
 
@@ -663,15 +655,22 @@ async def upload_url(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Mint a short-lived signed URL the browser PUTs the photo bytes to.
-    The service-role key never reaches the browser."""
+    """Mint a short-lived signed URL the browser PUTs the file bytes to.
+    The service-role key never reaches the browser.
+
+    Serves photographs AND documents — see `svc.ALLOWED_UPLOAD_MIME`."""
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
     if not is_storage_configured():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             "Supabase Storage isn't configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY).")
-    if body.contentType and body.contentType not in _ALLOWED_PHOTO_MIME:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unsupported file type: {body.contentType}")
-    path = _audit_photo_path(body.auditId, body.checkpointCode, body.fileName)
+    if body.contentType and body.contentType not in svc.ALLOWED_UPLOAD_MIME:
+        # Names what IS accepted. "Unsupported file type: application/zip" alone
+        # leaves an auditor on site guessing which of their files will go up.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unsupported file type: {body.contentType}. {svc.UNSUPPORTED_UPLOAD_MESSAGE}",
+        )
+    path = svc.attachment_storage_path(body.auditId, body.checkpointCode, body.fileName)
     try:
         signed = create_signed_upload_url(path)
     except Exception as e:  # noqa: BLE001
