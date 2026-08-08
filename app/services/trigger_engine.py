@@ -231,6 +231,13 @@ async def run_trigger_rules(
 
     for rule in rules:
         rule_name = getattr(rule, "trigger_name", None) or _rule_display_name(rule)
+        # Identity declared on the callable, so it survives the rule RAISING.
+        # A result the rule returns can carry its own rule_id; a result the
+        # engine synthesises from an exception cannot — and that is exactly the
+        # case where attribution matters most. Without this, a FAILED audit row
+        # says "something failed" but not WHICH obligation went unraised, which
+        # is only marginally better than the silent failure it replaced.
+        rule_id = getattr(rule, "trigger_id", None)
         try:
             # SAVEPOINT per rule: a rule that leaves the session dirty (a failed
             # INSERT, a constraint violation) is rolled back to this point and
@@ -245,6 +252,8 @@ async def run_trigger_rules(
                 )
             if not res.rule_name:
                 res.rule_name = rule_name
+            if not res.rule_id:
+                res.rule_id = rule_id
             # A rule may hand back FAILED without raising (e.g. a downstream
             # HTTP call returned 500). Enforce the non-empty invariant there too
             # — the guarantee is about the *outcome*, not about how it arose.
@@ -259,6 +268,7 @@ async def run_trigger_rules(
             results.append(
                 TriggerResult(
                     rule_name=rule_name,
+                    rule_id=rule_id,
                     outcome=TriggerOutcome.FAILED,
                     reason=f"Rule errored: {reason}",
                     failure_reason=reason,

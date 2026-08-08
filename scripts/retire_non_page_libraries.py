@@ -6,13 +6,24 @@ shipped with the generic product and have no place here — leaving them active
 is what puts an "Industry" chooser back on screen the moment any surface
 enumerates libraries.
 
-Two are deliberately KEPT:
-  • PAGE_INDUSTRIES — the internal checklist (HR / EHS / Production).
+Four are deliberately KEPT — the three own-facility AUDIT CATEGORIES plus the
+supplier checklist:
+  • PAGE_INDUSTRIES — the Internal category (HR / EHS / Production).
+  • PAGE_IMS        — the QMS, EMS, OHS category (ISO 9001 / 14001 / 45001 /
+                      50001), whose four disciplines come from the customer's
+                      "QMS, EMS OHS" workbook.
+  • PAGE_SOCIAL     — the Social Compliance category (Annexure-2, PIL Social
+                      Compliance Audit checklist).
   • SUPPLIER_COC    — the supplier Code of Conduct, which is the checklist a
                       SUPPLIER audit runs against. It is never offered for an
                       own-facility audit, so it cannot be mistaken for an
                       industry option, and retiring it would silently break
                       supplier audits rather than simplify anything.
+
+These three are not "extra industries": each one IS an audit category the
+scheduling wizard offers, so retiring one removes a category from the product.
+Keep this list in step with `AUDIT_CATEGORIES` in
+app/services/audit_compliance.py.
 
 Deactivation, NOT deletion. `isActive = false` removes a library from every
 list the product builds, and audits already materialised from one keep working
@@ -30,7 +41,7 @@ from sqlalchemy import create_engine, text
 
 from app.core.config import get_settings
 
-KEEP = ("PAGE_INDUSTRIES", "SUPPLIER_COC")
+KEEP = ("PAGE_INDUSTRIES", "PAGE_IMS", "PAGE_SOCIAL", "SUPPLIER_COC")
 
 
 def main() -> None:

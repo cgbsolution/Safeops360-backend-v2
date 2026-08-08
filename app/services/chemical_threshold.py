@@ -436,6 +436,11 @@ def _breach_rule(ev: ThresholdEvaluation, *, tenant_id: str, actor_user_id: str)
         )
 
     _rule.trigger_name = f"Threshold breach — {ev.rule.scheduleReference}"  # type: ignore[attr-defined]
+    # Declared on the callable so the MocTriggerLog row keeps its rule
+    # attribution even when the rule raises and the engine has to synthesise
+    # the FAILED result. "Which obligation was not raised?" must be answerable
+    # from the audit row alone.
+    _rule.trigger_id = f"rule_threshold_{ev.rule.id}"  # type: ignore[attr-defined]
     return _rule
 
 

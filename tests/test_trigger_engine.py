@@ -145,6 +145,43 @@ def test_failed_result_always_carries_a_non_empty_reason(_stub_platform):
     assert all(r.stack for r in run.failed)
 
 
+def test_failed_result_keeps_the_rule_id_declared_on_the_callable(_stub_platform):
+    """Regression: a rule that RAISES cannot attach its own rule_id, so the
+    engine must take it from the callable.
+
+    Caught by CHEM-T12 against a real database — the MocTriggerLog row was
+    written with ruleId NULL, so a failed trigger recorded that *something* had
+    failed but not WHICH statutory obligation went unraised. That is only
+    marginally better than the silent failure this engine exists to replace,
+    and it is invisible unless something asserts on it."""
+    async def exploding(db, subject):
+        raise RuntimeError("downstream 500")
+
+    exploding.trigger_id = "rule_threshold_abc123"
+    exploding.trigger_name = "Threshold breach — MSIHC Schedule 2"
+
+    db = FakeSession()
+    run = _run(run_trigger_rules(
+        db, [exploding], subject=None,
+        source_kind="ChemicalThresholdBreach", source_id="plant-1",
+    ))
+    assert run.failed[0].rule_id == "rule_threshold_abc123"
+    assert run.failed[0].rule_name == "Threshold breach — MSIHC Schedule 2"
+    assert run.failed[0].to_audit_entry()["ruleId"] == "rule_threshold_abc123"
+
+
+def test_rule_result_without_an_id_inherits_the_callables(_stub_platform):
+    async def quiet(db, subject):
+        return TriggerResult("X", outcome=TriggerOutcome.SKIPPED, reason="n/a")
+
+    quiet.trigger_id = "rule_threshold_zzz"
+    db = FakeSession()
+    run = _run(run_trigger_rules(
+        db, [quiet], subject=None, source_kind="X", source_id="1",
+    ))
+    assert run.results[0].rule_id == "rule_threshold_zzz"
+
+
 def test_a_human_is_notified_when_a_rule_fails(_stub_platform):
     db = FakeSession()
     _run(run_trigger_rules(

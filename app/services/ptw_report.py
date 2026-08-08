@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any
 
 from fpdf import FPDF
+from fpdf.enums import XPos
 
 _REPL = {"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"',
          "•": "*", "₹": "Rs ", "→": "->", "≥": ">=", "≤": "<=", " ": " "}
@@ -98,6 +99,14 @@ class _PtwReport(FPDF):
         for key in ("txt", "text"):
             if key in k and isinstance(k[key], str):
                 k[key] = _s(k[key])
+        # fpdf2's multi_cell defaults to new_x=XPos.RIGHT, which for the w=0
+        # calls used throughout this report parks the cursor ON the right
+        # margin. The next cell then has zero usable width and fpdf2 raises
+        # "Not enough horizontal space to render a single character" — which
+        # is what turned every close-out PDF into a 500. Every multi_cell here
+        # is a full-width block that should continue at the left margin, so
+        # default new_x accordingly (callers can still override).
+        k.setdefault("new_x", XPos.LMARGIN)
         return super().multi_cell(*a, **k)
 
     def header(self):  # noqa: D102
@@ -140,6 +149,9 @@ class _PtwReport(FPDF):
         self.set_text_color(0, 0, 0)
 
     def kv(self, label: str, value: Any, w_label: float = 48):
+        # Label + value always start a fresh row at the left margin, whatever
+        # the previous cell left the cursor on.
+        self.set_x(self.l_margin)
         self.set_font("Helvetica", "B", 8.5)
         self.set_text_color(*GREY)
         self.cell(w_label, 5.5, label)

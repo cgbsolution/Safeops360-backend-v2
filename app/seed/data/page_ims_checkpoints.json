@@ -1,0 +1,1159 @@
+[
+  {
+    "category_code": "QMS",
+    "category_name": "Quality Management System (ISO 9001:2015)",
+    "category_color": "#0EA5E9",
+    "category_icon": "badge-check",
+    "checkpoints": [
+      {
+        "code": "PI-QMS-001",
+        "question": "Previous Audit and NC Closure Status",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Review Internal/External Audit Status (verify audit dates, findings, and auditor details).\nii. If there is any NC findings in the previous Audit then verify the action plan and Non-Conformities (NCs) closure status.",
+        "requirement_reference": "Clause 9.2/10.2",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-002",
+        "question": "Departmental Objective (KPI)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure Departmental Objectives are prepared as per Integrated Management System (IMS) Standards (ISO 9001:2015, ISO 14001:2015 & ISO 45001:2018).\nii. Verify the process for establishing departmental objective targets.\niii. Check if departmental objective status are updated on time.",
+        "requirement_reference": "Clause 6.2",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-003",
+        "question": "Action Plan If KPI Target not achieved",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i.If objectives targets are not met, then ensure an action plan with assigned responsibilities and target dates must be available.\nii. Road Map for Current Financial Year objective targets achievement.",
+        "requirement_reference": "Clause 6.2.2, 10.2",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-004",
+        "question": "Process Module",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify the updated Master list of process Modules.\nii. Review the Process Modules and verify min 02 nos of evidences for actual implemented process.",
+        "requirement_reference": "Clause 4.4",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-005",
+        "question": "Standard Operating Procedure",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Check the updated Master list of SOPs.\nii. Review SOPs and verify min 02 nos of evidences for actual implemented process..",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-006",
+        "question": "Needs and expectations of Interested parties, Risk and Opportunities",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure interested parties, risks, and opportunities cover all applicable (IMS) Standards (ISO 9001, ISO 14001, ISO 45001).\nii. Verify that opportunities are adequately addressed.\niii. Interested parties, risks, and opportunities achievement status backup data is required.",
+        "requirement_reference": "Clause 4.2, 6.1",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-007",
+        "question": "Organogram (Dept. Organization Chart)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the updated Departmental Organization Chart is available.",
+        "requirement_reference": "Clause 5.3",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-008",
+        "question": "Master list of documents",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the document list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-009",
+        "question": "Master list of formats",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure the format list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-010",
+        "question": "Continual Improvement",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the records related to Continual Improvement Projects (CIPs).",
+        "requirement_reference": "Clause 10.3",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-011",
+        "question": "Monitoring,measurement,analysis and evaluation- Equipments Master List, Calibration Plan and record",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Master List of Equipments and Gauges.\nIi. Calibration Plan and Reports.\nIii. Calibration stickers shall be pasted on respective Equipments and Gauges.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-012",
+        "question": "Chemical inventory",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. List of Applicable Chemical Inventory Material shall be available.\nIi. These material must be stored as per Safety guidelines etc",
+        "requirement_reference": "Clause 8.5.4",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-013",
+        "question": "Awareness Training Plan & records",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Check the Awareness with some Employees, Workers etc",
+        "requirement_reference": "Clause 7.3",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-014",
+        "question": "STP — Control of Calibrated Equipment",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the STP Equipments Calibration plan and record",
+        "requirement_reference": "Clause 7.1.5",
+        "standard": "ISO 9001:2015"
+      },
+      {
+        "code": "PI-QMS-015",
+        "question": "STP — Competence of Operators",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "STP Operator Training and record",
+        "requirement_reference": "Clause 7.2",
+        "standard": "ISO 9001:2015"
+      }
+    ]
+  },
+  {
+    "category_code": "EMS",
+    "category_name": "Environmental Management System (ISO 14001:2015)",
+    "category_color": "#16A34A",
+    "category_icon": "leaf",
+    "checkpoints": [
+      {
+        "code": "PI-EMS-001",
+        "question": "Previous Audit and NC Closure Status",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Review Internal/External Audit Status (verify audit dates, findings, and auditor details).\nii. If there is any NC findings in the previous Audit then verify the action plan and Non-Conformities (NCs) closure status.",
+        "requirement_reference": "Clause 9.2/10.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-002",
+        "question": "Departmental Objective (KPI)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure Departmental Objectives are prepared as per Integrated Management System (IMS) Standards (ISO 9001:2015, ISO 14001:2015 & ISO 45001:2018).\nii. Verify the process for establishing departmental objective targets.\niii. Check if departmental objective status are updated on time.",
+        "requirement_reference": "Clause 6.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-003",
+        "question": "Action Plan If KPI Target not achieved",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i.If objectives targets are not met, then ensure an action plan with assigned responsibilities and target dates must be available.\nii. Road Map for Current Financial Year objective targets achievement.",
+        "requirement_reference": "Clause 6.2.2, 10.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-004",
+        "question": "Process Module",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify the updated Master list of process Modules.\nii. Review the Process Modules and verify min 02 nos of evidences for actual implemented process.",
+        "requirement_reference": "Clause 4.4",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-005",
+        "question": "Standard Operating Procedure",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Check the updated Master list of SOPs.\nii. Review SOPs and verify min 02 nos of evidences for actual implemented process..",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-006",
+        "question": "Needs and expectations of Interested parties, Risk and Opportunities",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure interested parties, risks, and opportunities cover all applicable (IMS) Standards (ISO 9001, ISO 14001, ISO 45001).\nii. Verify that opportunities are adequately addressed.\niii. Interested parties, risks, and opportunities achievement status backup data is required.",
+        "requirement_reference": "Clause 4.2, 6.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-007",
+        "question": "Organogram (Dept. Organization Chart)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the updated Departmental Organization Chart is available.",
+        "requirement_reference": "Clause 5.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-008",
+        "question": "Emergency Preparedness and Response Plan",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify that the EPRP is updated.\nii.Ensure mock drills are conducted for each EPRP scenario based on defined frequencies.",
+        "requirement_reference": "Clause 8.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-009",
+        "question": "Risk Management Program",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Review the RMP list and verify at least 02 case records.",
+        "requirement_reference": "Clause 6.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-010",
+        "question": "AIC Aspect Impact Chart",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Identify the number of sub-processes/activities evaluated.\nii.Note the total number of environmental aspects identified.\niii. Ensure that all significant aspects and their associated controls are documented in the Aspect and Impact chart.",
+        "requirement_reference": "Clause 6.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-011",
+        "question": "Aspect Control procedure",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure details of at least 02 ACP records are mentioned in the audit report.",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-012",
+        "question": "EMP - Environmental Management program",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the EMP Master List and ensure relevant records are available.",
+        "requirement_reference": "Clause 6.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-013",
+        "question": "Compliance Obligation (If applicable), legal requirements and other requirements",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Updated Legal and other register, Records",
+        "requirement_reference": "Clause 6.1.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-014",
+        "question": "Master list of documents",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the document list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-015",
+        "question": "Master list of formats",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure the format list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-016",
+        "question": "Continual Improvement",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the records related to Continual Improvement Projects (CIPs).",
+        "requirement_reference": "Clause 10.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-017",
+        "question": "Monitoring,measurement,analysis and evaluation- Equipments Master List, Calibration Plan and record",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Master List of Equipments and Gauges.\nIi. Calibration Plan and Reports.\nIii. Calibration stickers shall be pasted on respective Equipments and Gauges.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-018",
+        "question": "Chemical inventory",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. List of Applicable Chemical Inventory Material shall be available.\nIi. These material must be stored as per Safety guidelines etc",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-019",
+        "question": "Bio medical waste disposal data",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Medical Test report shall be available from Authorized agency, and reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-020",
+        "question": "Monitoring,measurement,analysis and evaluation- Needle detector calibration report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Calibration report for oxygen regulator Pressure gauges shall be available.\nIi. This reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-021",
+        "question": "Evaluation of compliance- Factory license",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-022",
+        "question": "Evaluation of compliance- Stability certificate form No ----",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-023",
+        "question": "Evaluation of compliance- Fire Dept. NOC certificate",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-024",
+        "question": "Evaluation of compliance- Hazardous waste consent acknowledgement",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-025",
+        "question": "E waste Manifest form 06",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-026",
+        "question": "Used oil disposal form 10",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-027",
+        "question": "Environmental statement in form 5",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-028",
+        "question": "Form 11 accident register",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2, 10.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-029",
+        "question": "Legal and Other requirement register",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "All the latest legal updates must be considered in the Legal and Other requirement register",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-030",
+        "question": "Mock drill Plan and Record, Covered the Fire, Shock, Overflow of STP etc",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Evidence must be verified",
+        "requirement_reference": "Clause 8.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-031",
+        "question": "Awareness Training Plan & records",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Check the Awareness with some Employees, Workers etc",
+        "requirement_reference": "Clause 7.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-032",
+        "question": "Medical, welfare Committees meetings MOM",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Meeting Agenda, MOM etc",
+        "requirement_reference": "Clause 7.4.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-033",
+        "question": "STP — Compliance Obligations- valid Consent to Operate (CTO",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Check for a valid Consent to Operate (CTO) issued by the pollution control board alongside timely submissions of environmental statements",
+        "requirement_reference": "Clause 6.1.3",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-034",
+        "question": "STP — Aspect & Impact Identification",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Check control mechanisms for environmental aspects unique to STPs, such as emissions (air), sludge disposal (land), and noise from blowers etc",
+        "requirement_reference": "Clause 6.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-035",
+        "question": "STP — Waste Management",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Evaluate records tracking the generation, drying, and legal disposal or reuse of stabilized sewage sludge",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-036",
+        "question": "STP — Monitoring,measurement,analysis and evaluation- STP treated water test report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Valid report for ETP Water test shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-037",
+        "question": "STP — Monitoring,measurement,analysis and evaluation- ETP treated water test report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Valid report for ETP Water test shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-038",
+        "question": "ETP — Operational Control & SOPs",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Confirm explicit instructions are posted for chemical dosing calculations (e.g., lime, alum, polyelectrolyte) relative to fluctuating influent concentrations.",
+        "requirement_reference": "Clause 8.5.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-039",
+        "question": "ETP — Monitoring and Measurement",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Review log sheets for hourly tracking of heavy metals, oil and grease levels, high-salinity TDS, and shifting pH ranges",
+        "requirement_reference": "Clause 9.1.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-040",
+        "question": "ETP — Legal Compliance Monitoring",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Ensure the treated effluent satisfies zero liquid discharge (ZLD) criteria or matches exact statutory parameters before final industrial estate pipeline discharge.",
+        "requirement_reference": "Clause 9.1.2",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-041",
+        "question": "ETP — Hazardous Waste Management",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the generation and handling of toxic ETP sludge (chemical sludge). Ensure it is bagged, weighed, and stored in a designated, covered hazardous waste yard with an updated Form-3/Logbook.",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-042",
+        "question": "ETP — Pollution Prevention - Soil/Groundwater",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Inspect the physical integrity of ETP tanks for cracks or chemical leaching. Verify that the chemical unloading section features an impervious floor and a dedicated containment dyke.",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      },
+      {
+        "code": "PI-EMS-043",
+        "question": "ETP — Life Cycle Perspective - Outsourced Waste",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify valid manifest records (hazardous waste consignment notes) proving safe transfer to an authorized TSDF (Treatment, Storage, and Disposal Facility)",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 14001:2015"
+      }
+    ]
+  },
+  {
+    "category_code": "OHS",
+    "category_name": "Occupational H&S Management System (ISO 45001:2018)",
+    "category_color": "#DC2626",
+    "category_icon": "shield",
+    "checkpoints": [
+      {
+        "code": "PI-OHS-001",
+        "question": "Previous Audit and NC Closure Status",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Review Internal/External Audit Status (verify audit dates, findings, and auditor details).\nii. If there is any NC findings in the previous Audit then verify the action plan and Non-Conformities (NCs) closure status.",
+        "requirement_reference": "Clause 9.2/10.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-002",
+        "question": "Departmental Objective (KPI)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure Departmental Objectives are prepared as per Integrated Management System (IMS) Standards (ISO 9001:2015, ISO 14001:2015 & ISO 45001:2018).\nii. Verify the process for establishing departmental objective targets.\niii. Check if departmental objective status are updated on time.",
+        "requirement_reference": "Clause 6.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-003",
+        "question": "Action Plan If KPI Target not achieved",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i.If objectives targets are not met, then ensure an action plan with assigned responsibilities and target dates must be available.\nii. Road Map for Current Financial Year objective targets achievement.",
+        "requirement_reference": "Clause 6.2.2, 10.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-004",
+        "question": "Process Module",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify the updated Master list of process Modules.\nii. Review the Process Modules and verify min 02 nos of evidences for actual implemented process.",
+        "requirement_reference": "Clause 4.4",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-005",
+        "question": "Standard Operating Procedure",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Check the updated Master list of SOPs.\nii. Review SOPs and verify min 02 nos of evidences for actual implemented process..",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-006",
+        "question": "Needs and expectations of Interested parties, Risk and Opportunities",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure interested parties, risks, and opportunities cover all applicable (IMS) Standards (ISO 9001, ISO 14001, ISO 45001).\nii. Verify that opportunities are adequately addressed.\niii. Interested parties, risks, and opportunities achievement status backup data is required.",
+        "requirement_reference": "Clause 4.2, 6.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-007",
+        "question": "Organogram (Dept. Organization Chart)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the updated Departmental Organization Chart is available.",
+        "requirement_reference": "Clause 5.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-008",
+        "question": "HIRA (Hazards Identification and Risk Assessments),",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Identify the number of sub-processes/activities evaluated.\nii. Note the total number of hazards identified.\niii.Ensure that all unacceptable risks and their associated controls are documented in the HIRA chart.\niv.Verify that Risk Management Programs (RMP) and Risk Control Processes (RCP) are available for each unacceptable risk.",
+        "requirement_reference": "Clause 6.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-009",
+        "question": "Risk Control process",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "RCP at least 02 Nos of records details to be mentioned in report.",
+        "requirement_reference": "Clause 8.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-010",
+        "question": "Emergency Preparedness and Response Plan",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify that the EPRP is updated.\nii.Ensure mock drills are conducted for each EPRP scenario based on defined frequencies.",
+        "requirement_reference": "Clause 8.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-011",
+        "question": "Risk Management Program",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Review the RMP list and verify at least 02 case records.",
+        "requirement_reference": "Clause 6.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-012",
+        "question": "Compliance Obligation (If applicable), legal requirements and other requirements",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Updated Legal and other register, Records",
+        "requirement_reference": "Clause 6.1.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-013",
+        "question": "Master list of documents",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Ensure the document list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-014",
+        "question": "Master list of formats",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure the format list is updated and includes retention periods.",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-015",
+        "question": "Continual Improvement",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the records related to Continual Improvement Projects (CIPs).",
+        "requirement_reference": "Clause 10.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-016",
+        "question": "Monitoring,measurement,analysis and evaluation- Equipments Master List, Calibration Plan and record",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Master List of Equipments and Gauges.\nIi. Calibration Plan and Reports.\nIii. Calibration stickers shall be pasted on respective Equipments and Gauges.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-017",
+        "question": "Monitoring,measurement,analysis and evaluation- RO Water test report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Valid report for RO Water test shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-018",
+        "question": "Monitoring,measurement,analysis and evaluation- Food test report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Valid report for Food Test Report shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-019",
+        "question": "Chemical inventory",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. List of Applicable Chemical Inventory Material shall be available.\nIi. These material must be stored as per Safety guidelines etc",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-020",
+        "question": "Monitoring,measurement,analysis and evaluation- Medical test for canteen employees, Dish Washers, Bio medical waste handler etc",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Medical Test report shall be available from Authorized agency, and reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-021",
+        "question": "Bio medical waste disposal data",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Medical Test report shall be available from Authorized agency, and reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-022",
+        "question": "Monitoring,measurement,analysis and evaluation- Calibration report for oxygen regulator Pressure gauges",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Calibration report for oxygen regulator Pressure gauges shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-023",
+        "question": "Medical Test report for all employees",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Medical Test report shall be available from Authorized agency, and reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-024",
+        "question": "Monitoring,measurement,analysis and evaluation- Needle detector calibration report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Calibration report for oxygen regulator Pressure gauges shall be available.\nIi. This reports must be verified by competent personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-025",
+        "question": "Compliance obligations- FSSAI certificate",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-026",
+        "question": "Evaluation of compliance- Factory license",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-027",
+        "question": "Evaluation of compliance- Stability certificate form No ----",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-028",
+        "question": "Evaluation of compliance- Fire Dept. NOC certificate",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "i. Valid report shall be available.\nIi. This reports must be verified.",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-029",
+        "question": "Evaluation of compliance- Hazardous waste consent acknowledgement",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-030",
+        "question": "E waste Manifest form 06",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-031",
+        "question": "Used oil disposal form 10",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-032",
+        "question": "Environmental statement in form 5",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-033",
+        "question": "Form 11 accident register",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Verify & record the evidence",
+        "requirement_reference": "Clause 6.1.3, 9.1.2, 10.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-034",
+        "question": "Legal and Other requirement register",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "All the latest legal updates must be considered in the Legal and Other requirement register",
+        "requirement_reference": "Clause 6.1.3, 9.1.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-035",
+        "question": "Mock drill Plan and Record, Covered the Fire, Shock, Overflow of STP etc",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Evidence must be verified",
+        "requirement_reference": "Clause 8.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-036",
+        "question": "Awareness Training Plan & records",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Check the Awareness with some Employees, Workers etc",
+        "requirement_reference": "Clause 7.3",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-037",
+        "question": "Medical, welfare Committees meetings MOM",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Meeting Agenda, MOM etc",
+        "requirement_reference": "Clause 5.4, 7.4.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-038",
+        "question": "STP — Hazard Identification - Biohazards",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the list of Biohazards, Disposal process and records",
+        "requirement_reference": "Clause 6.1.2.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-039",
+        "question": "STP — Gas Hazard Monitoring",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Inspect functional, calibrated portable gas detectors capable of sensing lethal gases like Hydrogen Sulfide (H₂S), Methane (CH₄), and carbon monoxide.",
+        "requirement_reference": "Clause 8.1.1.",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-040",
+        "question": "STP — Emergency Preparedness - Toxic Gas/Drowning",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Review the schedules and logs for emergency evacuation drills focused on toxic gas inhalation, asphyxiation, or drowning.",
+        "requirement_reference": "Clause 8.2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-041",
+        "question": "STP — Personal Protective Equipment",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Check that operators are wearing adequate PPE, including heavy-duty long rubber gloves, gumboots, and respiratory masks",
+        "requirement_reference": "Clause 8.1. 2",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-042",
+        "question": "STP — Monitoring,measurement,analysis and evaluation- ETP treated water test report",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Valid report for ETP Water test shall be available.\nIi. This reports must be verified by responsible personnel.",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-043",
+        "question": "ETP — Hazard Identification - Chemical Handling",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Inspect risk assessments regarding severe chemical burns, toxic fumes, or accidental exothermic mixing (e.g., adding water directly to concentrated acids).",
+        "requirement_reference": "Clause 6.1.2.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-044",
+        "question": "ETP — Safety Data Sheets & Labelling",
+        "criticality": "critical",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Confirm that Material Safety Data Sheets (MSDS) for every chemical utilized (e.g., sulfuric acid, caustic soda) are clearly posted in regional scripts",
+        "requirement_reference": "Clause 7.4.1 / 8.1.1",
+        "standard": "ISO 45001:2018"
+      },
+      {
+        "code": "PI-OHS-045",
+        "question": "ETP — Health Surveillance",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Review medical check-up records of ETP workers",
+        "requirement_reference": "Clause 9.1.1",
+        "standard": "ISO 45001:2018"
+      }
+    ]
+  },
+  {
+    "category_code": "ENMS",
+    "category_name": "Energy Management System (ISO 50001:2018)",
+    "category_color": "#CA8A04",
+    "category_icon": "zap",
+    "checkpoints": [
+      {
+        "code": "PI-ENMS-001",
+        "question": "Previous Audit and NC Closure Status",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Internal/ External Audit Status (Audit Completed Dates, Audit findings, Auditor details etc.\nIi. Action Plan and NC closure if there is any NC's in Previous Audit.",
+        "requirement_reference": "Clause 9.2",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-002",
+        "question": "Departmental Objective (KPI)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Departmental Objectives as per EnMS Stds (ISO 50001:2018).\nIi. Adequate process for Departmental objective Target settings.\niii. Departmental Objectives Status are on time updated?.",
+        "requirement_reference": "Clause 6.2",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-003",
+        "question": "Action Plan If KPI Target not achieved",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i.If objectives targets are not met, then ensure an action plan with assigned responsibilities and target dates must be available.\nii. Road Map for Current Financial Year objective targets achievement.",
+        "requirement_reference": "Clause 6.2.2, 10.2",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-004",
+        "question": "Process Module",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Verify the updated Master list of process Modules.\nii. Review the Process Modules and verify min 02 nos of evidences for actual implemented process.",
+        "requirement_reference": "Clause 4.4",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-005",
+        "question": "Standard Operating Procedure",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Check the updated Master list of SOPs.\nii. Review SOPs and verify min 02 nos of evidences for actual implemented process..",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-006",
+        "question": "Needs and expectations of Interested parties, Risk and Opportunities",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "i. Ensure interested parties, risks, and opportunities cover all applicable (EnMS) Standards (ISO 50001:2018).\nii. Verify that opportunities are adequately addressed.\niii. Interested parties, risks, and opportunities achievement status backup data is required.",
+        "requirement_reference": "Clause 4.2, 6.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-007",
+        "question": "Organogram (Dept. Organization Chart)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Updated UnitDepartmental Organizational chart shall be available.",
+        "requirement_reference": "Clause 5.3",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-008",
+        "question": "Energy design and procurements",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the energy design and procurement records for new machines and equipment in the Quality Test Lab:\ni. List of new machines/equipment procured by the Quality Test Lab.\nii. Comparison of quotations for new machines/equipment based on energy usage.\niii. Energy Star ratings or energy consumption specifications explicitly stated in Purchase Orders or any other documents.",
+        "requirement_reference": "Clause 8.2, 8.3",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-009",
+        "question": "Energy base line and Energy Performance Indicators (EnPI)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "EnPI targets vs. actual data, and the Unit of Measurement (UOM) for EnPIs.",
+        "requirement_reference": "Clause 6.4, 6.5",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-010",
+        "question": "Significant Energy Use (SEU) Chart",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Quality area identified SEUs; ensure relevant personnel are fully aware of them.",
+        "requirement_reference": "Clause 6.3, 6.6",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-011",
+        "question": "Compliance Obligation (If applicable)",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "EnMS related Legal requirements mentioned in Legal register",
+        "requirement_reference": "Clause 9.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-012",
+        "question": "Master list of documents and formats",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Master list of Documents, Formats",
+        "requirement_reference": "Clause 7.5.3",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-013",
+        "question": "Operational planning and control (Energy Controlled procedure)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Master list of Energy Control Procedures (EnCP) and verification of at least one EnCP with supporting evidence.",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-014",
+        "question": "Continual Improvement",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "List of Continual Improvement projects",
+        "requirement_reference": "Clause 10.2",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-015",
+        "question": "Master List of Equipments",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Master list of Equipments",
+        "requirement_reference": "Clause 7.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-016",
+        "question": "Calibration Plan & reports for Equipments Gauges i.e. Wieghing Machine etc",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "Calibration Plan, Calibration Certificates",
+        "requirement_reference": "Clause 6.6, 9.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-017",
+        "question": "List of Applicable critical spare parts eg. STP/ETP related equipments etc (under Admin)",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "List of critical spare parts",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-018",
+        "question": "Applicable E-Waste",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "E-Waste Material list, Disposition process and records",
+        "requirement_reference": "Clause 4.2",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-019",
+        "question": "PM Plan and Record",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "PM Plan and Records",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-020",
+        "question": "Break down record",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Breakdown record, MTTR, MTBF",
+        "requirement_reference": "Clause 10.1",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-021",
+        "question": "EnMS Awareness",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Awareness of EnMS to Staff, Workers (Including Security, Housekeeping employees also)",
+        "requirement_reference": "Clause 7.3",
+        "standard": "ISO 50001:2018"
+      },
+      {
+        "code": "PI-ENMS-022",
+        "question": "EnCP for STP/ETP process",
+        "criticality": "minor",
+        "requirement_type": "INTERNAL_REQUIREMENT",
+        "guidance": "Verify the Energy control procedure for STP/ETP process",
+        "requirement_reference": "Clause 8.1",
+        "standard": "ISO 50001:2018"
+      }
+    ]
+  }
+]

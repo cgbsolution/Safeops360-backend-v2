@@ -1,0 +1,479 @@
+[
+  {
+    "category_code": "LAWS",
+    "category_name": "Compliance with Laws and Workplace Regulations",
+    "category_color": "#7C3AED",
+    "category_icon": "scale",
+    "checkpoints": [
+      {
+        "code": "PI-SC-LAWS-001",
+        "question": "Does the factory have a valid Factory Licence ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-002",
+        "question": "Does the factory have a Certified standing order ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-003",
+        "question": "Does the factory have a Certified building layout plan and is matching to the existing layout ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-004",
+        "question": "Does the factory have a Structure stability certificate ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-005",
+        "question": "Does the factory have a Fire NOC ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-006",
+        "question": "Does the factory have a valid PCB consent ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-007",
+        "question": "Does the factory have Boiler Licence ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-008",
+        "question": "Does the factory have Pressure Vessel Certificate ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-009",
+        "question": "Does the factory have Lift licence ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-010",
+        "question": "Is Canteen facility/ Lunch hall provided ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-011",
+        "question": "Is FSSAI Certificate availabile ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-012",
+        "question": "Is Creche facility available ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-013",
+        "question": "Are adequate Toliets/Urinals are available ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-014",
+        "question": "Is Regular employment ensured for all the workers ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-LAWS-015",
+        "question": "Are hostel /dormitories are compliant and with all the approvals obtained ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compliance with Laws and Workplace Regulations",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "HOURS",
+    "category_name": "Hours of work",
+    "category_color": "#0EA5E9",
+    "category_icon": "clock",
+    "checkpoints": [
+      {
+        "code": "PI-SC-HOURS-001",
+        "question": "Are the working Hours comply with the law ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Hours of work",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HOURS-002",
+        "question": "Are Weekly rest days provided for all workers ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Hours of work",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "WAGES",
+    "category_name": "Compensation and Benefits",
+    "category_color": "#16A34A",
+    "category_icon": "wallet",
+    "checkpoints": [
+      {
+        "code": "PI-SC-WAGES-001",
+        "question": "Is Payment of wages is made ontime regularly ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-002",
+        "question": "Are all workers paid the applicable Minimum wages ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-003",
+        "question": "Is Overtime paid at double the rate of wages ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-004",
+        "question": "Are all the employees covered under EPFO / ESIC schemes ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-005",
+        "question": "Does the factory remit the Statutory Benefit contributions ontime and regularly ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-006",
+        "question": "Is Bonus paid to all the employees as per the law ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-007",
+        "question": "Are all the applicable Leaves provided for all employees ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-WAGES-008",
+        "question": "Is full and final settlement paid to all the left employees ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Compensation and Benefits",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "HS",
+    "category_name": "Health and Safety",
+    "category_color": "#DC2626",
+    "category_icon": "shield",
+    "checkpoints": [
+      {
+        "code": "PI-SC-HS-001",
+        "question": "Is the factory free of Electrical safety concernes ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-002",
+        "question": "Are all the departments /floors have secondary exits ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-003",
+        "question": "Is Fire alarm system available through out the factory ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-004",
+        "question": "Are Industrial Grade exit/emergency exit lights are available for all the exits and are they functional ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-005",
+        "question": "Are Fire hydrants,Hosereels,Auto sprinklers provided as per the law ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-006",
+        "question": "Are Fire mock drills and Trainings conducted regularly ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-007",
+        "question": "Are Fire Exitinguishers provided across the factory ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-008",
+        "question": "Is First aid training provided for employees ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-009",
+        "question": "Are First aid Boxes provided across factory ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-010",
+        "question": "Are Evacuation plans posted across the factory ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-011",
+        "question": "Is Aisle marking done across the factory ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-012",
+        "question": "Are the Chemicals managed safely ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-HS-013",
+        "question": "Are apropriate PPEs used by all the employees ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Health and Safety",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "FOA",
+    "category_name": "Freedom of association and collective bargaining",
+    "category_color": "#EA580C",
+    "category_icon": "users",
+    "checkpoints": [
+      {
+        "code": "PI-SC-FOA-001",
+        "question": "Are all the workers committies exist and functioning ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Freedom of association and collective bargaining",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "CHILD",
+    "category_name": "Prohibition of Child Labor",
+    "category_color": "#BE123C",
+    "category_icon": "user-x",
+    "checkpoints": [
+      {
+        "code": "PI-SC-CHILD-001",
+        "question": "Is Child labour employed ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Prohibition of Child Labor",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-CHILD-002",
+        "question": "Is Adolescent workers employed without following the requirementS ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Prohibition of Child Labor",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "DISCRIM",
+    "category_name": "Prohibition of Discrimination",
+    "category_color": "#DB2777",
+    "category_icon": "user-minus",
+    "checkpoints": [
+      {
+        "code": "PI-SC-DISCRIM-001",
+        "question": "Any Discrimination practices ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Prohibition of Discrimination",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "FORCED",
+    "category_name": "Prohibition of Forced labor",
+    "category_color": "#9333EA",
+    "category_icon": "lock",
+    "checkpoints": [
+      {
+        "code": "PI-SC-FORCED-001",
+        "question": "Any Forced labour practices ?",
+        "criticality": "critical",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Prohibition of Forced labor",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  },
+  {
+    "category_code": "ENV",
+    "category_name": "Environment",
+    "category_color": "#059669",
+    "category_icon": "leaf",
+    "checkpoints": [
+      {
+        "code": "PI-SC-ENV-001",
+        "question": "Is ETP available and functioning ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Environment",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      },
+      {
+        "code": "PI-SC-ENV-002",
+        "question": "Are all the waste disposed as per the law ?",
+        "criticality": "major",
+        "requirement_type": "STATUTORY_REGULATORY",
+        "guidance": "",
+        "requirement_reference": "Environment",
+        "standard": "PIL Social Compliance Audit Checklist (Annexure-2, v4)"
+      }
+    ]
+  }
+]

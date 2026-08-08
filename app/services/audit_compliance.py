@@ -402,6 +402,76 @@ def library_subject_scope(industry_code: str, categories: list[dict[str, Any]]) 
     return "OWN_SITE"
 
 
+# ── Audit categories ─────────────────────────────────────────────────
+#
+# The scheduler's first choice. A category names the KIND of audit being run,
+# and each category resolves exactly one checkpoint library — which is what
+# makes "the disciplines populate from the category" true rather than a
+# coincidence of whichever library sorted first.
+#
+# Ordered as they appear in the wizard. `INTERNAL` is first because it is the
+# audit this instance runs most, and the one the other two were standardised
+# against.
+AUDIT_CATEGORIES: list[dict[str, Any]] = [
+    {
+        "code": "INTERNAL",
+        "label": "Internal",
+        "description": "Page Industries internal audit — HR, EHS and Production.",
+        "industryCode": "PAGE_INDUSTRIES",
+        "auditType": "internal_audit",
+        "standards": ["Page Industries Internal Audit"],
+    },
+    {
+        "code": "MANAGEMENT_SYSTEMS",
+        "label": "QMS, EMS, OHS",
+        "description": "Integrated management-system audit against ISO 9001, 14001, 45001 and 50001.",
+        "industryCode": "PAGE_IMS",
+        "auditType": "management_system_audit",
+        "standards": [
+            "ISO 9001:2015", "ISO 14001:2015", "ISO 45001:2018", "ISO 50001:2018",
+        ],
+    },
+    {
+        "code": "SOCIAL_COMPLIANCE",
+        "label": "Social Compliance",
+        "description": "PIL Social Compliance Audit checklist — labour, wages, safety and environment.",
+        "industryCode": "PAGE_SOCIAL",
+        "auditType": "social_compliance_audit",
+        "standards": ["PIL Social Compliance Audit Checklist (Annexure-2, v4)"],
+    },
+]
+
+_CATEGORY_BY_INDUSTRY = {c["industryCode"]: c["code"] for c in AUDIT_CATEGORIES}
+
+
+def library_audit_category(industry_code: str, categories: list[dict[str, Any]]) -> str | None:
+    """Which audit category a checkpoint library belongs to, or None.
+
+    Derived, not stored — same reasoning as `library_subject_scope`: there is no
+    column to add, nothing to backfill, and no stored flag that can drift out of
+    step with the content.
+
+    `audit_category` on a category dict is the explicit hook, so a library
+    imported later can declare its own category without editing this map. The
+    industry-code map is the fallback for the three libraries shipped here.
+
+    None means "not one of the own-facility audit categories" — the supplier
+    checklists and any retired industry library. That is why the wizard must not
+    treat None as a fourth category: those libraries are reached through the
+    audit SUBJECT (supplier), which is a different axis entirely.
+    """
+    for c in categories or []:
+        declared = (c.get("audit_category") or "").upper()
+        if declared:
+            return declared
+    return _CATEGORY_BY_INDUSTRY.get(industry_code)
+
+
+def list_audit_categories() -> list[dict[str, Any]]:
+    """The category menu, for the scheduling wizard."""
+    return [dict(c) for c in AUDIT_CATEGORIES]
+
+
 async def list_libraries(db: AsyncSession) -> list[dict[str, Any]]:
     rows = (
         await db.execute(
@@ -424,6 +494,10 @@ async def list_libraries(db: AsyncSession) -> list[dict[str, Any]]:
                 # written for. The scheduling wizard branches on it so a supplier
                 # audit cannot be scoped against plant checklists.
                 "subjectScope": library_subject_scope(lib.industryCode, cats),
+                # INTERNAL | MANAGEMENT_SYSTEMS | SOCIAL_COMPLIANCE, or null for
+                # the supplier checklists. The wizard's category selector groups
+                # on this, and the disciplines it offers are this library's.
+                "auditCategory": library_audit_category(lib.industryCode, cats),
                 # A library can be correctly scoped and still have no content —
                 # the buyer regimes ship as structure with zero checkpoints
                 # because the criteria are licensed. Selectable requires BOTH.
@@ -1817,7 +1891,11 @@ def validate_audit_title(title: str | None) -> str:
 
 async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) -> ComplianceAudit:
     industry_code = data.get("industryCode")
-    audit_type = data.get("auditType") or "compliance_audit"
+    # `None` here, not the generic default: the fallback is applied AFTER the
+    # library is resolved, so an audit whose checklist belongs to a category can
+    # inherit that category's audit type. Defaulting now would make every
+    # programme-materialised audit read "compliance_audit" regardless.
+    audit_type = data.get("auditType")
     config: dict[str, Any] = {"mode": "all"}
     template: AuditTemplate | None = None
 
@@ -1827,7 +1905,7 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
         if template is None:
             raise ValueError("Invalid templateId")
         industry_code = template.baseIndustry
-        audit_type = data.get("auditType") or template.auditType
+        audit_type = audit_type or template.auditType
         config = template.checkpointConfiguration or {"mode": "all"}
 
     if not industry_code:
@@ -1840,6 +1918,25 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
     ).scalar_one_or_none()
     if library is None:
         raise ValueError(f"No checkpoint library for industry {industry_code}")
+
+    # ── Audit type follows the checklist's category ─────────────────────────
+    #
+    # An explicit auditType (the scheduling wizard sends the category's) and a
+    # template's own type both win — they are the more specific statement of
+    # intent. Otherwise the category the resolved library belongs to supplies it,
+    # so a report names the regime the audit was actually run under.
+    #
+    # Placed here rather than in each caller because the callers are several: the
+    # wizard, the programme's `materialise_slot`, and the raw API. A rule that
+    # lives in one of them is not a rule — a programme-materialised QMS audit
+    # would read "compliance_audit" while a hand-scheduled one read
+    # "management_system_audit", for no reason a reader could discover.
+    if not audit_type:
+        _cat = library_audit_category(industry_code, library.categories or [])
+        audit_type = next(
+            (c["auditType"] for c in AUDIT_CATEGORIES if c["code"] == _cat),
+            "compliance_audit",
+        )
 
     plant = await db.get(Plant, data["plantId"])
     plant_code = plant.code if plant else "XX"

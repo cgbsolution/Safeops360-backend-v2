@@ -63,17 +63,35 @@ def check(tid: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {tid} {detail}")
 
 
-async def _expect_db_error(db, coro, tid: str, expect_fragment: str) -> None:
+async def _expect_db_error(
+    db, coro, tid: str, expect_fragment: str, *, deferred: bool = False
+) -> None:
     """Assert that a statement is rejected BY THE DATABASE.
 
     Each attempt runs in its own SAVEPOINT so a rejection does not poison the
     rest of the verification run — and, importantly, so a constraint that fails
     to fire is visible as a PASS-that-should-have-FAILED rather than as a
     cascade of unrelated errors.
+
+    `deferred=True` is required for CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY
+    DEFERRED. Such a trigger queues its check and fires it at COMMIT — NOT at
+    savepoint release. This script deliberately never commits (it must not
+    mutate real data), so without forcing the issue the check would never run
+    and the assertion would silently pass as "accepted". `SET CONSTRAINTS ALL
+    IMMEDIATE` drains the queue right here, which is the only way to verify a
+    deferred constraint inside a transaction that will be rolled back.
+
+    Worth being explicit, because the first version of this helper got it wrong
+    and reported the co-storage constraint as not firing: the deferral is
+    correct for production (a real request commits, and the legal ordering
+    INSERT item → assign location needs the intermediate state tolerated), and
+    it was the TEST that could not see it.
     """
     try:
         async with db.begin_nested():
             await coro
+            if deferred:
+                await db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
         check(tid, False, "— statement was ACCEPTED; the constraint did not fire")
     except (IntegrityError, DBAPIError) as e:
         msg = str(getattr(e, "orig", e))
@@ -244,9 +262,9 @@ async def main() -> None:  # noqa: C901 — a linear verification script reads b
                 check("CHEM-T06a", "Incompatible co-storage" in str(e), f"— {str(e)[:90]}")
 
             # (b) and the DATABASE refuses even when the service is bypassed —
-            #     which is what makes AC #4 "not just a toast warning". The
-            #     trigger is DEFERRED, so it fires when the savepoint is
-            #     released, not on the UPDATE itself.
+            #     which is what makes AC #4 "not just a toast warning".
+            #     deferred=True because the trigger fires at COMMIT; see
+            #     _expect_db_error for why the savepoint alone is not enough.
             await _expect_db_error(
                 db,
                 db.execute(
@@ -255,6 +273,7 @@ async def main() -> None:  # noqa: C901 — a linear verification script reads b
                 ),
                 "CHEM-T06b",
                 "Co-storage blocked",
+                deferred=True,
             )
 
         # ═══ CHEM-T07 — WARN saves, but demands a reason ═════════════════════

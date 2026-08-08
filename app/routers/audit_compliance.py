@@ -390,7 +390,15 @@ async def list_library(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
-    return {"libraries": await svc.list_libraries(db)}
+    # The category menu ships alongside the libraries because it is only
+    # meaningful with them: a category the instance has no library for must not
+    # appear in the wizard, and the client resolves that by matching
+    # `auditCategory` on the libraries below. One payload, one round trip, no
+    # window where the two lists disagree.
+    return {
+        "libraries": await svc.list_libraries(db),
+        "auditCategories": svc.list_audit_categories(),
+    }
 
 
 class ImportLibraryBody(BaseModel):
