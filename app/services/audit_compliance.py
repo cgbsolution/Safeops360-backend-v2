@@ -48,6 +48,7 @@ from app.services import (
     scoring_rules,
     signoff,
 )
+from app.services.insights import rules_audit_report
 
 MINIMUM_PASS_SCORE = 80.0
 
@@ -3953,9 +3954,24 @@ def _build_report_snapshot(
         # open iterations on an audit whose Findings Register correctly read 0.
         #
         # `_is_terminal` is unchanged — the finalisation gate still needs it.
+        #
+        # The `val in (fail, partial)` arm below is what makes a raised finding
+        # an open item BEFORE it has been routed (workflowState OPEN, pre-submit)
+        # — that is correct and is why it is here. But a finding does not stop
+        # being a fail once it is answered, so on its own that arm counted EVERY
+        # finding on a CLOSED audit as an open iteration: the flag underneath
+        # then fired on all 39 findings of AUD-PI-2026-NW-0014 and told the
+        # reader its record was corrupt. It was not — `_finalizability` had
+        # already proved every row terminal, which is the only reason the audit
+        # could close at all.
+        #
+        # A resolved terminal state therefore wins over the verdict. RESOLVED /
+        # ACCEPTED_WITH_CAPA / FINALIZED mean the iteration is closed, whatever
+        # the auditor's original grade was.
+        resolved = r.workflowState in ("RESOLVED", "ACCEPTED_WITH_CAPA", "FINALIZED")
         in_flight = r.workflowState not in ("OPEN", "PASSED", "RESOLVED",
                                             "ACCEPTED_WITH_CAPA", "FINALIZED")
-        if val in ("fail", "partial") or in_flight:
+        if not resolved and (val in ("fail", "partial") or in_flight):
             open_iters.append({
                 "checkpointCode": r.checkpointCode, "discipline": r.categoryName,
                 "workflowState": r.workflowState, "round": r.currentRound, "ownerId": owner,
@@ -4082,6 +4098,19 @@ def _build_report_snapshot(
         snapshot["hasFullRegister"] = True
         snapshot["standardsRollup"] = _standards_rollup(responses)
         snapshot["finalizability"] = _finalizability(audit)
+
+    # ── Section 1 insight layer ───────────────────────────────────────────
+    # Computed HERE, inside the snapshot that `generate_report` hashes, so the
+    # insights are frozen with everything else at issue. It is deliberately not
+    # a view-time query: a headline that changed after issue would break the
+    # immutability the SHA-256 digest asserts. Underlying data changes produce
+    # a new issue (I02, I03 …), and its insights are recomputed then.
+    #
+    # Purely derivative — every input is a field already counted above, so this
+    # cannot disagree with the register it sits over. Deterministic rules +
+    # template slot-filling only (`services/insights`), no model call, which is
+    # what keeps report generation working on an airgapped deployment.
+    snapshot["insights"] = rules_audit_report.compute_report_insights(snapshot)
     return snapshot
 
 
@@ -4371,6 +4400,14 @@ async def generate_report(
         snapshot["userNames"] = {uid: nm for uid, nm in _rows}
     for _d in snapshot.get("distributionList") or []:
         _d["name"] = snapshot["userNames"].get(_d.get("userId", ""), "Unknown")
+
+    # Owner-concentration insights name a person. `compute_report_insights` is
+    # pure (no DB), so it left a `{owner}` slot; fill it from the same frozen
+    # name map the rest of the report resolves against — never a raw cuid.
+    # Runs BEFORE the hash, so the resolved name is part of the frozen snapshot.
+    rules_audit_report.resolve_owner_names(
+        snapshot.get("insights") or {}, snapshot["userNames"]
+    )
 
     snapshot["generatedAt"] = _iso(_utcnow())
     # Two digests over the SAME canonical form: the 16-char prefix stays inside

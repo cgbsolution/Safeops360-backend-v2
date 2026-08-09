@@ -114,6 +114,34 @@ TEMPLATES: dict[str, str] = {
     "training.followup.open.evidence": "{count} open training assignments were auto-created from {module} records here; {competency} is the most-assigned competency.",
     "training.followup.overdue": "{overdue} auto-assigned trainings from these events are now overdue",
     "training.followup.overdue.evidence": "{overdue} of {count} event-driven training assignments are past due — competency gaps stay open until completed.",
+    # ── Audit report — Section 1 insight layer ────────────────────────────
+    # Phrased for a certification-body reader, so each headline states what was
+    # OBSERVED and leaves the verdict to the gate. The one exception is the
+    # critical banner, which restates a rule the report has already applied.
+    "audit.report.critical_gate": "FAIL — {count} critical non-conformance{plural}; the audit fails regardless of score",
+    "audit.report.repeat_nc": "{count} repeat non-conformance{plural} across {disciplines} discipline{dplural}",
+    "audit.report.repeat_nc.evidence": "{count} finding(s) were raised at an earlier audit and remain unresolved: {refs}",
+    "audit.report.owner_concentration": "{owner} holds {count} of the {total} {tier} findings",
+    "audit.report.owner_concentration.evidence": "{owner} owns {count} ({share}%) of the {tier} findings: {refs}",
+    "audit.report.owner_concentration.action": "Check {owner} has the capacity to close {tier} findings on time, or redistribute.",
+    "audit.report.discipline_concentration": "{discipline} carries {count} of the {total} failures ({share}%)",
+    "audit.report.discipline_concentration.evidence": "{count} of {total} failed checkpoints sit in {discipline}: {refs}",
+    "audit.report.discipline_concentration.action": "Treat {discipline} as the primary corrective-action programme, not as isolated findings.",
+    "audit.report.statutory": "{count} statutory/regulatory requirement{plural} not met across {disciplines} disciplines",
+    "audit.report.statutory.evidence": "{count} adverse finding(s) sit on statutory or regulatory requirements ({dlist}) — these carry legal exposure beyond the compliance score: {refs}",
+    "audit.report.statutory.action": "Close the statutory findings first — they are the ones an inspector can act on.",
+    "audit.report.capa_gap": "{count} severe finding{plural} closed with no CAPA linked",
+    "audit.report.capa_gap.evidence": "{count} critical/major failure(s) carry no corrective action record: {refs}",
+    "audit.report.capa_gap.action": "Raise a CAPA against each, or record why one is not required.",
+    "audit.report.single_round": "{count} of {total} severe findings resolved at the first response",
+    "audit.report.single_round.evidence": "{count} of {total} critical/major findings reached a terminal state in round 1, with no further evidence requested: {refs}",
+    "audit.report.single_round.action": "Spot-check the round-1 closures — a first-pass acceptance rate this high is worth verifying.",
+    "audit.report.escalated": "{count} of {total} severe findings needed escalation or a second round",
+    "audit.report.escalated.evidence": "{count} finding(s) went to the plant manager or required further evidence before closing: {refs}",
+    "audit.report.wording": "{count} findings across {disciplines} disciplines carry identical observation wording",
+    "audit.report.wording.evidence": "The same observation text appears verbatim on {count} findings in {dlist}. Observation text is freeform, so this indicates shared wording — it may reflect a common cause or a reused note. Excerpt: \"{excerpt}\" — {refs}",
+    "audit.report.wording.more": "A further {groups} group{plural} of findings ({findings} in total) each share their own repeated wording.",
+    "audit.report.suppressed": "Pattern detection needs at least {floor} findings; this audit has {count}. The figures above are complete.",
 }
 
 

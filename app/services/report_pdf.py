@@ -7,6 +7,7 @@ register, CAPA summary, sign-off block (FINAL), page numbers + confidential foot
 
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +27,10 @@ except Exception:  # noqa: BLE001 — a bad env var must not break report genera
     REPORT_TZ, REPORT_TZ_LABEL = timezone.utc, "UTC"
 
 _REPL = {"—": "-", "–": "-", "‘": "'", "’": "'", "“": '"', "”": '"',
+         # U+2026 is not latin-1, so without an entry here it fell through to
+         # `encode(..., "replace")` and printed as "?" - a truncated quotation
+         # ended `briefed.?"` on the real Page Industries report.
+         "…": "...",
          "•": "*", "₹": "Rs ", "→": "->", "≥": ">=", "≤": "<=", " ": " "}
 
 
@@ -45,11 +50,184 @@ RED = (192, 57, 43)
 AMBER = (230, 126, 34)
 GREEN = (39, 139, 87)
 
+# CAMS violet/indigo — the SAME ramp as the app (`tailwind.config.ts` primary,
+# i.e. Tailwind violet). The insight layer is a new visual language on an
+# existing product, not a new palette: a report that looked like a different
+# product from the screen that produced it would read as a different system.
+VIOLET = (109, 40, 217)        # violet-700 — headings, chart accents
+VIOLET_DARK = (76, 29, 149)    # violet-900 — banner ground
+VIOLET_TINT = (237, 233, 254)  # violet-100 — card fills
+SLATE = (71, 85, 105)          # slate-600 — secondary text
+HAIRLINE = (226, 232, 240)     # slate-200 — rules and empty track
+INK = (15, 23, 42)             # slate-900 — primary text
+RED_TINT = (254, 226, 226)
+AMBER_TINT = (254, 243, 199)
+GREEN_TINT = (209, 250, 229)
+
+# Band key (from `insights.rules_audit_report`) -> ink + fill. The BANDING
+# DECISION is not made here: the insight layer already assigned every gauge and
+# bar its band, so the PDF, the screen and the stored snapshot cannot disagree
+# about what colour a number is. This map only says what each band looks like.
+_BAND_INK: dict[str, tuple[int, int, int]] = {
+    "green": GREEN, "amber": AMBER, "red": RED, "neutral": GREY,
+}
+_BAND_TINT: dict[str, tuple[int, int, int]] = {
+    "green": GREEN_TINT, "amber": AMBER_TINT, "red": RED_TINT, "neutral": LIGHT,
+}
+
+# Severity -> (ink, tint) for finding-card stripes and badges.
+_SEV_STYLE: dict[str, tuple[tuple[int, int, int], tuple[int, int, int]]] = {
+    "critical": (RED, RED_TINT),
+    "major": (AMBER, AMBER_TINT),
+    "minor": (VIOLET, VIOLET_TINT),
+}
+_SEV_ORDER = ("critical", "major", "minor")
+
 
 def _rag(pct: float | None) -> tuple[int, int, int]:
     if pct is None:
         return GREY
     return GREEN if pct >= 85 else (AMBER if pct >= 70 else RED)
+
+
+# ── Chart primitives ─────────────────────────────────────────────────────
+#
+# Drawn with fpdf2 vector calls rather than an embedded chart image. The PDF is
+# produced by fpdf2 (pure Python, no headless browser and no system deps —
+# that is the whole reason this renderer exists), so an SVG or canvas chart
+# library is not on the table: there is no browser to run it. Vector primitives
+# also stay sharp at print resolution and add no bytes worth mentioning, which
+# a rasterised chart would.
+#
+# NOTE on page breaks: fpdf2's auto-break fires on TEXT flow, not on rect/arc
+# calls. Every helper here is therefore given its height up front and each
+# caller checks `_room()` before drawing — a chart half-drawn across a page
+# boundary is the one failure mode this section can produce.
+
+def _room(pdf: "_Report", needed: float) -> None:
+    """Start a new page unless `needed` mm remain above the bottom margin."""
+    if pdf.get_y() + needed > pdf.h - pdf.b_margin:
+        pdf.add_page()
+
+
+def _donut(
+    pdf: "_Report", cx: float, cy: float, radius: float, pct: float | None,
+    colour: tuple[int, int, int], *, thickness: float = 7.0,
+) -> None:
+    """A radial gauge: grey track ring, then the score swept over it.
+
+    Built from quadrilateral segments rather than fpdf2's `solid_arc`. That is
+    not stubbornness — `solid_arc` interprets its x/y as the arc origin in a way
+    that does not agree with `ellipse`'s bounding-box origin, so a sweep drawn
+    at the same coordinates as the track lands off-centre and renders the
+    COMPLEMENT of the angle asked for (88% drew as a 43° wedge). Trigonometry
+    here is a dozen lines, is exact, and cannot be changed underneath us by a
+    library upgrade — worth it for the one number on page 1 a reader trusts
+    most.
+
+    Angles run clockwise from 12 o'clock, which is what a gauge means by "full".
+    """
+    inner = max(0.5, radius - thickness)
+    segments = 120  # 3° apiece — smooth at print resolution
+
+    def _ring(from_frac: float, to_frac: float, colour_: tuple[int, int, int]) -> None:
+        if to_frac <= from_frac:
+            return
+        pdf.set_fill_color(*colour_)
+        # Stroke each segment in its own fill colour ("DF"). Fill-only leaves a
+        # hairline of white between adjacent polygons where the rasteriser
+        # anti-aliases their shared edge, which printed the ring as a barber
+        # pole. The stroke covers its own seam and changes nothing else.
+        pdf.set_draw_color(*colour_)
+        n = max(1, round((to_frac - from_frac) * segments))
+        step = (to_frac - from_frac) * 2 * math.pi / n
+        base = from_frac * 2 * math.pi
+        for i in range(n):
+            a0, a1 = base + i * step, base + (i + 1) * step
+            pdf.polygon(
+                [
+                    (cx + radius * math.sin(a0), cy - radius * math.cos(a0)),
+                    (cx + radius * math.sin(a1), cy - radius * math.cos(a1)),
+                    (cx + inner * math.sin(a1), cy - inner * math.cos(a1)),
+                    (cx + inner * math.sin(a0), cy - inner * math.cos(a0)),
+                ],
+                style="DF",
+            )
+
+    prev_lw = pdf.line_width
+    pdf.set_line_width(0.08)
+    _ring(0.0, 1.0, HAIRLINE)
+    if pct is not None and pct > 0:
+        _ring(0.0, max(0.0, min(100.0, float(pct))) / 100.0, colour)
+    pdf.set_line_width(prev_lw)
+    pdf.set_draw_color(*HAIRLINE)
+
+
+def _hbar(
+    pdf: "_Report", x: float, y: float, width: float, height: float,
+    pct: float | None, colour: tuple[int, int, int],
+) -> None:
+    """Horizontal bar on a full-width track. `pct is None` (nothing assessed)
+    draws the track only — a neutral empty bar, never a red 0%, which would
+    report 'not assessed' as 'failed everything'."""
+    pdf.set_fill_color(*HAIRLINE)
+    pdf.rect(x, y, width, height, style="F")
+    if pct is None:
+        return
+    filled = max(0.0, min(100.0, float(pct))) / 100.0 * width
+    if filled > 0:
+        pdf.set_fill_color(*colour)
+        pdf.rect(x, y, filled, height, style="F")
+
+
+def _chip(
+    pdf: "_Report", x: float, y: float, text: str,
+    ink: tuple[int, int, int], tint: tuple[int, int, int], *, size: float = 6.5,
+) -> float:
+    """A pill. Returns its width so callers can flow chips along a row."""
+    pdf.set_font("Helvetica", "B", size)
+    w = pdf.get_string_width(_s(text)) + 3.6
+    pdf.set_fill_color(*tint)
+    pdf.rect(x, y, w, size * 0.62, style="F")
+    pdf.set_text_color(*ink)
+    pdf.set_xy(x, y)
+    pdf.cell(w, size * 0.62, text, border=0, ln=0, align="C")
+    pdf.set_text_color(0, 0, 0)
+    return w
+
+
+def _banner(pdf: "_Report", text: str, ink: tuple[int, int, int],
+            tint: tuple[int, int, int], *, height: float = 11.0) -> None:
+    """Full-width callout with a solid leading rule. Used for the critical-fail
+    gate, which the report has always stated in prose — this only stops it being
+    a sentence a reader can skim past."""
+    _room(pdf, height + 3)
+    y = pdf.get_y()
+    pdf.set_fill_color(*tint)
+    pdf.rect(10, y, 190, height, style="F")
+    pdf.set_fill_color(*ink)
+    pdf.rect(10, y, 1.8, height, style="F")
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(*ink)
+    pdf.set_xy(14, y + (height - 5) / 2)
+    pdf.cell(184, 5, text, border=0, ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(y + height + 3)
+
+
+def _stat(pdf: "_Report", x: float, y: float, w: float, label: str, value: str,
+          ink: tuple[int, int, int]) -> None:
+    pdf.set_fill_color(248, 250, 252)
+    pdf.rect(x, y, w, 14, style="F")
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(*ink)
+    pdf.set_xy(x + 3, y + 1.5)
+    pdf.cell(w - 6, 7, value, border=0, ln=1)
+    pdf.set_font("Helvetica", "", 6.5)
+    pdf.set_text_color(*SLATE)
+    pdf.set_xy(x + 3, y + 8.2)
+    pdf.cell(w - 6, 4, label.upper(), border=0, ln=1)
+    pdf.set_text_color(0, 0, 0)
 
 
 class _Report(FPDF):
@@ -105,9 +283,14 @@ class _Report(FPDF):
         self.set_y(-15)
         self.set_font("Helvetica", "I", 7)
         self.set_text_color(*GREY)
-        self.cell(0, 6, "CONFIDENTIAL", border=0, ln=0, align="L")
-        self.cell(0, 6, f"Page {self.page_no()} of {{nb}}", border=0, ln=0, align="C")
-        self.cell(0, 6, f"hash {self.snapshot_hash[:12]}", border=0, ln=1, align="R")
+        # Explicit thirds, not `w=0`. A zero width means "run to the right
+        # margin", so all three cells started at the right margin and printed
+        # on top of each other — the shipped samples read "hashRage2 of 4".
+        # Pre-existing, and every page of this report carries it.
+        third = (self.w - self.l_margin - self.r_margin) / 3
+        self.cell(third, 6, "CONFIDENTIAL", border=0, ln=0, align="L")
+        self.cell(third, 6, f"Page {self.page_no()} of {{nb}}", border=0, ln=0, align="C")
+        self.cell(third, 6, f"hash {self.snapshot_hash[:12]}", border=0, ln=1, align="R")
 
 
 def _h(pdf: _Report, text: str):
@@ -162,6 +345,279 @@ def _dt(value: str | None, *, with_time: bool = True) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     local = dt.astimezone(REPORT_TZ)
     return local.strftime("%d %b %Y, %H:%M " + REPORT_TZ_LABEL) if with_time else local.strftime("%d %b %Y")
+
+
+def _sub(pdf: _Report, text: str) -> None:
+    """Sub-heading inside a numbered section — deliberately NOT `_h`, which
+    would consume a section number and renumber the whole document."""
+    _room(pdf, 12)
+    pdf.set_font("Helvetica", "B", 8.5)
+    pdf.set_text_color(*SLATE)
+    pdf.set_x(10)
+    pdf.cell(0, 5, text.upper(), border=0, ln=1)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(1)
+
+
+def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
+    """Section 1 — the insight layer, read off the frozen snapshot.
+
+    Renders `snapshot["insights"]` and computes NOTHING: the block was built by
+    `services/insights/rules_audit_report` at issue and hashed into the
+    snapshot, so this page says the same thing every time it is regenerated,
+    for as long as the report exists. A report frozen before the insight layer
+    shipped has no block and simply skips the section — an immutable snapshot
+    cannot be backfilled, and a reconstructed insight would be a claim about a
+    reading nobody actually took.
+    """
+    ins = snap.get("insights") or {}
+    if not ins:
+        return
+
+    pdf.add_page()
+    _h(pdf, "Insight Summary")
+
+    # ── The gate, stated as a banner rather than buried in prose ──────────
+    banner = ins.get("criticalBanner") or {}
+    if banner.get("headline"):
+        _banner(pdf, banner["headline"], RED, RED_TINT)
+        codes = ", ".join(banner.get("codes") or [])
+        if codes:
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(*SLATE)
+            pdf.set_x(14)
+            pdf.multi_cell(186, 4, _s(f"Critical non-conformances: {codes}"))
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(2)
+
+    # ── Gauge + headline counts ───────────────────────────────────────────
+    g = ins.get("gauge") or {}
+    _room(pdf, 46)
+    top = pdf.get_y()
+    band = str(g.get("displayBand") or "neutral")
+    ink = _BAND_INK.get(band, GREY)
+
+    cx, cy, r = 32.0, top + 19.0, 17.0
+    _donut(pdf, cx, cy, r, g.get("pct"), ink)
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.set_text_color(*ink)
+    pdf.set_xy(cx - r, cy - 6.5)
+    pdf.cell(r * 2, 7, f"{g.get('pct')}%" if g.get("pct") is not None else "n/a",
+             border=0, ln=1, align="C")
+    pdf.set_font("Helvetica", "B", 6)
+    pdf.set_text_color(*SLATE)
+    pdf.set_xy(cx - r, cy + 0.8)
+    pdf.cell(r * 2, 4, "OVERALL", border=0, ln=1, align="C")
+    # The verdict word, under the dial — the dial is the picture, this is the
+    # result, and the result is the one a reader must not have to infer.
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_text_color(*ink)
+    pdf.set_xy(10, top + 38)
+    pdf.cell(44, 4, str(g.get("result") or "-").replace("_", " "), border=0, ln=1, align="C")
+    pdf.set_text_color(0, 0, 0)
+
+    capa = ins.get("capaStrip") or {}
+    repeats = ins.get("repeats") or {}
+    stats = [
+        ("Assessed", f"{snap.get('checkpointsAssessed', 0)}/{snap.get('checkpointsTotal', 0)}", INK),
+        ("Critical NC", str(snap.get("criticalFailures", 0)),
+         RED if snap.get("criticalFailures") else INK),
+        ("Major NC", str(snap.get("majorFailures", 0)),
+         AMBER if snap.get("majorFailures") else INK),
+        ("Repeat NC", str(repeats.get("count", 0)),
+         RED if repeats.get("count") else INK),
+        ("CAPAs open", f"{capa.get('open', 0)}/{capa.get('total', 0)}",
+         AMBER if capa.get("open") else INK),
+        ("CAPAs overdue", str(capa.get("overdue", 0)),
+         RED if capa.get("overdue") else INK),
+    ]
+    sx, sw, gap = 58.0, 45.3, 1.5
+    for i, (label, value, tone) in enumerate(stats):
+        col, row = i % 3, i // 3
+        _stat(pdf, sx + col * (sw + gap), top + row * 16, sw, label, value, tone)
+
+    pdf.set_y(top + 42)
+
+    # The rule behind the verdict. A number without its rule is not a result —
+    # and this is the same `gate.explanation` the cover prints, not a restatement.
+    if g.get("explanation"):
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*SLATE)
+        pdf.set_x(10)
+        pdf.multi_cell(190, 4, _s(g["explanation"]))
+        pdf.set_text_color(0, 0, 0)
+    if g.get("coverageLabel"):
+        pdf.set_font("Helvetica", "I", 7.5)
+        pdf.set_text_color(*GREY)
+        pdf.set_x(10)
+        pdf.multi_cell(190, 4, _s(
+            f"{g['coverageLabel']} — no overall grade is issued for this report."))
+        pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+
+    # ── Compliance by discipline ──────────────────────────────────────────
+    chart = [c for c in (ins.get("categoryChart") or []) if c.get("total")]
+    if chart:
+        _room(pdf, 12 + min(len(chart), 3) * 5.6)
+        _sub(pdf, "Compliance by discipline")
+        for c in chart[:14]:
+            _room(pdf, 9)
+            y = pdf.get_y()
+            pct = c.get("pct")
+            c_ink = _BAND_INK.get(str(c.get("band") or "neutral"), GREY)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*INK)
+            pdf.set_xy(10, y)
+            pdf.cell(48, 4.5, _s(str(c.get("name"))[:32]), border=0, ln=0)
+            _hbar(pdf, 60, y + 1.1, 100, 2.6, pct, c_ink)
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(*c_ink)
+            pdf.set_xy(162, y)
+            pdf.cell(14, 4.5, f"{pct}%" if pct is not None else "n/a", border=0, ln=0, align="R")
+            pdf.set_font("Helvetica", "", 7)
+            pdf.set_text_color(*SLATE)
+            pdf.set_xy(178, y)
+            pdf.cell(22, 4.5, f"{c.get('passed', 0)}P {c.get('failed', 0)}F / {c.get('total', 0)}",
+                     border=0, ln=1, align="R")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_y(y + 5.6)
+        pdf.ln(2)
+
+    # ── Systemic patterns ─────────────────────────────────────────────────
+    patterns = ins.get("patterns") or []
+    if patterns:
+        _room(pdf, 26)
+        _sub(pdf, "Systemic patterns")
+        for p in patterns:
+            sev = str(p.get("severity") or "info")
+            p_ink = {"critical": RED, "high": AMBER, "watch": VIOLET}.get(sev, SLATE)
+            # Measure BOTH the headline and the body before drawing the card
+            # ground: the rectangle is painted first, so an under-measured
+            # height shows as text spilling past its own background. Headlines
+            # are capped at 90 chars by `templates.fill` and wrap to one line in
+            # practice, but measuring costs nothing and does not assume that.
+            pdf.set_font("Helvetica", "B", 8.5)
+            head_h = len(pdf.multi_cell(184, 4.4, _s(p.get("headline") or ""),
+                                        dry_run=True, output="LINES"))
+            pdf.set_font("Helvetica", "", 7.5)
+            body_h = len(pdf.multi_cell(178, 4, _s(p.get("evidence") or ""), dry_run=True,
+                                        output="LINES"))
+            action_h = 0
+            if p.get("suggestedAction"):
+                pdf.set_font("Helvetica", "I", 7.5)
+                action_h = len(pdf.multi_cell(178, 4, _s(f"-> {p['suggestedAction']}"),
+                                              dry_run=True, output="LINES")) * 4
+            need = 3.2 + head_h * 4.4 + body_h * 4 + action_h
+            _room(pdf, need + 3)
+            y = pdf.get_y()
+            pdf.set_fill_color(250, 250, 252)
+            pdf.rect(10, y, 190, need, style="F")
+            pdf.set_fill_color(*p_ink)
+            pdf.rect(10, y, 1.6, need, style="F")
+
+            pdf.set_font("Helvetica", "B", 8.5)
+            pdf.set_text_color(*p_ink)
+            pdf.set_xy(14, y + 1.6)
+            pdf.multi_cell(184, 4.4, _s(p.get("headline") or ""))
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(*SLATE)
+            pdf.set_x(14)
+            pdf.multi_cell(178, 4, _s(p.get("evidence") or ""))
+            if p.get("suggestedAction"):
+                pdf.set_font("Helvetica", "I", 7.5)
+                pdf.set_text_color(*VIOLET)
+                pdf.set_x(14)
+                pdf.multi_cell(178, 4, _s(f"-> {p['suggestedAction']}"))
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_y(y + need + 2)
+        pdf.ln(1)
+    elif ins.get("patternNote"):
+        # Say why there is nothing here. A silent gap where patterns should be
+        # reads as a rendering failure; "not enough findings to infer from" is
+        # a finding of its own.
+        pdf.set_font("Helvetica", "I", 7.5)
+        pdf.set_text_color(*GREY)
+        pdf.set_x(10)
+        pdf.multi_cell(190, 4, _s(ins["patternNote"]))
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    # ── Repeat non-conformances ───────────────────────────────────────────
+    if repeats.get("count"):
+        _banner(pdf, repeats["headline"], RED, RED_TINT, height=9)
+        for it in repeats.get("items") or []:
+            _room(pdf, 10)
+            pdf.set_font("Helvetica", "B", 7.5)
+            pdf.set_text_color(*RED)
+            pdf.set_x(14)
+            pdf.multi_cell(186, 4, _s(
+                f"{it.get('checkpointCode')}   {it.get('statusLabel')}"
+                f"   -   {it.get('discipline')}"
+                + (f"   -   CAPA {it['capaNumber']}" if it.get("capaNumber") else "")))
+            pdf.set_font("Helvetica", "", 7.5)
+            pdf.set_text_color(*INK)
+            pdf.set_x(16)
+            pdf.multi_cell(184, 4, _s(str(it.get("question") or "-")))
+            if it.get("observation"):
+                pdf.set_font("Helvetica", "I", 7)
+                pdf.set_text_color(*SLATE)
+                pdf.set_x(16)
+                pdf.multi_cell(184, 3.8, _s(str(it["observation"])))
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1.5)
+        if repeats.get("truncated"):
+            pdf.set_font("Helvetica", "I", 7)
+            pdf.set_text_color(*GREY)
+            pdf.set_x(14)
+            pdf.multi_cell(186, 4, _s(
+                f"{repeats['truncated']} further repeat finding(s) appear in the findings "
+                "register below."))
+            pdf.set_text_color(0, 0, 0)
+        pdf.ln(1)
+
+    # ── CAPA status strip ─────────────────────────────────────────────────
+    chips = capa.get("chips") or []
+    if chips:
+        # Reserve the heading AND the chips together — `_sub` would otherwise
+        # fit at the foot of a page and leave "CAPA STATUS" stranded over
+        # nothing, which reads as a chart that failed to render.
+        _room(pdf, 12 + (len(chips) // 4 + 1) * 6)
+        _sub(pdf, "CAPA status")
+        x, y = 10.0, pdf.get_y()
+        for c in chips:
+            status = str(c.get("status") or "OPEN").upper()
+            closed = status in ("CLOSED", "VERIFIED", "CLOSED_RECURRED")
+            c_ink, c_tint = (GREEN, GREEN_TINT) if closed else (AMBER, AMBER_TINT)
+            label = f"{c.get('capaNumber')}  {c.get('checkpointCode')}  {status.title()}"
+            pdf.set_font("Helvetica", "B", 6.5)
+            w = pdf.get_string_width(_s(label)) + 3.6
+            if x + w > 200:
+                x, y = 10.0, y + 6.0
+                _room(pdf, 8)
+            _chip(pdf, x, y, label, c_ink, c_tint)
+            x += w + 2
+        pdf.set_y(y + 8)
+        if capa.get("truncated"):
+            pdf.set_font("Helvetica", "I", 7)
+            pdf.set_text_color(*GREY)
+            pdf.set_x(10)
+            pdf.multi_cell(190, 4, _s(
+                f"{capa['truncated']} further linked CAPA(s) — the full list is in the CAPA "
+                "summary and findings register below."))
+            pdf.set_text_color(0, 0, 0)
+
+    # The provenance of this page, stated where it is read. Without it a reader
+    # cannot tell a computed summary from an auditor's written opinion, and the
+    # difference matters to whoever has to defend the report.
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "I", 6.5)
+    pdf.set_text_color(*GREY)
+    pdf.set_x(10)
+    pdf.multi_cell(190, 3.6, _s(
+        "This summary is computed by fixed rules from the findings recorded below and was "
+        "frozen into this report at issue. It re-presents the register; it does not add to it. "
+        "No judgement here overrides the auditor's."))
+    pdf.set_text_color(0, 0, 0)
 
 
 def render_audit_report_pdf(
@@ -261,8 +717,18 @@ def render_audit_report_pdf(
             pdf.multi_cell(0, 5, _s(gate["explanation"]))
     pdf.set_text_color(0, 0, 0)
 
+    # ── Insight summary (Section 1) ──
+    # Placed immediately after the cover, ahead of the Executive Summary: the
+    # register below is the record, but a reader who only gets one page should
+    # get the one that says what the audit found.
+    _insight_summary(pdf, snap)
+
     # ── Executive summary ──
-    pdf.add_page()
+    # Flows on from the insight summary rather than forcing a page break. It
+    # used to break because it followed the cover; now that Section 1 precedes
+    # it, a forced break stranded the CAPA strip alone on a near-empty page.
+    _room(pdf, 40)
+    pdf.ln(2)
     _h(pdf, "Executive Summary")
     pdf.set_x(10)
     # "Open iterations" counts findings awaiting a response. It used to be
@@ -393,20 +859,66 @@ def render_audit_report_pdf(
     scored = [c for c in cats if _cat_pct(c) is not None]
     if scored:
         _h(pdf, "Category-wise Compliance")
-        pdf.set_font("Helvetica", "B", 9)
+        # Charted, then tabulated. The chart is what a reader scans; the table
+        # is what an assessor cites. Neither is a summary of the other — they
+        # are the same numbers twice, so removing the table to make room for the
+        # chart would have cost data for presentation.
+        chart = [c for c in ((snap.get("insights") or {}).get("categoryChart") or [])
+                 if c.get("total")]
+        if chart:
+            for c in chart[:20]:
+                _room(pdf, 9)
+                y = pdf.get_y()
+                pct = c.get("pct")
+                c_ink = _BAND_INK.get(str(c.get("band") or "neutral"), GREY)
+                pdf.set_font("Helvetica", "", 8.5)
+                pdf.set_text_color(*INK)
+                pdf.set_xy(10, y)
+                pdf.cell(52, 5, _s(str(c.get("name"))[:34]), border=0, ln=0)
+                _hbar(pdf, 64, y + 1.3, 96, 3.0, pct, c_ink)
+                pdf.set_font("Helvetica", "B", 8.5)
+                pdf.set_text_color(*c_ink)
+                pdf.set_xy(162, y)
+                pdf.cell(16, 5, f"{pct}%" if pct is not None else "n/a", border=0, ln=0, align="R")
+                pdf.set_font("Helvetica", "", 7)
+                pdf.set_text_color(*SLATE)
+                pdf.set_xy(180, y)
+                pdf.cell(20, 5, f"{c.get('assessed', 0)}/{c.get('total', 0)}",
+                         border=0, ln=1, align="R")
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_y(y + 6.2)
+            pdf.ln(2)
+            _sub(pdf, "Underlying figures")
+
+        _room(pdf, 14)
+        pdf.set_font("Helvetica", "B", 8)
         pdf.set_fill_color(*LIGHT)
-        pdf.cell(120, 7, "Category", border=1, ln=0, fill=True)
-        pdf.cell(30, 7, "Assessed", border=1, ln=0, fill=True, align="C")
-        pdf.cell(30, 7, "Score %", border=1, ln=1, fill=True, align="C")
-        pdf.set_font("Helvetica", "", 9)
+        for w, t, al in ((84, "Category", "L"), (18, "Pass", "C"), (18, "Partial", "C"),
+                         (18, "Fail", "C"), (18, "N/A", "C"), (16, "Assessed", "C"),
+                         (18, "Score %", "C")):
+            pdf.cell(w, 6, t, border=1, ln=0, fill=True, align=al)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 8)
         for c in scored[:30]:
-            name = str(c.get("category_name") or c.get("category") or c.get("name") or "-")[:52]
+            _room(pdf, 8)
+            name = str(c.get("category_name") or c.get("category") or c.get("name") or "-")[:46]
             sc = _cat_pct(c)
             done = (c.get("passed", 0) or 0) + (c.get("partial", 0) or 0) + (c.get("failed", 0) or 0)
-            pdf.cell(120, 6, name, border=1, ln=0)
-            pdf.cell(30, 6, f"{done} of {c.get('total', done)}", border=1, ln=0, align="C")
-            pdf.set_text_color(*_rag(sc))
-            pdf.cell(30, 6, f"{sc}", border=1, ln=1, align="C")
+            pdf.cell(84, 5.5, name, border=1, ln=0)
+            pdf.cell(18, 5.5, str(c.get("passed", 0) or 0), border=1, ln=0, align="C")
+            pdf.cell(18, 5.5, str(c.get("partial", 0) or 0), border=1, ln=0, align="C")
+            fail = c.get("failed", 0) or 0
+            pdf.set_text_color(*(RED if fail else GREY))
+            pdf.cell(18, 5.5, str(fail), border=1, ln=0, align="C")
+            pdf.set_text_color(0, 0, 0)
+            pdf.cell(18, 5.5, str(c.get("na", 0) or 0), border=1, ln=0, align="C")
+            pdf.cell(16, 5.5, f"{done}/{c.get('total', done)}", border=1, ln=0, align="C")
+            # Coloured by the SAME band the bar above used, read off the frozen
+            # insight block — two colour scales for one number is a defect.
+            _b = next((x.get("band") for x in chart
+                       if x.get("name") == (c.get("category_name") or c.get("category"))), None)
+            pdf.set_text_color(*_BAND_INK.get(str(_b), _rag(sc)))
+            pdf.cell(18, 5.5, f"{sc}", border=1, ln=1, align="C")
             pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
     elif cats:
@@ -424,69 +936,119 @@ def render_audit_report_pdf(
     if not findings:
         pdf.cell(0, 6, "No findings recorded.", border=0, ln=1)
     else:
-        # One block per finding.
+        # Grouped by severity, worst tier first, then in the order the snapshot
+        # froze them (category × sequence). The old flat list made a reader scan
+        # 39 rows to find the two that fail the audit.
         #
-        # This section used to print "[major]  -" and a bare "-" for every row.
-        # It read `standardClauseRef`/`clause` and `title`/`description`, none of
-        # which the snapshot has ever produced — `_build_report_snapshot` writes
-        # `standard`, `requirementReference`, `question` and `observation`. Four
-        # key names, zero matches, so every finding rendered as two dashes and
-        # the register was worthless. The keys below are the ones the snapshot
-        # actually emits; the legacy names are kept as fallbacks so an old
-        # stored snapshot still renders.
+        # An unrecognised severity does NOT vanish into a default bucket — it
+        # gets its own group under its own name, so a value the grading
+        # vocabulary grows later still prints rather than silently disappearing
+        # from the register.
+        _by_sev: dict[str, list[dict[str, Any]]] = {}
         for f in findings:
-            sev = str(f.get("severity") or "-")
-            code_ = str(f.get("checkpointCode") or "-")
-            disc = str(f.get("discipline") or "")
-            result = str(f.get("assessmentStatus") or "")
-            adverse = "CRIT" in sev.upper() or "MAJOR" in sev.upper() or result == "FAIL"
+            _by_sev.setdefault(str(f.get("severity") or "unspecified").lower(), []).append(f)
+        _groups = [(s, _by_sev.pop(s)) for s in _SEV_ORDER if s in _by_sev]
+        _groups += sorted(_by_sev.items())
 
-            pdf.set_x(10)
+        # State icons. The register is FAIL/PARTIAL in every audit seen so far
+        # (PASS/NA rows raise no finding), but the map is keyed off whatever the
+        # row carries rather than assuming that — a data model that starts
+        # emitting a PASS finding must print it, not drop it.
+        _STATE_MARK = {"FAIL": "X", "PARTIAL": "!", "PASS": "OK", "NA": "-",
+                       "NOT_ASSESSED": "?"}
+        _STATE_INK = {"FAIL": RED, "PARTIAL": AMBER, "PASS": GREEN, "NA": GREY,
+                      "NOT_ASSESSED": GREY}
+
+        for _sev, _items in _groups:
+            _sev_ink, _sev_tint = _SEV_STYLE.get(_sev, (SLATE, LIGHT))
+            # Room for the band AND the first card under it — a severity band
+            # alone at the foot of a page reads as an empty group.
+            _room(pdf, 32)
+            _y = pdf.get_y()
+            pdf.set_fill_color(*_sev_tint)
+            pdf.rect(10, _y, 190, 6.5, style="F")
+            pdf.set_fill_color(*_sev_ink)
+            pdf.rect(10, _y, 1.8, 6.5, style="F")
             pdf.set_font("Helvetica", "B", 8.5)
-            pdf.set_text_color(*(RED if adverse else AMBER))
-            head = f"{code_}   [{sev[:16]}]"
-            if result:
-                head += f"   {result}"
-            if disc:
-                head += f"   -   {disc}"
-            pdf.multi_cell(190, 5, _s(head), border=0)
+            pdf.set_text_color(*_sev_ink)
+            pdf.set_xy(14, _y + 1)
+            pdf.cell(184, 4.5,
+                     _s(f"{_sev.upper()}  -  {len(_items)} finding(s)"), border=0, ln=1)
             pdf.set_text_color(0, 0, 0)
+            pdf.set_y(_y + 8)
 
-            # The requirement being assessed.
-            pdf.set_font("Helvetica", "", 8)
-            pdf.set_x(10)
-            pdf.multi_cell(190, 4.5, _s(f.get("question") or f.get("title") or f.get("description") or "-"), border=0)
-
-            # What the auditor actually saw. Without this the "finding" is only
-            # a question with a verdict attached, which is not a finding.
-            obs = (f.get("observation") or "").strip()
-            pdf.set_font("Helvetica", "I", 8)
-            pdf.set_text_color(*GREY)
-            pdf.set_x(12)
-            pdf.multi_cell(188, 4.5, _s(f"Observation: {obs or 'None recorded.'}"), border=0)
-
-            meta = []
-            std = f.get("standard") or f.get("standardClauseRef") or f.get("clause")
-            ref = f.get("requirementReference")
-            if std:
-                meta.append(f"Standard: {std}")
-            if ref:
-                meta.append(f"Clause: {ref}")
-            if f.get("workflowState"):
-                meta.append(f"State: {_human(f.get('workflowState'))} (round {f.get('round', 0)})")
-            owner = _who(f.get("ownerId"), user_names)
-            if owner:
-                meta.append(f"Owner: {owner}")
-            if f.get("capaNumber"):
-                meta.append(f"CAPA: {f['capaNumber']} ({f.get('capaStatus') or 'open'})")
-            if f.get("isAdHoc"):
-                meta.append("Ad-hoc checkpoint")
-            if meta:
-                pdf.set_font("Helvetica", "", 7.5)
+            for f in _items:
+                _room(pdf, 22)
+                result = str(f.get("assessmentStatus") or "")
+                _r_ink = _STATE_INK.get(result, GREY)
+                # Header line: state mark, code, category, owner, CAPA.
+                pdf.set_font("Helvetica", "B", 8)
+                pdf.set_text_color(*_r_ink)
                 pdf.set_x(12)
-                pdf.multi_cell(188, 4, _s("   |   ".join(meta)), border=0)
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(2)
+                _head = f"[{_STATE_MARK.get(result, '?')}] {f.get('checkpointCode') or '-'}"
+                pdf.cell(38, 4.6, _s(_head), border=0, ln=0)
+                pdf.set_font("Helvetica", "", 7.5)
+                pdf.set_text_color(*SLATE)
+                _bits = [str(f.get("discipline") or "")]
+                _owner = _who(f.get("ownerId"), user_names)
+                if _owner:
+                    _bits.append(f"Owner: {_owner}")
+                if f.get("capaNumber"):
+                    _bits.append(f"CAPA {f['capaNumber']} ({f.get('capaStatus') or 'open'})")
+                if f.get("isRepeat"):
+                    _bits.append("REPEAT")
+                if f.get("isAdHoc"):
+                    _bits.append("ad-hoc")
+                pdf.cell(150, 4.6, _s("   |   ".join(b for b in _bits if b)), border=0, ln=1)
+                pdf.set_text_color(0, 0, 0)
+
+                # The requirement being assessed.
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_x(12)
+                pdf.multi_cell(188, 4.4, _s(
+                    f.get("question") or f.get("title") or f.get("description") or "-"))
+
+                # What the auditor actually saw. Without this the "finding" is
+                # only a question with a verdict attached, which is not a
+                # finding. Kept in full — the redesign re-lays it out, it does
+                # not abridge it.
+                obs = (f.get("observation") or "").strip()
+                pdf.set_font("Helvetica", "I", 7.5)
+                pdf.set_text_color(*GREY)
+                pdf.set_x(14)
+                pdf.multi_cell(186, 4.2, _s(f"Observation: {obs or 'None recorded.'}"))
+
+                meta = []
+                std = f.get("standard") or f.get("standardClauseRef") or f.get("clause")
+                if std:
+                    meta.append(f"Standard: {std}")
+                if f.get("requirementReference"):
+                    meta.append(f"Clause: {f['requirementReference']}")
+                if f.get("requirementType"):
+                    meta.append(f"Type: {_human(f.get('requirementType'))}")
+                if f.get("gradeAwarded"):
+                    _pts = ""
+                    if f.get("scoreObtained") is not None and f.get("scoreAllotted") is not None:
+                        _pts = f" {f['scoreObtained']}/{f['scoreAllotted']}"
+                    meta.append(f"Grade: {_human(f.get('gradeAwarded'))}{_pts}")
+                if f.get("complianceStatus"):
+                    meta.append(f"Status: {_human(f.get('complianceStatus'))}")
+                if f.get("riskGrade"):
+                    meta.append(f"Risk: {_human(f.get('riskGrade'))}")
+                if f.get("workflowState"):
+                    meta.append(
+                        f"State: {_human(f.get('workflowState'))} (round {f.get('round', 0)})")
+                if meta:
+                    pdf.set_font("Helvetica", "", 7)
+                    pdf.set_text_color(*SLATE)
+                    pdf.set_x(14)
+                    pdf.multi_cell(186, 3.8, _s("   |   ".join(meta)))
+                pdf.set_text_color(0, 0, 0)
+                pdf.set_draw_color(*HAIRLINE)
+                pdf.line(12, pdf.get_y() + 1, 200, pdf.get_y() + 1)
+                pdf.ln(3)
+            pdf.ln(1)
+
     pdf.ln(3)
 
     # ── CAPA summary ──
