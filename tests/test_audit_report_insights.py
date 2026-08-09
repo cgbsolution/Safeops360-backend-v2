@@ -45,9 +45,33 @@ def _finding(code, *, severity="major", status="FAIL", discipline="EHS", owner="
     }
 
 
+# Categories carry the POINTS score the product is scored on — three points per
+# assessed checkpoint, N/A allotted nothing. The pass-ratio numbers these would
+# produce are deliberately DIFFERENT (see
+# `test_category_chart_uses_points_not_the_pass_ratio`) so a regression back to
+# the ratio cannot pass silently.
+_CATEGORIES = [
+    # 39 assessed x 3 = 117 allotted; 102 earned -> 87.2%. Pass-ratio would say
+    # (31 + 0.5*6) / 39 = 87.2% too — so EHS alone cannot distinguish them.
+    {"category_id": "EHS", "category_name": "EHS", "total": 40,
+     "passed": 31, "partial": 6, "failed": 2, "na": 1,
+     "score_obtained": 102, "score_allotted": 117, "score_pct": 87.2},
+    # Nothing assessed: no points allotted at all -> no score, neutral bar.
+    {"category_id": "HR", "category_name": "HR", "total": 10,
+     "passed": 0, "partial": 0, "failed": 0, "na": 10,
+     "score_obtained": 0, "score_allotted": 0, "score_pct": 0.0},
+    # 112/117 = 95.7% on points; the pass-ratio would say (38 + 0.5)/39 = 98.7%.
+    # That gap is the regression guard.
+    {"category_id": "PR", "category_name": "PRODUCTION", "total": 40,
+     "passed": 38, "partial": 1, "failed": 0, "na": 1,
+     "score_obtained": 112, "score_allotted": 117, "score_pct": 95.7},
+]
+
+
 def _snapshot(findings, *, critical=0, pct=88.0, show_grade=True, passed=False):
     return {
         "overallScorePct": pct, "overallResult": "CRITICAL_NC" if critical else "MAJOR_NC",
+        "scoreObtained": 214, "scoreAllotted": 234,
         "criticalFailures": critical, "majorFailures": len(findings), "minorFailures": 0,
         "checkpointsTotal": 120, "checkpointsAssessed": 120,
         "grade": {"showGrade": show_grade, "assessed": 117, "applicable": 117,
@@ -55,14 +79,7 @@ def _snapshot(findings, *, critical=0, pct=88.0, show_grade=True, passed=False):
         "gate": {"band": "CRITICAL_NC", "passed": passed, "explanation": "Gate sentence.",
                  "rules": {}},
         "capaSummary": {"total": 2, "open": 1, "overdue": 1},
-        "disciplineRag": [
-            {"categoryId": "EHS", "categoryName": "EHS", "pct": 87.2, "total": 40,
-             "passed": 31, "partial": 6, "failed": 2, "na": 1},
-            {"categoryId": "HR", "categoryName": "HR", "pct": None, "total": 10,
-             "passed": 0, "partial": 0, "failed": 0, "na": 10},
-            {"categoryId": "PR", "categoryName": "PRODUCTION", "pct": 96.0, "total": 40,
-             "passed": 38, "partial": 1, "failed": 0, "na": 1},
-        ],
+        "categoryScores": [dict(c) for c in _CATEGORIES],
         "findings": findings,
     }
 
@@ -298,6 +315,8 @@ def test_pattern_list_is_capped_and_says_how_many_it_dropped():
 def test_unassessed_discipline_charts_as_neutral_never_as_a_red_zero():
     chart = compute_report_insights(_snapshot(_many()))["categoryChart"]
     hr = next(c for c in chart if c["name"] == "HR")
+    # score_pct is a literal 0.0 on this row; charting it would print a red 0%
+    # for a discipline nobody assessed. Zero allotted points means no score.
     assert hr["pct"] is None and hr["band"] == "neutral"
     # …and it sorts LAST, not first: absent is not "worst".
     assert chart[-1]["name"] == "HR"
@@ -306,6 +325,44 @@ def test_unassessed_discipline_charts_as_neutral_never_as_a_red_zero():
 def test_category_chart_is_worst_first():
     chart = compute_report_insights(_snapshot(_many()))["categoryChart"]
     assert [c["name"] for c in chart] == ["EHS", "PRODUCTION", "HR"]
+
+
+def test_category_chart_uses_points_not_the_pass_ratio():
+    """The chart must report the same formula as the headline percentage.
+
+    Both formulas have always been computed and frozen into every snapshot, so
+    reaching for the wrong key is a one-word mistake that renders a second,
+    contradictory number for the same discipline — Production printed 85.0% on
+    the bar and 88.3% in the table directly beneath it. This pins the choice.
+    """
+    chart = compute_report_insights(_snapshot(_many()))["categoryChart"]
+    pr = next(c for c in chart if c["name"] == "PRODUCTION")
+
+    assert pr["pct"] == 95.7                        # points: 112 / 117
+    ratio = (pr["passed"] + 0.5 * pr["partial"]) / pr["assessed"] * 100
+    assert round(ratio, 1) == 98.7                  # the superseded formula
+    assert pr["pct"] != round(ratio, 1)
+
+
+def test_category_chart_carries_the_arithmetic_behind_each_percentage():
+    # A percentage a reader cannot check is a percentage they must trust.
+    pr = next(c for c in compute_report_insights(_snapshot(_many()))["categoryChart"]
+              if c["name"] == "PRODUCTION")
+    assert (pr["scoreObtained"], pr["scoreAllotted"]) == (112, 117)
+    assert round(pr["scoreObtained"] / pr["scoreAllotted"] * 100, 1) == pr["pct"]
+
+
+def test_gauge_carries_the_arithmetic_behind_the_headline():
+    g = compute_report_insights(_snapshot(_many()))["gauge"]
+    assert (g["scoreObtained"], g["scoreAllotted"]) == (214, 234)
+
+
+def test_full_outcome_split_is_available_to_renderers():
+    # The count line used to print pass and fail only, so it never summed to the
+    # total even though partials earn points toward the percentage beside it.
+    ehs = next(c for c in compute_report_insights(_snapshot(_many()))["categoryChart"]
+               if c["name"] == "EHS")
+    assert ehs["passed"] + ehs["partial"] + ehs["failed"] + ehs["na"] == ehs["total"]
 
 
 def test_capa_strip_totals_come_from_the_capa_summary_not_a_recount():

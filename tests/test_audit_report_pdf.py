@@ -87,12 +87,21 @@ def _fixture():
                 "riskGrade": "HIGH", "isRepeat": repeat,
             })
 
+    # Points, the way the product scores: 3 per assessed checkpoint, N/A allotted
+    # nothing, a repeat penalised at -1. The fixture must carry real allotments —
+    # without them every bar renders "n/a" and a chart regression walks straight
+    # through the suite.
     rag = []
     for d in DISCIPLINES:
         c = cat[d]
         a = c["passed"] + c["partial"] + c["failed"]
+        allotted = a * 3
+        obtained = c["passed"] * 3 + c["partial"] * 2 + c["failed"] * 0
+        if d == "PRODUCTION":
+            obtained -= 1  # PI-PR-002 is a repeat: -1 rather than 0
         rag.append({"categoryId": d, "categoryName": d,
-                    "pct": round((c["passed"] + 0.5 * c["partial"]) / a * 100, 1) if a else None,
+                    "score_obtained": obtained, "score_allotted": allotted,
+                    "pct": round(obtained / allotted * 100, 1) if allotted else None,
                     **c})
 
     snap = {
@@ -110,9 +119,12 @@ def _fixture():
         "criticalFailures": 2, "majorFailures": len(findings) - 2, "minorFailures": 0,
         "openIterationsCount": 0, "criticalOpenCount": 0, "notAssessedCount": 0, "adHocCount": 0,
         "disciplineRag": rag,
+        "scoreObtained": sum(r["score_obtained"] for r in rag),
+        "scoreAllotted": sum(r["score_allotted"] for r in rag),
         "categoryScores": [{"category_id": r["categoryId"], "category_name": r["categoryName"],
-                            "score_pct": r["pct"], **{k: r[k] for k in
-                                                      ("passed", "partial", "failed", "na", "total")}}
+                            "score_pct": r["pct"],
+                            **{k: r[k] for k in ("passed", "partial", "failed", "na", "total",
+                                                 "score_obtained", "score_allotted")}}
                            for r in rag],
         "capaSummary": {"total": 2, "open": 2, "overdue": 1},
         "findings": findings, "openIterations": [],
@@ -235,6 +247,109 @@ def test_category_figures_are_charted_without_losing_the_table():
     # Every discipline's raw counts survive alongside the bars.
     for d in DISCIPLINES:
         assert d in text
+
+
+def test_every_category_percentage_on_the_page_is_the_same_number():
+    """The bar and the table beneath it must not disagree.
+
+    This is the defect verbatim: Section 6 printed Production at 85.0% on the
+    bar and 88.3% in its own table three centimetres below, because the two
+    read different keys computed by different formulas. Both now read points,
+    so each discipline's percentage may appear only once as a value.
+    """
+    snap, register = _fixture()
+    text = re.sub(r"[ \t]+", " ", _text(_render(snap, register)))
+
+    points = {c["score_pct"] for c in snap["categoryScores"]}
+    for c in snap["categoryScores"]:
+        assert f"{c['score_pct']}%" in text, (
+            f"{c['category_name']}: charted percentage {c['score_pct']}% missing")
+
+    # Any pass-ratio value that is not ALSO some category's points score must be
+    # absent. Set-based because two categories can legitimately collide on a
+    # value — in this fixture EHS scores 92.3% on points, which is exactly HR's
+    # pass-ratio, and a per-row check would read that coincidence as a failure.
+    for c in snap["categoryScores"]:
+        assessed = c["passed"] + c["partial"] + c["failed"]
+        ratio = round((c["passed"] + 0.5 * c["partial"]) / assessed * 100, 1)
+        if ratio not in points:
+            assert f"{ratio}%" not in text, (
+                f"{c['category_name']}: superseded pass-ratio {ratio}% still rendered")
+
+
+def test_score_arithmetic_is_printed_so_a_reader_can_check_it():
+    snap, register = _fixture()
+    text = re.sub(r"[ \t]+", " ", _text(_render(snap, register)))
+    # Headline: "311 of 357 points" under the dial.
+    assert f"{snap['scoreObtained']} of {snap['scoreAllotted']} points" in text
+    # Per category: "106/120 pts" on the bar and "106/120" in the Points column.
+    for c in snap["categoryScores"]:
+        assert f"{c['score_obtained']}/{c['score_allotted']}" in text
+    # And the one sentence that says what the percentage means.
+    assert "points earned / points available" in text
+    assert "repeat finding -1" in text
+
+
+def test_partial_count_is_no_longer_hidden_from_the_summary_line():
+    # "32P 4F / 40" omitted Partial entirely, so the counts never summed to the
+    # total even though partials earn points toward the percentage beside them.
+    snap, register = _fixture()
+    text = re.sub(r"[ \t]+", " ", _text(_render(snap, register)))
+    c = next(c for c in snap["categoryScores"] if c["category_name"] == "PRODUCTION")
+    assert f"{c['passed']}P {c['partial']}Pa {c['failed']}F" in text
+
+
+# ─── sign-off prints the record, or says what is missing ────────────────────
+
+_SIGNS = [
+    {"role": "LEAD_AUDITOR", "userId": "u_lead", "name": "S. Krishnan",
+     "designation": "HSE Manager", "disciplineCode": None, "signatureKind": "TYPED",
+     "typedName": "S. Krishnan", "statement": "Conducted per the approved programme.",
+     "signedAt": "2026-07-01T10:00:00+00:00"},
+    {"role": "AUDITEE_OWNER", "userId": "u_anjali", "name": "Anjali Verma",
+     "designation": "Admin", "disciplineCode": None, "signatureKind": "DRAWN",
+     "typedName": None, "statement": None, "signedAt": "2026-07-01T10:05:00+00:00"},
+    {"role": "DISCIPLINE_AUDITOR", "userId": "u_lead", "name": "S. Krishnan",
+     "designation": "HSE Manager", "disciplineCode": "EHS", "signatureKind": "TYPED",
+     "typedName": "S. Krishnan", "statement": None, "signedAt": "2026-07-01T10:07:00+00:00"},
+]
+
+
+def _render_signed(signs, summary):
+    snap, register = _fixture()
+    snap["signOffSummary"] = summary
+    return _text(render_audit_report_pdf(
+        {"id": "rpt_x", "reportType": "FINAL", "reportCode": "RPT-X-F01",
+         "snapshot": snap, "snapshotHashFull": FULL_HASH, "signOffs": signs},
+        generated_by_name="S. Krishnan", register=register, user_names=USER_NAMES))
+
+
+def test_signoff_prints_name_role_and_when_it_was_signed():
+    # The old renderer read `name`/`signedAt` off a payload that only ever
+    # carried role + userId, so every line printed "LEAD_AUDITOR: -  -".
+    text = _render_signed(_SIGNS, {"recorded": 3, "awaitingRoles": [],
+                                   "missingRequiredRoles": []})
+    assert "S. Krishnan" in text and "Anjali Verma" in text
+    assert "HSE Manager" in text
+    assert "01 Jul 2026" in text                       # a real signature time
+    assert "Drawn signature on file" in text           # and how it was signed
+    assert "Conducted per the approved programme." in text
+    assert "DISCIPLINE_AUDITOR: -" not in text
+    assert "All sign-offs required for closure were recorded." in text
+
+
+def test_signoff_names_the_roles_that_have_not_signed():
+    text = _render_signed(_SIGNS[:1], {"recorded": 1, "awaitingRoles": ["PLANT_MANAGER"],
+                                       "missingRequiredRoles": ["AUDITEE_OWNER"]})
+    assert "Outstanding required sign-off: Auditee Owner." in text
+    assert "Also nominated but not signed: Plant Manager." in text
+
+
+def test_no_signoff_states_the_absence_rather_than_printing_blanks():
+    text = _render_signed([], {"recorded": 0, "awaitingRoles": [],
+                               "missingRequiredRoles": ["LEAD_AUDITOR", "AUDITEE_OWNER"]})
+    assert "No sign-off has been recorded for this audit." in text
+    assert "Outstanding required sign-off: Lead Auditor, Auditee Owner." in text
 
 
 def test_footer_does_not_overprint_itself():

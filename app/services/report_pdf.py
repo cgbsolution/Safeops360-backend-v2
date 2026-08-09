@@ -303,6 +303,11 @@ def _h(pdf: _Report, text: str):
     only ever describe what actually rendered — on interim and final alike.
     """
     pdf._section_no = getattr(pdf, "_section_no", 0) + 1
+    # A section heading is never the last thing on a page. fpdf2's auto-break
+    # fires on the text that FOLLOWS, so a heading could sit alone at the foot
+    # while its first row began overleaf — which reads as a section that failed
+    # to render.
+    _room(pdf, 26)
     pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(*PURPLE)
     pdf.cell(0, 8, f"{pdf._section_no}. {text}", border=0, ln=1)
@@ -392,7 +397,7 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
 
     # ── Gauge + headline counts ───────────────────────────────────────────
     g = ins.get("gauge") or {}
-    _room(pdf, 46)
+    _room(pdf, 50)
     top = pdf.get_y()
     band = str(g.get("displayBand") or "neutral")
     ink = _BAND_INK.get(band, GREY)
@@ -414,6 +419,14 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
     pdf.set_text_color(*ink)
     pdf.set_xy(10, top + 38)
     pdf.cell(44, 4, str(g.get("result") or "-").replace("_", " "), border=0, ln=1, align="C")
+    # What the dial is made of. Printed under it so the headline number can be
+    # reconciled by hand against the category table further down.
+    if g.get("scoreAllotted"):
+        pdf.set_font("Helvetica", "", 6.5)
+        pdf.set_text_color(*SLATE)
+        pdf.set_xy(10, top + 42)
+        pdf.cell(44, 3.5, f"{g['scoreObtained']} of {g['scoreAllotted']} points",
+                 border=0, ln=1, align="C")
     pdf.set_text_color(0, 0, 0)
 
     capa = ins.get("capaStrip") or {}
@@ -436,7 +449,9 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
         col, row = i % 3, i // 3
         _stat(pdf, sx + col * (sw + gap), top + row * 16, sw, label, value, tone)
 
-    pdf.set_y(top + 42)
+    # Clear of the donut (bottom top+36), its verdict word (top+38) and the
+    # points line under it (top+42).
+    pdf.set_y(top + 46.5)
 
     # The rule behind the verdict. A number without its rule is not a result —
     # and this is the same `gate.explanation` the cover prints, not a restatement.
@@ -468,19 +483,46 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
             pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(*INK)
             pdf.set_xy(10, y)
-            pdf.cell(48, 4.5, _s(str(c.get("name"))[:32]), border=0, ln=0)
-            _hbar(pdf, 60, y + 1.1, 100, 2.6, pct, c_ink)
+            pdf.cell(44, 4.5, _s(str(c.get("name"))[:30]), border=0, ln=0)
+            _hbar(pdf, 56, y + 1.1, 78, 2.6, pct, c_ink)
             pdf.set_font("Helvetica", "B", 8)
             pdf.set_text_color(*c_ink)
-            pdf.set_xy(162, y)
+            pdf.set_xy(136, y)
             pdf.cell(14, 4.5, f"{pct}%" if pct is not None else "n/a", border=0, ln=0, align="R")
+            # The arithmetic behind the percentage, so a reader can check it
+            # rather than take it on trust — and the FULL outcome split.
+            # This line used to read "32P 4F / 40", silently omitting Partial
+            # even though a partial contributes points to the percentage beside
+            # it, so the counts never added up to the total.
+            #
+            # Columns are sized for the LONGEST string each can hold —
+            # "32P 3Pa 4F 1NA" is ~20mm at 7pt, and a right-aligned cell
+            # narrower than its text overflows LEFT into its neighbour, which is
+            # how "101/117 pts" and the counts first collided.
             pdf.set_font("Helvetica", "", 7)
             pdf.set_text_color(*SLATE)
-            pdf.set_xy(178, y)
-            pdf.cell(22, 4.5, f"{c.get('passed', 0)}P {c.get('failed', 0)}F / {c.get('total', 0)}",
-                     border=0, ln=1, align="R")
+            pdf.set_xy(151, y)
+            pdf.cell(20, 4.5, f"{c.get('scoreObtained', 0)}/{c.get('scoreAllotted', 0)} pts",
+                     border=0, ln=0, align="R")
+            pdf.set_xy(172, y)
+            pdf.cell(28, 4.5, _s(
+                f"{c.get('passed', 0)}P {c.get('partial', 0)}Pa {c.get('failed', 0)}F"
+                + (f" {c['na']}NA" if c.get("na") else "")), border=0, ln=1, align="R")
             pdf.set_text_color(0, 0, 0)
             pdf.set_y(y + 5.6)
+        # One sentence that removes the question the chart otherwise raises:
+        # what IS this percentage? Without it a reader has to guess whether 85%
+        # means "85% of checkpoints passed" — which it does not.
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "I", 6.8)
+        pdf.set_text_color(*GREY)
+        pdf.set_x(10)
+        pdf.multi_cell(190, 3.4, _s(
+            "Score = points earned / points available. Each assessed checkpoint is worth 3 "
+            "points: Effective 3, Some Improvement Needed 2, Major Improvement Needed 1, "
+            "Unsatisfactory 0, and a repeat finding -1. N/A checkpoints are excluded. This is "
+            "the same calculation as the overall score above."))
+        pdf.set_text_color(0, 0, 0)
         pdf.ln(2)
 
     # ── Systemic patterns ─────────────────────────────────────────────────
@@ -883,7 +925,7 @@ def render_audit_report_pdf(
                 pdf.set_font("Helvetica", "", 7)
                 pdf.set_text_color(*SLATE)
                 pdf.set_xy(180, y)
-                pdf.cell(20, 5, f"{c.get('assessed', 0)}/{c.get('total', 0)}",
+                pdf.cell(20, 5, f"{c.get('scoreObtained', 0)}/{c.get('scoreAllotted', 0)} pts",
                          border=0, ln=1, align="R")
                 pdf.set_text_color(0, 0, 0)
                 pdf.set_y(y + 6.2)
@@ -893,9 +935,12 @@ def render_audit_report_pdf(
         _room(pdf, 14)
         pdf.set_font("Helvetica", "B", 8)
         pdf.set_fill_color(*LIGHT)
-        for w, t, al in ((84, "Category", "L"), (18, "Pass", "C"), (18, "Partial", "C"),
-                         (18, "Fail", "C"), (18, "N/A", "C"), (16, "Assessed", "C"),
-                         (18, "Score %", "C")):
+        # "Points" is the column that makes "Score %" checkable: 106 / 120 is
+        # visibly 88.3%. Without it the percentage is a number the reader has to
+        # take on trust, and cannot reconcile against their own workbook.
+        for w, t, al in ((70, "Category", "L"), (16, "Pass", "C"), (16, "Partial", "C"),
+                         (16, "Fail", "C"), (14, "N/A", "C"), (16, "Assessed", "C"),
+                         (24, "Points", "C"), (18, "Score %", "C")):
             pdf.cell(w, 6, t, border=1, ln=0, fill=True, align=al)
         pdf.ln()
         pdf.set_font("Helvetica", "", 8)
@@ -904,15 +949,18 @@ def render_audit_report_pdf(
             name = str(c.get("category_name") or c.get("category") or c.get("name") or "-")[:46]
             sc = _cat_pct(c)
             done = (c.get("passed", 0) or 0) + (c.get("partial", 0) or 0) + (c.get("failed", 0) or 0)
-            pdf.cell(84, 5.5, name, border=1, ln=0)
-            pdf.cell(18, 5.5, str(c.get("passed", 0) or 0), border=1, ln=0, align="C")
-            pdf.cell(18, 5.5, str(c.get("partial", 0) or 0), border=1, ln=0, align="C")
+            pdf.cell(70, 5.5, name, border=1, ln=0)
+            pdf.cell(16, 5.5, str(c.get("passed", 0) or 0), border=1, ln=0, align="C")
+            pdf.cell(16, 5.5, str(c.get("partial", 0) or 0), border=1, ln=0, align="C")
             fail = c.get("failed", 0) or 0
             pdf.set_text_color(*(RED if fail else GREY))
-            pdf.cell(18, 5.5, str(fail), border=1, ln=0, align="C")
+            pdf.cell(16, 5.5, str(fail), border=1, ln=0, align="C")
             pdf.set_text_color(0, 0, 0)
-            pdf.cell(18, 5.5, str(c.get("na", 0) or 0), border=1, ln=0, align="C")
+            pdf.cell(14, 5.5, str(c.get("na", 0) or 0), border=1, ln=0, align="C")
             pdf.cell(16, 5.5, f"{done}/{c.get('total', done)}", border=1, ln=0, align="C")
+            pdf.cell(24, 5.5,
+                     f"{c.get('score_obtained', 0) or 0}/{c.get('score_allotted', 0) or 0}",
+                     border=1, ln=0, align="C")
             # Coloured by the SAME band the bar above used, read off the frozen
             # insight block — two colour scales for one number is a defect.
             _b = next((x.get("band") for x in chart
@@ -1217,10 +1265,65 @@ def render_audit_report_pdf(
     if rtype.upper() == "FINAL":
         _h(pdf, "Sign-Off")
         signs = report.get("signOffs") or []
+        summary = snap.get("signOffSummary") or {}
         if not signs:
-            pdf.cell(0, 6, "Awaiting sign-off.", border=0, ln=1)
+            pdf.set_font("Helvetica", "", 9)
+            pdf.cell(0, 6, "No sign-off has been recorded for this audit.", border=0, ln=1)
         for s in signs:
-            pdf.cell(0, 6, f"{s.get('role', '-')}: {s.get('name', '-')}  -  {s.get('signedAt', '')}", border=0, ln=1)
+            _room(pdf, 14)
+            role = _human(s.get("role"))
+            if s.get("disciplineCode"):
+                role += f" - {s['disciplineCode']}"
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*INK)
+            pdf.set_x(10)
+            pdf.cell(0, 5, _s(f"{s.get('name') or s.get('typedName') or 'Unnamed signer'}"),
+                     border=0, ln=1)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*SLATE)
+            bits = [role]
+            if s.get("designation"):
+                bits.append(str(s["designation"]))
+            # Signed WHEN and HOW. A name with neither is not a sign-off, and
+            # the old renderer printed exactly that.
+            bits.append(f"Signed {_dt(s.get('signedAt'))}")
+            if s.get("signatureKind"):
+                bits.append(
+                    "Drawn signature on file" if s.get("signatureKind") == "DRAWN"
+                    else f"Typed signature: {s.get('typedName') or s.get('name') or '-'}"
+                )
+            pdf.set_x(12)
+            pdf.multi_cell(188, 4.2, _s("   |   ".join(bits)))
+            if s.get("statement"):
+                pdf.set_font("Helvetica", "I", 8)
+                pdf.set_x(12)
+                pdf.multi_cell(188, 4.2, _s(f'"{s["statement"]}"'))
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(1.5)
+
+        # Absence, stated. A reader must be able to tell "nobody else was
+        # required" from "somebody has not signed yet", and only a sentence does
+        # that — a section that simply stops says neither.
+        missing = summary.get("missingRequiredRoles") or []
+        awaiting = [r for r in (summary.get("awaitingRoles") or []) if r not in missing]
+        pdf.set_font("Helvetica", "", 8)
+        if missing:
+            pdf.set_text_color(*RED)
+            pdf.set_x(10)
+            pdf.multi_cell(190, 4.4, _s(
+                "Outstanding required sign-off: "
+                + ", ".join(_human(r) for r in missing) + "."))
+        elif signs:
+            pdf.set_text_color(*GREY)
+            pdf.set_x(10)
+            pdf.multi_cell(190, 4.4, "All sign-offs required for closure were recorded.")
+        if awaiting:
+            pdf.set_text_color(*GREY)
+            pdf.set_x(10)
+            pdf.multi_cell(190, 4.4, _s(
+                "Also nominated but not signed: "
+                + ", ".join(_human(r) for r in awaiting) + "."))
+        pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
 
     # ── Distribution list (WP-12) ──

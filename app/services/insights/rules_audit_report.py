@@ -147,6 +147,11 @@ def gauge(snapshot: dict[str, Any]) -> dict[str, Any]:
         "assessed": grade.get("assessed"),
         "applicable": grade.get("applicable"),
         "coverageLabel": grade.get("label") if not show else None,
+        # The arithmetic behind the dial. A percentage a reader cannot check is
+        # a percentage they have to trust, and this report is read by people
+        # whose job is not to trust it.
+        "scoreObtained": snapshot.get("scoreObtained"),
+        "scoreAllotted": snapshot.get("scoreAllotted"),
     }
 
 
@@ -169,20 +174,46 @@ def critical_banner(snapshot: dict[str, Any], findings: list[dict[str, Any]]) ->
 
 def category_chart(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     """Section 5's numbers, ready to chart. Worst first — the reader opens this
-    to find the weak discipline, not to read A–Z. Nothing new is computed:
-    `disciplineRag` already carries the null-pct-when-unassessed rule, which is
-    the one thing a chart must not get wrong (a neutral bar, never a red 0%)."""
-    rows = snapshot.get("disciplineRag") or []
+    to find the weak discipline, not to read A–Z.
+
+    Reads `categoryScores`, i.e. the POINTS score (Σ obtained / Σ allotted) that
+    `page_grading.compute_points_score` owns and that the report's own headline
+    percentage uses.
+
+    It used to read `disciplineRag`, which carries the engine's superseded
+    pass-ratio ((passed + 0.5·partial) / assessed). Both blocks have always been
+    written into every snapshot, so charting the wrong one put two different
+    numbers for one discipline on one page — Production read 85.0% on the bar
+    and 88.3% in the table directly beneath it. They are not a rounding
+    artefact: the pass-ratio has no concept of a REPEAT finding, which scores
+    -1 under the points model, so the two disagree in both directions.
+
+    The points score is the authoritative one (`page_grading` module docstring;
+    `audit_compliance._score_from_rollup`, "the two paths must agree exactly"),
+    and it is what Page reconcile against their own workbook.
+    """
+    rows = snapshot.get("categoryScores") or []
     out = []
     for c in rows:
-        pct = c.get("pct")
+        passed = c.get("passed", 0) or 0
+        partial = c.get("partial", 0) or 0
+        failed = c.get("failed", 0) or 0
+        allotted = c.get("score_allotted", 0) or 0
+        assessed = passed + partial + failed
+        # Nothing assessed, or nothing allotted → no score. A neutral bar, never
+        # a red 0%: not-assessed is not failed-everything.
+        pct = c.get("score_pct") if (assessed and allotted) else None
         band, _ = _band(pct)
         out.append({
-            "categoryId": c.get("categoryId"), "name": c.get("categoryName") or "—",
+            "categoryId": c.get("category_id"), "name": c.get("category_name") or "—",
             "pct": pct, "band": band,
-            "total": c.get("total", 0), "passed": c.get("passed", 0),
-            "partial": c.get("partial", 0), "failed": c.get("failed", 0), "na": c.get("na", 0),
-            "assessed": (c.get("passed", 0) or 0) + (c.get("partial", 0) or 0) + (c.get("failed", 0) or 0),
+            "total": c.get("total", 0), "passed": passed,
+            "partial": partial, "failed": failed, "na": c.get("na", 0),
+            "assessed": assessed,
+            # The arithmetic behind the percentage, carried so every renderer
+            # can show a number the reader is able to check by hand.
+            "scoreObtained": c.get("score_obtained", 0) or 0,
+            "scoreAllotted": allotted,
         })
     # Unassessed disciplines sort last: they are not the worst performers, they
     # are absent ones, and putting a neutral bar at the top of a "worst first"

@@ -3877,21 +3877,35 @@ def _result_label(score: dict[str, Any]) -> str:
 
 
 def _standards_rollup(responses: list[AuditCheckpointResponse]) -> list[dict[str, Any]]:
-    """Aggregate conformance by standard (SA8000 / ISO 45001 / …) for the final."""
+    """Aggregate conformance by standard (SA8000 / ISO 45001 / …) for the final.
+
+    Scored on POINTS, like every other percentage this product prints. It used
+    to use the engine's superseded pass-ratio, so the same audit could report a
+    standard at one number here and a discipline at another number computed a
+    different way two sections earlier.
+    """
     agg: dict[str, dict[str, int]] = {}
     for r in responses:
         std = (r.standard or "").strip()
         if not std:
             continue
         val = _norm_value((r.auditorResponse or {}).get("value")) if r.auditorResponse else None
-        a = agg.setdefault(std, {"total": 0, "pass": 0, "partial": 0, "fail": 0, "na": 0})
+        a = agg.setdefault(
+            std,
+            {"total": 0, "pass": 0, "partial": 0, "fail": 0, "na": 0,
+             "scoreObtained": 0, "scoreAllotted": 0},
+        )
         a["total"] += 1
+        if r.scoreAllotted:
+            a["scoreAllotted"] += r.scoreAllotted
+            a["scoreObtained"] += r.scoreObtained or 0
         if val in ("pass", "partial", "fail", "na"):
             a[val] += 1
     out = []
     for std, a in sorted(agg.items()):
-        assessable = a["pass"] + a["partial"] + a["fail"]
-        a["scorePct"] = round((a["pass"] + 0.5 * a["partial"]) / assessable * 100, 1) if assessable else 0.0
+        a["scorePct"] = page_grading.compute_points_score(
+            obtained=a["scoreObtained"], allotted=a["scoreAllotted"]
+        )
         out.append({"standard": std, **a})
     return out
 
@@ -4014,13 +4028,22 @@ def _build_report_snapshot(
     # Per-discipline RAG summary — the structured spine of the report (so 1500
     # checkpoints read as a discipline breakdown, not a flat dump). all-NA /
     # not-assessed disciplines → null pct (neutral, not a misleading 0%; M1).
+    #
+    # `pct` is the POINTS score, the same number `categoryScores.score_pct`
+    # carries and the same one the headline percentage uses. It used to be the
+    # engine's superseded pass-ratio, which meant every snapshot stored TWO
+    # different percentages for one discipline under two different keys — and a
+    # renderer that reached for this one printed 85.0% beside a table saying
+    # 88.3%. Keeping the key (an API consumer may read it) but making it agree
+    # is what closes that off: there is now no way to pick the wrong number.
     discipline_rag = []
     for c in score["category_scores"]:
         d_assess = c["passed"] + c["partial"] + c["failed"]
         discipline_rag.append({
             "categoryId": c["category_id"], "categoryName": c["category_name"], "total": c["total"],
             "passed": c["passed"], "partial": c["partial"], "failed": c["failed"], "na": c["na"],
-            "pct": None if d_assess == 0 else round((c["passed"] + 0.5 * c["partial"]) / d_assess * 100, 1),
+            "scoreObtained": c["score_obtained"], "scoreAllotted": c["score_allotted"],
+            "pct": None if (d_assess == 0 or not c["score_allotted"]) else c["score_pct"],
         })
 
     snapshot: dict[str, Any] = {
@@ -4043,6 +4066,11 @@ def _build_report_snapshot(
         ),
         "plannedDate": _iso(audit.scheduledDate), "submittedAt": _iso(audit.submittedAt), "closedAt": _iso(audit.closedAt),
         "overallScorePct": overall_pct, "overallResult": overall_result,
+        # The arithmetic behind the headline percentage. Frozen alongside it so
+        # the report can PRINT `311 of 357 points` rather than asking a reader
+        # to trust 87.1% — the single cheapest thing that makes the score
+        # checkable against the customer's own workbook.
+        "scoreObtained": score["score_obtained"], "scoreAllotted": score["score_allotted"],
         "auditPassed": score["audit_passed"],
         "checkpointsTotal": total, "checkpointsAssessed": assessed,
         "passCount": score["passed"], "failCount": score["failed"],
@@ -4408,6 +4436,42 @@ async def generate_report(
     rules_audit_report.resolve_owner_names(
         snapshot.get("insights") or {}, snapshot["userNames"]
     )
+
+    # ── Sign-offs: the RECORDED ones, not the caller's assertion ───────────
+    #
+    # `AuditReport.signOffs` used to be whatever the caller passed. The HTTP
+    # contract (`routers.audit_compliance.SignOff`) carries only role + userId,
+    # and the UI sends a hardcoded lead-auditor + plant-manager pair, so every
+    # report issued through the API froze two nameless, timeless stubs and
+    # printed "LEAD_AUDITOR: -  -". Reports generated in-process (the seeders)
+    # passed `audit.signOffs` and looked correct, which is why this went unseen.
+    #
+    # The system of record is `ComplianceAudit.signOffs`, written only by
+    # `signoff.record_signoff` — which authenticates the signer, validates the
+    # signature and stamps a server-side time. That is what gets frozen now.
+    #
+    # A caller can no longer assert a sign-off that was never recorded. That is
+    # the point: a printed name against a role, with no signature and no
+    # timestamp, reads as "this person signed" when nobody did, and on a
+    # compliance document that is the most damaging thing this section can say.
+    # Roles the caller nominated that carry no recorded signature are reported
+    # as outstanding instead.
+    _recorded = list(audit.signOffs or [])
+    _signed_slots = {(s.get("role"), s.get("disciplineCode")) for s in _recorded}
+    _awaited = [
+        {"role": (c or {}).get("role"), "userId": (c or {}).get("userId")}
+        for c in (sign_offs or [])
+        if ((c or {}).get("role"), None) not in _signed_slots
+    ]
+    sign_offs = _recorded or None
+    snapshot["signOffSummary"] = {
+        "recorded": len(_recorded),
+        "awaitingRoles": [a["role"] for a in _awaited if a.get("role")],
+        "missingRequiredRoles": [
+            r for r in signoff.REQUIRED_FOR_CLOSURE
+            if r not in {s.get("role") for s in _recorded}
+        ],
+    }
 
     snapshot["generatedAt"] = _iso(_utcnow())
     # Two digests over the SAME canonical form: the 16-char prefix stays inside
