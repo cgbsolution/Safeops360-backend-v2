@@ -13,6 +13,15 @@ Three rules, all fail-closed:
     every product API while leaving core reachable);
   * limits (sites/users/factories) are checked at create paths.
 
+Within the signed ceiling, two admin-managed layers can restrict further, each
+strictly narrower than the one above it:
+
+    signed licence ceiling      (vendor — the only thing that can GRANT)
+      └─ organisation layer     (Super Admin, org-wide — org_entitlements)
+           └─ per-factory layer (System Admin, per plant — factory_entitlements)
+
+Neither admin layer can grant a module the licence doesn't include.
+
 `is_module_enabled` is also the graceful-degradation primitive: cross-module
 providers call it and treat "not entitled" exactly like "not present", which
 generalises the CAMS-standalone degradation contract (§5.2, TL-15).
@@ -22,10 +31,15 @@ from __future__ import annotations
 
 from fastapi import Header, HTTPException, status
 
-from app.licensing import factory_entitlements
+from app.licensing import factory_entitlements, org_entitlements
 from app.licensing.payload import RuntimeLicenceState
 from app.licensing.registry import CORE_MODULE_CODES, MODULE_REGISTRY
 from app.licensing.state import get_state
+
+# Shown to ordinary users whenever the Super Admin has switched a module off for
+# the whole organisation. Deliberately generic — it names the person to ask, not
+# the internal reason, which stays in the Super Admin screen.
+ORG_DISABLED_MESSAGE = "Please contact your Super Admin to request access to this module."
 
 
 def current_state() -> RuntimeLicenceState:
@@ -44,6 +58,18 @@ def is_module_enabled(code: str, state: RuntimeLicenceState | None = None) -> bo
     return code in st.enabled_module_set
 
 
+def is_module_enabled_for_org(code: str, state: RuntimeLicenceState | None = None) -> bool:
+    """Effective access for the ORGANISATION: the signed ceiling AND the Super
+    Admin's org-wide allocation. Core is never restricted — the Super Admin can
+    no more switch off identity or licensing than a licence can."""
+    st = state or get_state()
+    if not is_module_enabled(code, st):
+        return False
+    if code in CORE_MODULE_CODES:
+        return True
+    return org_entitlements.is_enabled_for_org(code)
+
+
 def _effective_now(state: RuntimeLicenceState):
     """The clock used for per-factory windows — the licence's monotonic
     effective clock when available, so a rollback can't extend a window either."""
@@ -53,11 +79,11 @@ def _effective_now(state: RuntimeLicenceState):
 def is_module_enabled_for_plant(
     code: str, plant_id: str | None, state: RuntimeLicenceState | None = None
 ) -> bool:
-    """Effective access for a specific factory: the signed ceiling AND the
-    admin's per-factory allocation (on/off + validity window). Core is never
-    restricted per factory."""
+    """Effective access for a specific factory: the signed ceiling AND the Super
+    Admin's org-wide allocation AND the admin's per-factory allocation (on/off +
+    validity window). Core is never restricted at either admin layer."""
     st = state or get_state()
-    if not is_module_enabled(code, st):
+    if not is_module_enabled_for_org(code, st):
         return False
     if code in CORE_MODULE_CODES:
         return True
@@ -100,7 +126,25 @@ def require_module(module_code: str):
                 },
             )
 
-        # 2. Per-factory allocation + validity window (within the ceiling) —
+        # 2. Organisation-wide allocation (within the ceiling) — the Super
+        #    Admin's decision for the whole tenant. Checked before the
+        #    per-factory layer because it applies with or without an active
+        #    plant: a module switched off org-wide is off everywhere.
+        if module_code not in CORE_MODULE_CODES and not org_entitlements.is_enabled_for_org(
+            module_code
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "entitlement_denied",
+                    "reason": "module_disabled_for_organisation",
+                    "module": module_code,
+                    "licenceStatus": st.status,
+                    "message": ORG_DISABLED_MESSAGE,
+                },
+            )
+
+        # 3. Per-factory allocation + validity window (within the ceiling) —
         #    only when the request carries an active plant. Absent header →
         #    ceiling-only (safe default).
         if x_active_plant and not factory_entitlements.is_enabled_for_plant(
@@ -171,7 +215,10 @@ __all__ = [
     "require_module",
     "ModuleGuard",
     "is_module_enabled",
+    "is_module_enabled_for_org",
+    "is_module_enabled_for_plant",
     "current_state",
     "limit_for",
     "assert_within_limit",
+    "ORG_DISABLED_MESSAGE",
 ]

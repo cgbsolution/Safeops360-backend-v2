@@ -506,8 +506,9 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
                      border=0, ln=0, align="R")
             pdf.set_xy(172, y)
             pdf.cell(28, 4.5, _s(
-                f"{c.get('passed', 0)}P {c.get('partial', 0)}Pa {c.get('failed', 0)}F"
-                + (f" {c['na']}NA" if c.get("na") else "")), border=0, ln=1, align="R")
+                f"{c.get('passed', 0)}P {c.get('partial', 0)}Ptl {c.get('failed', 0)}F"
+                + (f" {c['na']}NA" if c.get("na") else "")
+                + f" / {c.get('total', 0)}"), border=0, ln=1, align="R")
             pdf.set_text_color(0, 0, 0)
             pdf.set_y(y + 5.6)
         # One sentence that removes the question the chart otherwise raises:
@@ -1305,7 +1306,7 @@ def render_audit_report_pdf(
         # required" from "somebody has not signed yet", and only a sentence does
         # that — a section that simply stops says neither.
         missing = summary.get("missingRequiredRoles") or []
-        awaiting = [r for r in (summary.get("awaitingRoles") or []) if r not in missing]
+        unsigned_disc = summary.get("unsignedDisciplines") or []
         pdf.set_font("Helvetica", "", 8)
         if missing:
             pdf.set_text_color(*RED)
@@ -1317,12 +1318,16 @@ def render_audit_report_pdf(
             pdf.set_text_color(*GREY)
             pdf.set_x(10)
             pdf.multi_cell(190, 4.4, "All sign-offs required for closure were recorded.")
-        if awaiting:
-            pdf.set_text_color(*GREY)
+        # Per-discipline sign-off is expected from each auditor who actually
+        # held checkpoints, so an unsigned discipline is a real gap and not an
+        # absence the reader should have to infer from a shorter list.
+        if unsigned_disc:
+            pdf.set_text_color(*AMBER)
             pdf.set_x(10)
             pdf.multi_cell(190, 4.4, _s(
-                "Also nominated but not signed: "
-                + ", ".join(_human(r) for r in awaiting) + "."))
+                f"Discipline sign-off outstanding ({summary.get('disciplinesSigned', 0)} of "
+                f"{summary.get('disciplinesTotal', 0)} signed): "
+                + ", ".join(str(d) for d in unsigned_disc) + "."))
         pdf.set_text_color(0, 0, 0)
         pdf.ln(3)
 

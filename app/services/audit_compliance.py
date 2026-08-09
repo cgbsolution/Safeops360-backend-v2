@@ -4264,11 +4264,22 @@ def _report_to_dict(rep: AuditReport) -> dict[str, Any]:
 
 
 async def generate_report(
-    db: AsyncSession, *, user: User, audit_id: str, report_type: str, sign_offs: list[dict[str, Any]] | None = None,
+    db: AsyncSession, *, user: User, audit_id: str, report_type: str,
 ) -> dict[str, Any]:
     """Generate an immutable Interim or Final report. Interim accumulates (the
     latest supersedes prior interims for display, all retained). Final requires
-    a finalizable audit."""
+    a finalizable audit.
+
+    Takes no `sign_offs` argument. It used to, and the caller's list was frozen
+    into the snapshot verbatim — so the HTTP contract (role + userId, no name,
+    no timestamp) determined what an issued compliance document said about who
+    had signed it, and every API-generated report printed "LEAD_AUDITOR: -  -".
+    Widening that contract would only move the same trust boundary outwards; a
+    client must not be able to assert a signature at all. Sign-offs are read
+    here from `ComplianceAudit.signOffs`, written solely by
+    `signoff.record_signoff`, which authenticates the signer and stamps the
+    time server-side.
+    """
     report_type = (report_type or "").upper()
     if report_type not in ("INTERIM", "FINAL"):
         raise ValueError("reportType must be INTERIM or FINAL")
@@ -4339,7 +4350,12 @@ async def generate_report(
     uid_set: set[str] = {audit.leadAuditorUserId, audit.plantManagerUserId}
     for r in audit.responses:
         uid_set.update((r.assignedOwnerId, r.routedToUserId))
-    uid_set.update((so or {}).get("userId") for so in (sign_offs or []))
+    # Signers used to be added here so their ids could be resolved to names.
+    # They no longer need to be: a recorded sign-off carries the signer's name
+    # and designation with it, captured at signing time — which is the correct
+    # record anyway, since a person's current name is not necessarily the one
+    # they signed under.
+    uid_set.update(s.get("userId") for s in (audit.signOffs or []))
     uid_set = {u for u in uid_set if u}
     snapshot["userNames"] = {}
     if uid_set:
@@ -4456,21 +4472,20 @@ async def generate_report(
     # compliance document that is the most damaging thing this section can say.
     # Roles the caller nominated that carry no recorded signature are reported
     # as outstanding instead.
-    _recorded = list(audit.signOffs or [])
-    _signed_slots = {(s.get("role"), s.get("disciplineCode")) for s in _recorded}
-    _awaited = [
-        {"role": (c or {}).get("role"), "userId": (c or {}).get("userId")}
-        for c in (sign_offs or [])
-        if ((c or {}).get("role"), None) not in _signed_slots
-    ]
-    sign_offs = _recorded or None
+    _status = await signoff.signoff_status(db, audit)
+    sign_offs = list(_status["signOffs"]) or None
     snapshot["signOffSummary"] = {
-        "recorded": len(_recorded),
-        "awaitingRoles": [a["role"] for a in _awaited if a.get("role")],
-        "missingRequiredRoles": [
-            r for r in signoff.REQUIRED_FOR_CLOSURE
-            if r not in {s.get("role") for s in _recorded}
+        "recorded": len(_status["signOffs"]),
+        "missingRequiredRoles": list(_status["missingRequiredRoles"]),
+        # Which disciplines still lack their auditor's sign-off — server-side
+        # knowledge derived from who actually held allocated checkpoints, not
+        # something a client could tell us.
+        "unsignedDisciplines": [
+            d["disciplineLabel"] for d in _status["disciplines"] if not d["signed"]
         ],
+        "disciplinesSigned": _status["disciplinesSigned"],
+        "disciplinesTotal": _status["disciplinesTotal"],
+        "statement": _status["statement"],
     }
 
     snapshot["generatedAt"] = _iso(_utcnow())

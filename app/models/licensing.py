@@ -76,3 +76,35 @@ class FactoryModuleEntitlement(Base, IdMixin, TimestampMixin):
     validFrom: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     validUntil: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updatedBy: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class OrganisationModuleEntitlement(Base, IdMixin, TimestampMixin):
+    """Super-Admin-managed ORGANISATION-WIDE module allocation, *within* the
+    signed-licence ceiling and *above* the per-factory layer.
+
+    This portal is single-tenant — one organisation (e.g. Page Industries) with
+    many plants. The Super Admin owns the organisation as a whole and decides
+    which of the licensed modules the organisation actually uses. Turning a
+    module off here removes it everywhere, at every plant, for every role — the
+    per-factory matrix can only restrict further within what survives this layer.
+
+    Same opt-out semantics as FactoryModuleEntitlement: a row exists only when
+    the Super Admin has explicitly set a module's state. Absence of a row means
+    the module is on (inherited from the licence), so an install with no rows
+    behaves exactly as it did before this layer existed.
+
+    Like the per-factory layer, this can only ever RESTRICT. No write here can
+    grant a module the licence doesn't include (build prompt §5.3).
+    """
+
+    __tablename__ = "OrganisationModuleEntitlement"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=gen_id)
+    moduleCode: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Optional free-text note the Super Admin leaves against a disabled module
+    # ("not purchased for FY26", "pending IT sign-off"). Surfaced only in the
+    # Super Admin screen — end users always see the generic contact message, so
+    # an internal note can never leak to the whole organisation.
+    note: Mapped[str | None] = mapped_column(String, nullable=True)
+    updatedBy: Mapped[str | None] = mapped_column(String, nullable=True)

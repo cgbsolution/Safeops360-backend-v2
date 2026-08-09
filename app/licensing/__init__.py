@@ -23,6 +23,11 @@ Import map:
   validator     — load → verify → compute status → RuntimeLicenceState
   state         — process-wide runtime licence state holder
   enforcement   — require_module() API guard (the security boundary) + limits
+
+Two admin-managed layers restrict *within* the signed ceiling — neither can
+grant a module the licence doesn't include:
+  org_entitlements     — Super Admin, organisation-wide on/off
+  factory_entitlements — System Admin, per-factory on/off + validity window
 """
 
 from __future__ import annotations

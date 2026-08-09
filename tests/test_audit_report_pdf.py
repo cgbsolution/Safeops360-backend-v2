@@ -296,7 +296,11 @@ def test_partial_count_is_no_longer_hidden_from_the_summary_line():
     snap, register = _fixture()
     text = re.sub(r"[ \t]+", " ", _text(_render(snap, register)))
     c = next(c for c in snap["categoryScores"] if c["category_name"] == "PRODUCTION")
-    assert f"{c['passed']}P {c['partial']}Pa {c['failed']}F" in text
+    expected = (f"{c['passed']}P {c['partial']}Ptl {c['failed']}F"
+                + (f" {c['na']}NA" if c["na"] else "") + f" / {c['total']}")
+    assert expected in text
+    # …and the counts now actually add up to the total, which is the point.
+    assert c["passed"] + c["partial"] + c["failed"] + c["na"] == c["total"]
 
 
 # ─── sign-off prints the record, or says what is missing ────────────────────
@@ -338,18 +342,81 @@ def test_signoff_prints_name_role_and_when_it_was_signed():
     assert "All sign-offs required for closure were recorded." in text
 
 
+def test_signoff_renders_a_variable_length_list_with_many_discipline_auditors():
+    """Three disciplines, three separate auditor signatures, plus the required
+    pair — the shape F01 actually had and F02 collapsed to two blank lines."""
+    signs = _SIGNS[:2] + [
+        {"role": "DISCIPLINE_AUDITOR", "userId": f"u{i}", "name": f"Auditor {d}",
+         "designation": "Auditor", "disciplineCode": d, "signatureKind": "TYPED",
+         "typedName": f"Auditor {d}", "statement": f"I conducted the {d} discipline.",
+         "signedAt": f"2026-07-01T11:0{i}:00+00:00"}
+        for i, d in enumerate(DISCIPLINES)
+    ]
+    text = _render_signed(signs, {"recorded": 5, "missingRequiredRoles": [],
+                                  "unsignedDisciplines": [], "disciplinesSigned": 3,
+                                  "disciplinesTotal": 3, "statement": "All recorded."})
+    for d in DISCIPLINES:
+        assert f"Auditor {d}" in text
+        assert f"I conducted the {d} discipline." in text
+        assert f"Discipline Auditor - {d}" in text
+    assert text.count("Signed 01 Jul 2026") == 5   # every signer has a real time
+
+
 def test_signoff_names_the_roles_that_have_not_signed():
-    text = _render_signed(_SIGNS[:1], {"recorded": 1, "awaitingRoles": ["PLANT_MANAGER"],
-                                       "missingRequiredRoles": ["AUDITEE_OWNER"]})
+    text = _render_signed(_SIGNS[:1], {"recorded": 1, "missingRequiredRoles": ["AUDITEE_OWNER"],
+                                       "unsignedDisciplines": ["Production"],
+                                       "disciplinesSigned": 2, "disciplinesTotal": 3,
+                                       "statement": "Awaiting."})
     assert "Outstanding required sign-off: Auditee Owner." in text
-    assert "Also nominated but not signed: Plant Manager." in text
+    assert "Discipline sign-off outstanding (2 of 3 signed): Production." in text
 
 
 def test_no_signoff_states_the_absence_rather_than_printing_blanks():
-    text = _render_signed([], {"recorded": 0, "awaitingRoles": [],
-                               "missingRequiredRoles": ["LEAD_AUDITOR", "AUDITEE_OWNER"]})
+    text = _render_signed([], {"recorded": 0, "missingRequiredRoles": ["LEAD_AUDITOR", "AUDITEE_OWNER"],
+                               "unsignedDisciplines": [], "disciplinesSigned": 0,
+                               "disciplinesTotal": 0, "statement": "Awaiting."})
     assert "No sign-off has been recorded for this audit." in text
     assert "Outstanding required sign-off: Lead Auditor, Auditee Owner." in text
+
+
+# ─── the contract that made this possible is gone ───────────────────────────
+
+def test_report_generation_cannot_be_handed_sign_offs_by_a_caller():
+    """The root cause, locked shut.
+
+    `generate_report` used to accept `sign_offs` and freeze it verbatim into an
+    immutable compliance document, so whatever the HTTP contract could carry
+    (role + userId — no name, no timestamp) became the report's record of who
+    signed. Widening that contract would move the same trust boundary outward;
+    removing it is what stops a client asserting a signature at all.
+    """
+    import inspect
+    from app.routers.audit_compliance import GenerateReportBody
+    from app.services.audit_compliance import generate_report
+
+    assert "sign_offs" not in inspect.signature(generate_report).parameters
+    assert "signOffs" not in GenerateReportBody.model_fields
+    # A client still posting the old field must not 422 — it is ignored.
+    assert GenerateReportBody(**{"reportType": "FINAL", "signOffs": [
+        {"role": "LEAD_AUDITOR", "userId": "u1"}]}).reportType == "FINAL"
+
+
+def test_no_caller_smuggles_sign_offs_past_the_generator():
+    """Seeders and scripts must exercise the same path as production.
+
+    `seed_complete_internal_audit.py` used to pass the live signer list straight
+    to the service, bypassing the contract the product uses — which is exactly
+    why the seeded report looked correct while every real one did not.
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    offenders = [
+        f"{p.relative_to(root)}:{n}"
+        for p in list((root / "scripts").rglob("*.py")) + list((root / "app").rglob("*.py"))
+        for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+        if "generate_report(" in line and "sign_offs" in line
+    ]
+    assert not offenders, f"sign_offs passed to generate_report at: {offenders}"
 
 
 def test_footer_does_not_overprint_itself():

@@ -211,7 +211,14 @@ async def lifespan(_app: FastAPI):
     except Exception as e:  # noqa: BLE001
         log.warning("Licence boot validation failed (fails closed): %s", e)
 
-    # Load the per-factory module-allocation cache (within the licence ceiling).
+    # Load the admin-managed allocation caches (both sit within the licence
+    # ceiling): organisation-wide first, then per-factory.
+    try:
+        from app.licensing import org_entitlements
+        await org_entitlements.refresh()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Organisation-entitlement cache load failed: %s", e)
+
     try:
         from app.licensing import factory_entitlements
         await factory_entitlements.refresh()

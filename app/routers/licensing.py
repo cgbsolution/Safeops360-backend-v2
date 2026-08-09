@@ -10,10 +10,13 @@ be gated by an entitlement. It exposes:
   GET  /api/licensing/diagnostics   validation detail + tamper warnings (admin)
   POST /api/licensing/upload        upload/renew a .lic; validates then publishes (admin)
   POST /api/licensing/revalidate    force a re-validation pass (admin)
+  GET  /api/licensing/organisation-modules  org-wide module allocation (super admin)
+  PUT  /api/licensing/organisation-modules  set org-wide module allocation (super admin)
 
 Entitlements are READ-ONLY here — they come only from the signed licence. No
 endpoint in this app can grant a module; only uploading a validly-signed
-licence changes entitlements (build prompt §5.3).
+licence changes entitlements (build prompt §5.3). The organisation and
+per-factory endpoints can only RESTRICT within that ceiling.
 """
 
 from __future__ import annotations
@@ -27,9 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.db import get_db
 from app.core.deps import get_current_user
-from app.licensing import factory_entitlements, keys
+from app.licensing import factory_entitlements, keys, org_entitlements
 from app.licensing.editions import get_edition
-from app.licensing.enforcement import is_module_enabled_for_plant
+from app.licensing.enforcement import is_module_enabled_for_org, is_module_enabled_for_plant
 from app.licensing.registry import CORE_MODULE_CODES, MODULE_REGISTRY
 from app.licensing.state import (
     evaluate_dry_run,
@@ -65,6 +68,48 @@ async def _is_admin(db: AsyncSession, user: User) -> bool:
 async def _require_admin(db: AsyncSession, user: User) -> None:
     if not await _is_admin(db, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Licence administration requires admin rights")
+
+
+# ── Super Admin (organisation owner) ─────────────────────────────────────────
+# Deliberately NARROWER than _is_admin: a System Admin runs the portal, but only
+# the Super Admin decides which modules the organisation as a whole uses. There
+# is no "ADMIN in role name" fallback here — that would let every *_ADMIN role
+# switch modules off for every plant at once.
+SUPER_ADMIN_ROLE_CODE = "SUPER_ADMIN"
+SUPER_ADMIN_PERMISSION = "ORGANISATION.MODULES"
+
+
+async def _is_super_admin(db: AsyncSession, user: User) -> bool:
+    """True for the organisation owner. Three independent paths, any of which
+    suffices, so an RBAC edit can never orphan the organisation:
+      1. the ORGANISATION.MODULES permission (the canonical grant),
+      2. the SUPER_ADMIN role code on the user or any of their role rows,
+      3. the configured anchor email (SUPER_ADMIN_EMAIL) — break-glass.
+    """
+    if (await can(db, user.id, SUPER_ADMIN_PERMISSION, PermissionContext())).allowed:
+        return True
+    if (user.role or "").upper() == SUPER_ADMIN_ROLE_CODE:
+        return True
+    from app.services.permissions import get_user_role_codes
+
+    if SUPER_ADMIN_ROLE_CODE in await get_user_role_codes(db, user.id):
+        return True
+    anchor = (get_settings().super_admin_email or "").strip().lower()
+    return bool(anchor) and (user.email or "").strip().lower() == anchor
+
+
+async def _require_super_admin(db: AsyncSession, user: User) -> None:
+    if not await _is_super_admin(db, user):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "super_admin_required",
+                "message": (
+                    "Organisation-wide module access is managed by the Super Admin. "
+                    "Please contact your Super Admin to request a change."
+                ),
+            },
+        )
 
 
 # ── view builders ────────────────────────────────────────────────────────────
@@ -103,6 +148,12 @@ def _public_status(state) -> dict[str, Any]:
             "maxFactories": p.limits.max_factories if p else None,
         } if p else {},
         "featureFlags": p.feature_flags if p else {},
+        # Licensed modules the Super Admin has switched off org-wide. The UI
+        # uses this to explain a missing module as "ask your Super Admin"
+        # rather than "not in your edition" — two very different next steps.
+        "orgDisabledModules": sorted(
+            c for c in org_entitlements.disabled_codes() if c in state.enabled_module_set
+        ),
     }
 
 
@@ -132,6 +183,7 @@ async def licence_status(
     view = _public_status(state)
     is_admin = await _is_admin(db, user)
     view["isAdmin"] = is_admin
+    view["isSuperAdmin"] = await _is_super_admin(db, user)
 
     if is_admin:
         view["usage"] = await _usage_counts(db)
@@ -150,19 +202,29 @@ async def my_modules(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """The caller's enabled module set — consumed by frontend nav/route gating.
-    When `plantId` is given, returns the EFFECTIVE set for that factory (signed
-    ceiling minus the admin's per-factory restrictions). Returns codes only."""
+    Always excludes modules the Super Admin has switched off org-wide. When
+    `plantId` is given, returns the EFFECTIVE set for that factory (signed
+    ceiling minus org-wide restrictions minus the admin's per-factory
+    restrictions). Returns codes only.
+
+    `orgDisabledModules` is returned alongside so the route guard can tell a
+    module that's missing because the organisation turned it off (ask your
+    Super Admin) from one that's missing because the licence never had it
+    (contact Vizionforge) — same absence, different message."""
     state = get_state()
     ceiling = sorted(state.enabled_module_set)
     if plantId:
         effective = [c for c in ceiling if is_module_enabled_for_plant(c, plantId, state)]
     else:
-        effective = ceiling
+        effective = [c for c in ceiling if is_module_enabled_for_org(c, state)]
     return {
         "status": state.status,
         "isOperational": state.is_operational,
         "plantId": plantId,
         "enabledModules": effective,
+        "orgDisabledModules": sorted(
+            c for c in org_entitlements.disabled_codes() if c in state.enabled_module_set
+        ),
     }
 
 
@@ -299,6 +361,111 @@ async def export_my_data(
     }
 
 
+@router.get("/organisation-modules")
+async def organisation_modules(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The organisation-wide module allocation (Super Admin). Returns every
+    LICENSED product module with its current org-wide state, plus how many
+    factories exist so the screen can say what a change affects. Modules outside
+    the licence are not listed — they can never be switched on here."""
+    await _require_super_admin(db, user)
+    from app.models.plant import Plant
+
+    state = get_state()
+    licensed = [
+        MODULE_REGISTRY[c]
+        for c in sorted(state.enabled_module_set)
+        if c not in CORE_MODULE_CODES and c in MODULE_REGISTRY
+    ]
+    rows = await org_entitlements.load_all(db)
+    plant_count = (await db.execute(select(func.count()).select_from(Plant))).scalar() or 0
+
+    return {
+        # The organisation this portal serves. Single-tenant, so it comes from
+        # the signed licence's customer name (e.g. "Page Industries").
+        "organisation": {
+            "name": state.payload.customer_name if state.payload else None,
+            "edition": state.payload.edition if state.payload else None,
+            "plantCount": int(plant_count),
+        },
+        "modules": [
+            {
+                "code": m.code,
+                "name": m.name,
+                "group": m.group,
+                # No row → on, inherited from the licence.
+                "enabled": rows.get(m.code, {}).get("enabled", True),
+                "note": rows.get(m.code, {}).get("note"),
+                "updatedBy": rows.get(m.code, {}).get("updatedBy"),
+                "updatedAt": rows.get(m.code, {}).get("updatedAt"),
+            }
+            for m in licensed
+        ],
+    }
+
+
+@router.put("/organisation-modules")
+async def update_organisation_modules(
+    payload: dict = Body(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Set organisation-wide module states (Super Admin). Body:
+        { "modules": { "CAMS": true, "PTW": {"enabled": false, "note": "..."} } }
+
+    Only licensed modules may be set — attempting to manage a module outside the
+    licence ceiling is rejected, so config can never grant entitlements. Turning
+    a module off here disables it at EVERY plant immediately; users hitting it
+    get 'Please contact your Super Admin to request access to this module.'"""
+    await _require_super_admin(db, user)
+    changes = payload.get("modules")
+    if not isinstance(changes, dict) or not changes:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Expected { modules: {code: bool|spec} }")
+
+    state = get_state()
+    licensed = {c for c in state.enabled_module_set if c not in CORE_MODULE_CODES}
+    bad = [c for c in changes if c not in licensed]
+    if bad:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "module_not_licensed",
+                "message": "Cannot manage modules outside the licence ceiling.",
+                "modules": bad,
+            },
+        )
+
+    # Accept either a bare bool (on/off) or a spec object {enabled, note}.
+    normalised: dict[str, dict] = {}
+    for code, v in changes.items():
+        if isinstance(v, bool):
+            normalised[code] = {"enabled": v, "note": None}
+            continue
+        if not isinstance(v, dict):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Bad value for {code}")
+        note = v.get("note")
+        if note is not None and not isinstance(note, str):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{code}: note must be text")
+        normalised[code] = {"enabled": bool(v.get("enabled", True)), "note": (note or "").strip() or None}
+
+    # get_db commits the request transaction on return (same contract the
+    # per-factory handler relies on); set_modules refreshes the hot-path cache.
+    await org_entitlements.set_modules(db, normalised, user.id)
+    disabled = sorted(c for c, s in normalised.items() if not s["enabled"])
+    return {
+        "applied": True,
+        "modules": {c: s["enabled"] for c, s in normalised.items()},
+        "disabledCount": len(disabled),
+        "message": (
+            f"Saved. {len(disabled)} module(s) are now off for the whole organisation."
+            if disabled
+            else "Saved. All selected modules are available across the organisation."
+        ),
+    }
+
+
 @router.get("/factory-matrix")
 async def factory_matrix(
     user: User = Depends(get_current_user),
@@ -329,7 +496,19 @@ async def factory_matrix(
         }
 
     return {
-        "modules": [{"code": m.code, "name": m.name, "group": m.group} for m in licensed],
+        # `orgDisabled` marks a licensed module the Super Admin has switched off
+        # for the whole organisation. It stays listed rather than vanishing, so
+        # a plant admin can see WHY the toggle has no effect instead of hunting
+        # for a module that silently disappeared from their screen.
+        "modules": [
+            {
+                "code": m.code,
+                "name": m.name,
+                "group": m.group,
+                "orgDisabled": not org_entitlements.is_enabled_for_org(m.code),
+            }
+            for m in licensed
+        ],
         "factories": [
             {
                 "id": p.id,

@@ -20,6 +20,9 @@ from app.core.db import AsyncSessionLocal
 from app.models.user import Permission, Role, RolePermission, User, UserRole
 
 ADDITIONAL_ROLES: list[dict[str, Any]] = [
+    # SUPER_ADMIN owns the organisation (single tenant, many plants). Everything
+    # SYSTEM_ADMIN can do, plus enabling/disabling modules org-wide.
+    {"code": "SUPER_ADMIN", "name": "Super Administrator", "description": "Organisation owner. Everything a System Administrator can do, plus enabling/disabling modules for the whole organisation.", "isSystem": True, "sortOrder": 0, "defaultLanding": "/organisation/modules"},
     {"code": "SYSTEM_ADMIN", "name": "System Administrator", "description": "Full configuration access. Alias of ADMIN.", "isSystem": True, "sortOrder": 1, "defaultLanding": "/configuration/workflows"},
     {"code": "CORPORATE_HSE", "name": "Corporate HSE", "description": "All-plants HSE leadership; manages master data and roll-up reports.", "isSystem": True, "sortOrder": 5, "defaultLanding": "/dashboard"},
     {"code": "PERMIT_ISSUER", "name": "Permit Issuer", "description": "Originates and approves permits as Issuer.", "isSystem": True, "sortOrder": 25, "defaultLanding": "/inbox"},
@@ -54,6 +57,9 @@ EXTRA_PERMISSIONS = [
     {"code": "CONFIGURATION.PERMISSIONS", "module": "CONFIGURATION", "action": "PERMISSIONS", "description": "Edit role × permission matrix"},
     {"code": "CONFIGURATION.ROLES", "module": "CONFIGURATION", "action": "ROLES", "description": "Create / edit roles and assign role membership"},
     {"code": "AUDIT.VIEW", "module": "AUDIT", "action": "VIEW", "description": "Read audit log"},
+    # Organisation ownership — SUPER_ADMIN only. Disabling a module here removes
+    # it for every plant and every role at once.
+    {"code": "ORGANISATION.MODULES", "module": "ORGANISATION", "action": "MODULES", "description": "Enable / disable modules for the whole organisation (Super Admin)"},
     # Skill Matrix non-CRUD (CRUD comes from OPERATIONAL_MODULES.SKILL_MATRIX)
     {"code": "SKILL_MATRIX.COMPETENCY_CONFIGURE", "module": "SKILL_MATRIX", "action": "COMPETENCY_CONFIGURE", "description": "Create / edit Competency + Skill masters"},
     {"code": "SKILL_MATRIX.ROLE_DEF_CONFIGURE", "module": "SKILL_MATRIX", "action": "ROLE_DEF_CONFIGURE", "description": "Create / edit RoleDefinition + requirements"},
@@ -260,6 +266,8 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "PPE", "actions": ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
+    # SUPER_ADMIN is filled in below, derived from SYSTEM_ADMIN so the two can
+    # never drift apart the way ADMIN and SYSTEM_ADMIN have.
     # ─── Skill Matrix — 2 new roles (Phase 1 IMS), grants per spec §8.1 ───
     "HR_HEAD": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
@@ -276,6 +284,13 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "EPC", "actions": ["READ", "GATE_OVERRIDE"], "scope": "OWN_PLANT"},
     ],
 }
+
+# SUPER_ADMIN = everything SYSTEM_ADMIN has + organisation ownership. Derived,
+# not copied, so a grant added to SYSTEM_ADMIN is automatically held here too.
+ROLE_GRANTS["SUPER_ADMIN"] = [
+    *ROLE_GRANTS["SYSTEM_ADMIN"],
+    {"module": "ORGANISATION", "actions": ["MODULES"], "scope": "ALL_PLANTS"},
+]
 
 DEMO_OVERLAYS = [
     {"emailContains": "rajesh", "roleCode": "PERMIT_ISSUER"},

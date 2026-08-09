@@ -145,7 +145,7 @@ async def main() -> None:
         cpf = next(r for r in (await db.execute(select(AuditCheckpointResponse).where(AuditCheckpointResponse.auditId == a8.id))).scalars().all() if r.workflowState == "AWAITING_AUDITEE")
         await svc.transition_checkpoint(db, user=owner, audit_id=a8.id, checkpoint_id=cpf.id, action="AUDITEE_RESPOND", payload={"comment": "fixed"})
         await svc.transition_checkpoint(db, user=lead, audit_id=a8.id, checkpoint_id=cpf.id, action="ACCEPT", payload={"comment": "ok"})
-        f1 = await svc.generate_report(db, user=lead, audit_id=a8.id, report_type="FINAL", sign_offs=[{"role": "LEAD_AUDITOR", "userId": lead.id}])
+        f1 = await svc.generate_report(db, user=lead, audit_id=a8.id, report_type="FINAL")
         # The full register is now served lazily (not inlined into the immutable
         # snapshot — 1500-cp safe). FINAL sets hasFullRegister; the register
         # endpoint paginates the whole set.

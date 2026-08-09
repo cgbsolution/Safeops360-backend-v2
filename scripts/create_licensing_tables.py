@@ -50,9 +50,28 @@ DDL: list[str] = [
     # Time-window columns (added later — idempotent ALTERs for existing installs).
     'ALTER TABLE "FactoryModuleEntitlement" ADD COLUMN IF NOT EXISTS "validFrom" TIMESTAMPTZ',
     'ALTER TABLE "FactoryModuleEntitlement" ADD COLUMN IF NOT EXISTS "validUntil" TIMESTAMPTZ',
+    # Organisation-wide module allocation (Super Admin) — sits within the
+    # licence ceiling and above the per-factory layer. One row per module.
+    """
+    CREATE TABLE IF NOT EXISTS "OrganisationModuleEntitlement" (
+        "id" TEXT PRIMARY KEY,
+        "moduleCode" TEXT NOT NULL,
+        "enabled" BOOLEAN NOT NULL DEFAULT true,
+        "note" TEXT,
+        "updatedBy" TEXT,
+        "createdAt" TIMESTAMPTZ NOT NULL DEFAULT now(),
+        "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    'CREATE UNIQUE INDEX IF NOT EXISTS "OrganisationModuleEntitlement_module_key" '
+    'ON "OrganisationModuleEntitlement" ("moduleCode")',
 ]
 
-TABLES = ["LicenceInstallation", "FactoryModuleEntitlement"]
+TABLES = [
+    "LicenceInstallation",
+    "FactoryModuleEntitlement",
+    "OrganisationModuleEntitlement",
+]
 
 
 def _existing(s: Session) -> set[str]:
@@ -80,7 +99,7 @@ def main() -> int:
         if set(TABLES) - after:
             print(f"!! MISSING: {sorted(set(TABLES) - after)}")
             return 1
-        print("Done. LicenceInstallation present.")
+        print("Done. All licensing tables present.")
         return 0
 
 

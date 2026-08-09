@@ -947,10 +947,18 @@ async def phase_close(ctx: dict) -> dict:
                 "audit. Audit closed."
             ),
         )
-        a = await db.get(ComplianceAudit, ctx["auditId"])
+        # No `sign_offs` argument. This used to hand the service
+        # `list(a.signOffs or [])` — bypassing the HTTP contract the product
+        # actually uses — so the seeded report carried full signer records while
+        # every report issued through the API carried two nameless stubs. The
+        # seeder looked correct and the product did not, which is precisely how
+        # the defect stayed invisible.
+        #
+        # `generate_report` now reads the recorded sign-offs itself, so this
+        # path and the API path produce the same snapshot. Seed data has to
+        # exercise the real contract or it hides bugs instead of surfacing them.
         final = await svc.generate_report(
             db, user=lead, audit_id=ctx["auditId"], report_type="FINAL",
-            sign_offs=list(a.signOffs or []),
         )
         print(f" 12. closed + FINAL       {final['reportCode']}")
         await db.commit()

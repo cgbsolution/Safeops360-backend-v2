@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # mutated by interval jobs; on-prem deployments set SCHEDULER_ENABLED=true.
     scheduler_enabled: bool = False
 
+    # ─── Super Admin (organisation owner) ────────────────────────────────
+    # The account that owns the organisation and decides which licensed modules
+    # it uses. Authority normally comes from holding the SUPER_ADMIN role; this
+    # email is the break-glass anchor so the organisation can never be left with
+    # nobody able to reach the module screen (e.g. the role row was deleted
+    # during an RBAC edit). Matched case-insensitively.
+    super_admin_email: str = "info@cgbindia.com"
+
     # ─── PTW closed-loop: FLRA policy ────────────────────────────────────
     # FLRA is an optional sub-flow per permit (closed-loop rebuild). Instance-
     # level config matches the per-customer-instance deployment model:

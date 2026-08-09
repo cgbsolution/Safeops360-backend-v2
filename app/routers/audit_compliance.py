@@ -321,14 +321,22 @@ class CloseBody(BaseModel):
     closingRemarks: str = ""
 
 
-class SignOff(BaseModel):
-    role: str
-    userId: str
-
-
 class GenerateReportBody(BaseModel):
+    """Report generation takes no sign-off input.
+
+    There used to be a `signOffs: list[SignOff]` field carrying role + userId,
+    and the service froze it into the immutable snapshot as the report's record
+    of who signed. Since it could not carry a name or a timestamp, every report
+    issued through this endpoint printed blank signers — and, worse, a client
+    could name a role nobody had actually signed. Sign-offs are recorded through
+    `POST /assurance/audits/{id}/signoff`, which authenticates the signer, and
+    the generator reads them from there.
+
+    Extra fields are ignored, so a client still posting `signOffs` gets a valid
+    report rather than a 422.
+    """
+
     reportType: str  # INTERIM | FINAL
-    signOffs: list[SignOff] = []
 
 
 class UploadUrlBody(BaseModel):
@@ -846,7 +854,6 @@ async def generate_report(
     try:
         return await svc.generate_report(
             db, user=user, audit_id=audit_id, report_type=body.reportType,
-            sign_offs=[s.model_dump() for s in body.signOffs] or None,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e

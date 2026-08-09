@@ -113,13 +113,56 @@ binding**, not on this flag.
 - Core modules stay reachable under every state incl. locked (TL-14).
 - All validation is offline — zero network (TL-13).
 
+## The three layers
+
+Access to a module is the AND of three layers. The top one is the only thing
+that can *grant*; the two below it can only *restrict* further:
+
+```
+signed licence ceiling      Vizionforge    which modules exist at all
+  └─ organisation layer     Super Admin    which the organisation uses  (org_entitlements)
+       └─ per-factory layer System Admin   which each plant uses        (factory_entitlements)
+```
+
+Neither admin layer can turn on a module the licence doesn't include — the API
+rejects any write naming a code outside the ceiling, so the
+config-can't-grant-entitlements rule (§5.3) holds at both.
+
+## Organisation-wide module access (Super Admin)
+
+This portal is single-tenant: one organisation (e.g. Page Industries), many
+plants. The **Super Admin** owns that organisation and decides which licensed
+modules it uses at all, from **/organisation/modules**. Switching a module off
+there removes it from every plant, for every role, immediately.
+
+- **Storage:** `OrganisationModuleEntitlement` (moduleCode unique, enabled, note,
+  updatedBy) — opt-out; absence of a row = on, inherited from the licence.
+  Cached in-memory (`org_entitlements.py`), refreshed on boot + after save.
+- **No validity window**, unlike the per-factory layer. A per-factory grant is
+  naturally time-boxed ("this plant gets CAMS for the pilot quarter"); an
+  organisation-level decision is a standing yes/no, and a silently-expiring org
+  module would look like an outage at every plant at once.
+- **Denial message:** `require_module` returns 403 with
+  `reason: "module_disabled_for_organisation"` and *"Please contact your Super
+  Admin to request access to this module."* — deliberately distinct from
+  `module_not_entitled` (licence never had it → contact Vizionforge) because the
+  user's next step is a different person.
+- **Who is a Super Admin:** the `ORGANISATION.MODULES` permission (canonical,
+  granted to `SUPER_ADMIN` only — never to `SYSTEM_ADMIN`/`ADMIN`), OR the
+  `SUPER_ADMIN` role code, OR the `SUPER_ADMIN_EMAIL` anchor account
+  (default `info@cgbindia.com`) as break-glass. Any one suffices, so an RBAC
+  edit can't orphan the organisation.
+- **API:** `GET/PUT /api/licensing/organisation-modules` (Super Admin only).
+- **Bootstrap:** `scripts/create_super_admin.py` creates or promotes the account.
+
 ## Per-factory module access (within the licence ceiling)
 
-The signed licence sets the **deployment ceiling** (which modules exist at all).
-On top of that, an admin can turn licensed modules **on/off per factory** from the
-**/licence → Per-factory module access** matrix. This can only *restrict* within
-the licence — never grant a module the licence doesn't include — so the
-config-can't-grant rule still holds.
+Within what the organisation has enabled, an admin can turn modules **on/off per
+factory** from the **/licence → Per-factory module access** matrix. This can only
+*restrict* further — never grant a module the licence or the organisation has
+switched off. A module the Super Admin turned off org-wide still appears in this
+matrix, flagged `orgDisabled`, so a plant admin can see why their toggle is inert
+rather than hunt for a module that silently vanished.
 
 - **Storage:** `FactoryModuleEntitlement` (plantId, moduleCode, enabled,
   validFrom, validUntil) — opt-out; absence of a row = on with no time bound.
@@ -129,7 +172,8 @@ config-can't-grant rule still holds.
   evaluated against the licence's monotonic effective clock, so a clock rollback
   can't extend it either. Outside the window → blocked at that factory.
 - **Effective access at a factory** = `is_module_enabled(code)` (signed ceiling)
-  AND not disabled for that plant. `enforcement.is_module_enabled_for_plant`.
+  AND enabled org-wide AND not disabled for that plant.
+  `enforcement.is_module_enabled_for_plant`.
 - **Runtime factory** = the active plant. The frontend writes it to the
   `safeops_active_plant` cookie (from `?plantId=` or the user's home plant); the
   API proxy forwards it as the `X-Active-Plant` header; `require_module` enforces
