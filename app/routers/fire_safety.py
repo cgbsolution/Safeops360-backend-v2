@@ -211,6 +211,141 @@ async def get_equipment(eid: str, user: User = Depends(get_current_user), db: As
     return {**_eq(e), "inspectionHistory": history}
 
 
+class EquipmentUpdate(BaseModel):
+    """Partial update. Only fields actually sent are applied (`exclude_unset`),
+    so a client editing one field cannot blank the rest by omission.
+
+    Deliberately NOT editable here:
+      • `plantId` — the asset code, its zone and every access-scope decision are
+        derived from it. Moving a site is a decommission-and-re-register, not an
+        edit, and silently repointing it would orphan the code sequence.
+      • `equipmentCode` / `qrCode` — identity. A printed QR label on the wall is
+        the physical counterpart of this row; renaming it invalidates the label.
+      • `status` — derived. Manual states go through /status-override, which
+        demands a reason and writes the audit chain.
+      • `lastInspectionDate` / `nextInspectionDueDate` — derived from inspection
+        records and the frequency rule. Hand-editing a due date is how a register
+        starts lying about compliance.
+    """
+
+    type: str | None = None
+    assetSubtype: str | None = None
+    location: str | None = Field(default=None, min_length=2)
+    zoneId: str | None = None
+    buildingId: str | None = None
+    make: str | None = None
+    model: str | None = None
+    serialNo: str | None = None
+    capacitySpec: str | None = None
+    maintenanceContractor: str | None = None
+    amcContractId: str | None = None
+    installationDate: datetime | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    floorLevel: int | None = None
+    # A per-asset cadence override is only honoured by fire_frequency.resolve()
+    # when it carries a reason, so the two are validated as a pair below.
+    inspectionFrequencyDays: int | None = Field(default=None, ge=1, le=3650)
+    frequencyOverrideReason: str | None = None
+
+
+@router.patch("/equipment/{eid}")
+async def update_equipment(eid: str, body: EquipmentUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    e = await db.get(FireEquipment, eid)
+    if not e or e.isDeleted:
+        raise HTTPException(404, "Equipment not found")
+    await _require(db, user, _WRITE, plant_id=e.plantId)
+
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "No fields to update.")
+
+    if "zoneId" in patch and patch["zoneId"]:
+        z = await db.get(FireZone, patch["zoneId"])
+        if not z or z.isDeleted:
+            raise HTTPException(404, "Zone not found")
+        if z.plantId != e.plantId:
+            raise HTTPException(400, f"Zone {z.zoneCode} belongs to a different plant.")
+
+    if "amcContractId" in patch and patch["amcContractId"]:
+        c = await db.get(FireAmcContract, patch["amcContractId"])
+        if not c or c.isDeleted:
+            raise HTTPException(404, "AMC contract not found")
+        if c.plantId != e.plantId:
+            raise HTTPException(400, f"Contract {c.contractCode} belongs to a different plant.")
+
+    # An override without a reason is invisible: fire_frequency.resolve() ignores
+    # it and silently falls back to config, so the user would see their edit
+    # "saved" and the cadence unchanged. Reject rather than accept-and-ignore.
+    new_days = patch.get("inspectionFrequencyDays", e.inspectionFrequencyDays)
+    new_reason = patch.get("frequencyOverrideReason", e.frequencyOverrideReason)
+    if "inspectionFrequencyDays" in patch and not (new_reason or "").strip():
+        raise HTTPException(
+            400,
+            "Changing the inspection interval requires frequencyOverrideReason — without one the "
+            "configured frequency rule applies and the override has no effect.",
+        )
+    if "frequencyOverrideReason" in patch and (new_reason or "").strip() and not new_days:
+        raise HTTPException(400, "frequencyOverrideReason requires inspectionFrequencyDays.")
+
+    for field, value in patch.items():
+        setattr(e, field, value)
+    e.updatedBy = user.id
+    await db.commit()
+    await db.refresh(e)
+
+    freq = None
+    try:
+        freq = await freqsvc.resolve_for_equipment(db, e)
+    except Exception:  # noqa: BLE001 — provenance is a label, not the payload
+        await db.rollback()
+    return {**_eq(e), "frequency": freq.as_dict() if freq else None}
+
+
+class EquipmentDeleteBody(BaseModel):
+    # soft_delete() enforces 10 chars itself; declared here so the client gets a
+    # 422 with a field error instead of a 400 with a string.
+    reason: str = Field(min_length=10)
+
+
+@router.delete("/equipment/{eid}")
+async def delete_equipment(eid: str, body: EquipmentDeleteBody, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    """Soft-delete an asset.
+
+    `FireEquipment` is a governed entity: the ORM guard blocks hard deletes
+    outright, and soft-deleted rows are auto-excluded from every SELECT. A fire
+    asset is statutory evidence — the regulator's question is "what did you have
+    and when", so the row survives with who removed it and why.
+
+    Refuses while open defects exist. Deleting the asset would strand them: the
+    defect board reads `areaOrAssetRef`, and a defect whose asset has vanished
+    can never be closed by re-inspection.
+    """
+    e = await db.get(FireEquipment, eid)
+    if not e or e.isDeleted:
+        raise HTTPException(404, "Equipment not found")
+    await _require(db, user, _WRITE, plant_id=e.plantId)
+
+    open_defects = [
+        d for d in await defectsvc.defects_for_asset(db, eid) if d.status in ("OPEN", "IN_PROGRESS")
+    ]
+    if open_defects:
+        raise HTTPException(
+            409,
+            f"{len(open_defects)} open defect(s) reference this asset "
+            f"({', '.join(d.findingCode for d in open_defects[:3])}). Close or reassign them first.",
+        )
+
+    from app.core.soft_delete import soft_delete
+
+    try:
+        soft_delete(e, user.id, body.reason)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    return {"ok": True, "equipmentId": eid, "equipmentCode": e.equipmentCode, "reason": body.reason}
+
+
 class OutOfServiceBody(BaseModel):
     reason: str = Field(min_length=5)
 
