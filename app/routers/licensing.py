@@ -225,6 +225,10 @@ async def my_modules(
         "orgDisabledModules": sorted(
             c for c in org_entitlements.disabled_codes() if c in state.enabled_module_set
         ),
+        # Individual screens the Super Admin has hidden, as nav hrefs. Consumed
+        # by the sidebar and the route guard; the API boundary stays at module
+        # granularity (screens under one module share its routers).
+        "disabledSubModules": sorted(org_entitlements.disabled_nav_hrefs()),
     }
 
 
@@ -417,6 +421,10 @@ async def organisation_modules(
             }
             for m in catalogue
         ],
+        # Screen-level decisions, as bare hrefs (e.g. "/cams/calendar"). The
+        # frontend owns the nav tree and renders it; this is only the set the
+        # Super Admin has switched off, so there is no second catalogue to drift.
+        "disabledSubModules": sorted(org_entitlements.disabled_nav_hrefs()),
     }
 
 
@@ -445,9 +453,29 @@ async def update_organisation_modules(
     hitting it get 'Please contact your Super Admin to request access to this
     module.'"""
     await _require_super_admin(db, user)
-    changes = payload.get("modules")
-    if not isinstance(changes, dict) or not changes:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Expected { modules: {code: bool|spec} }")
+    changes = payload.get("modules") or {}
+    sub_changes = payload.get("subModules") or {}
+    if not isinstance(changes, dict) or not isinstance(sub_changes, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "modules / subModules must be objects")
+    if not changes and not sub_changes:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Expected { modules: {code: bool|spec} } and/or { subModules: {href: bool} }",
+        )
+
+    # Sub-module keys are nav hrefs owned by the frontend, so there is no
+    # registry to validate against — only the shape. Anything not starting with
+    # "/" is a client bug, not a legitimate screen.
+    bad_href = [h for h in sub_changes if not isinstance(h, str) or not h.startswith("/")]
+    if bad_href:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "bad_submodule_key",
+                "message": "Sub-module keys must be nav paths starting with '/'.",
+                "keys": bad_href,
+            },
+        )
 
     unknown = [c for c in changes if c not in MODULE_REGISTRY]
     if unknown:
@@ -485,18 +513,25 @@ async def update_organisation_modules(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"{code}: note must be text")
         normalised[code] = {"enabled": bool(v.get("enabled", True)), "note": (note or "").strip() or None}
 
+    # Screen-level entries share the same store under the NAV: namespace.
+    for href, v in sub_changes.items():
+        enabled = v if isinstance(v, bool) else bool((v or {}).get("enabled", True))
+        normalised[org_entitlements.nav_key(href)] = {"enabled": enabled, "note": None}
+
     # get_db commits the request transaction on return (same contract the
     # per-factory handler relies on); set_modules refreshes the hot-path cache.
     await org_entitlements.set_modules(db, normalised, user.id)
-    disabled = sorted(c for c, s in normalised.items() if not s["enabled"])
+    disabled = sorted(c for c in changes if not normalised[c]["enabled"])
+    sub_off = sorted(h for h in sub_changes if not normalised[org_entitlements.nav_key(h)]["enabled"])
     # Changes to modules the licence doesn't cover are stored but inert — say so
     # rather than let the Super Admin believe they just turned something off
     # that was never reachable in the first place.
-    inert = sorted(c for c in normalised if c not in state.enabled_module_set)
+    inert = sorted(c for c in changes if c not in state.enabled_module_set)
     message = (
-        f"Saved. {len(disabled)} module(s) are now off for the whole organisation."
-        if disabled
-        else "Saved. All selected modules are available across the organisation."
+        f"Saved. {len(disabled)} module(s) and {len(sub_off)} screen(s) are now off"
+        " for the whole organisation."
+        if (disabled or sub_off)
+        else "Saved. All selected modules and screens are available across the organisation."
     )
     if inert:
         message += (
@@ -505,8 +540,10 @@ async def update_organisation_modules(
         )
     return {
         "applied": True,
-        "modules": {c: s["enabled"] for c, s in normalised.items()},
+        "modules": {c: normalised[c]["enabled"] for c in changes},
+        "subModules": {h: normalised[org_entitlements.nav_key(h)]["enabled"] for h in sub_changes},
         "disabledCount": len(disabled),
+        "disabledSubModuleCount": len(sub_off),
         "notLicensed": inert,
         "message": message,
     }
