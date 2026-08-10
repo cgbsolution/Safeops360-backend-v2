@@ -1674,12 +1674,31 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     owners = {o for o in owner_rows if o}
     d["ownerCount"] = len(owners)
 
+    # Every person named on ANY checkpoint of this audit — owner, routed owner
+    # and conducting auditor, across all three columns rather than the
+    # `coalesce` above (which keeps only one of owner/routed) and across ALL
+    # responses rather than the bounded `findings` slice below.
+    #
+    # This is what makes the conduct screen able to name a cross-plant assignee.
+    # The observed failure: the EMS and EnMS disciplines were assigned to users
+    # belonging to a different plant, the screen resolved names only from the
+    # plant-scoped directory, and every one of those checkpoints read
+    # "Unknown user" — while QMS and OHS, assigned to same-plant users, looked
+    # fine. A name must not depend on where the assignee happens to work.
+    assignee_rows = (
+        await db.execute(
+            select(R.assignedOwnerId, R.routedToUserId, R.assignedAuditorId).where(R.auditId == audit_id)
+        )
+    ).all()
+
     # Resolve names for every referenced actor (header + the review rows' owners
     # and thread actors) so the meta strip + owner chips never show "—".
     uid_set: set[str] = {audit.leadAuditorUserId, audit.plantManagerUserId}
     uid_set.update(_coauditor_ids(audit.coAuditors))
     uid_set.update((a.get("userId") if isinstance(a, dict) else a) for a in (audit.auditees or []))
     uid_set.update(owners)
+    for _owner, _routed, _auditor in assignee_rows:
+        uid_set.update((_owner, _routed, _auditor))
     for r in findings:
         uid_set.update((r.assignedOwnerId, r.routedToUserId, r.addedById, r.assignedById))
         for i in r.interactions:
@@ -3275,6 +3294,7 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
 
     now = _utcnow()
     capa_count = 0
+    capa_failures: list[dict[str, Any]] = []
     routed_owners: set[str] = set()
     # Resolved ONCE for the whole submit — a 1,500-checkpoint audit can spawn
     # dozens of CAPAs and this must not become a per-checkpoint lookup.
@@ -3313,6 +3333,19 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
             if spawned:
                 r.workflowState = "ACCEPTED_WITH_CAPA"
                 capa_count += 1
+            else:
+                # The silent failure this replaces was the worst of the three:
+                # an audit could close with critical non-conformances and NO
+                # corrective action raised, and nothing anywhere said so. The
+                # submit still succeeds — blocking it would strand a completed
+                # on-site audit over a permission gap — but the caller is told
+                # exactly which checkpoints did not get their CAPA and why.
+                capa_failures.append({
+                    "checkpointCode": r.checkpointCode,
+                    "categoryName": r.categoryName,
+                    "criticality": r.criticality,
+                    "reason": getattr(r, "capaSpawnError", None) or "unknown error",
+                })
 
     for owner_id in routed_owners:
         await _notify(db, owner_id, f"Audit {audit.auditNumber}: findings assigned to you",
@@ -3327,8 +3360,22 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
     audit.status = "submitted_pending_response"
     audit.submittedAt = now
     audit.actualEndAt = now
+    # A critical failure that owed a CAPA and did not get one is a gap in the
+    # RECORD, so the auditor who submitted must be told at the moment they can
+    # still act on it — not discover it when the report prints no CAPA number.
+    if capa_failures:
+        await _notify(
+            db, audit.leadAuditorUserId,
+            f"Audit {audit.auditNumber}: {len(capa_failures)} CAPA(s) were not raised",
+            "These checkpoints failed and should have raised a corrective action: "
+            + ", ".join(f["checkpointCode"] for f in capa_failures)
+            + f". Reason: {capa_failures[0]['reason']}",
+        )
     await db.flush()
-    return {"ok": True, "status": audit.status, "capasSpawned": capa_count, "score": score}
+    return {
+        "ok": True, "status": audit.status, "capasSpawned": capa_count, "score": score,
+        "capaFailures": capa_failures,
+    }
 
 
 async def _capa_subject(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any] | None:
@@ -3377,7 +3424,13 @@ async def _spawn_capa(
     `subject=None` genuinely means own-facility). Without that flag a None would
     be ambiguous between "own facility" and "not looked up yet", and the loop in
     `submit_audit` would re-query per checkpoint.
+
+    On failure the reason is recorded on `response.capaSpawnError` (transient,
+    not a column — read by the callers below) instead of being lost to stderr.
+    A blanket "please retry" was actively misleading: the commonest failure here
+    is the actor lacking CAPA.CREATE, which no amount of retrying fixes.
     """
+    response.capaSpawnError = None  # type: ignore[attr-defined]
     if response.capa and response.capa.get("capa_id"):
         return False  # already linked
     if not subject_resolved:
@@ -3479,6 +3532,23 @@ async def _spawn_capa(
             }
         return True
     except Exception as e:  # noqa: BLE001
+        # Keep the reason. A permission gap and a database blip both used to
+        # arrive as the same "please retry", and only one of them is worth
+        # retrying — telling them apart is the whole point of this branch.
+        from fastapi import HTTPException as _HTTPException
+
+        if isinstance(e, _HTTPException) and e.status_code in (401, 403):
+            reason = (
+                f"You do not have permission to raise a CAPA at this plant "
+                f"(CAPA.CREATE). Ask an admin to grant it in Configuration → Roles, "
+                f"or have someone who holds it raise the CAPA for "
+                f"{response.checkpointCode}."
+            )
+        elif isinstance(e, _HTTPException):
+            reason = f"CAPA could not be created: {e.detail}"
+        else:
+            reason = f"CAPA could not be created: {type(e).__name__}: {e}"
+        response.capaSpawnError = reason  # type: ignore[attr-defined]
         print(f"Auto-CAPA spawn failed for {response.checkpointCode}: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return False
@@ -3700,6 +3770,48 @@ _ACTION_FROM = {
 }
 
 
+def pm_decision_block_reason(audit, user_id: str) -> str | None:
+    """Why `user_id` may NOT take the plant manager's decision, or None.
+
+    Escalation exists to move a disputed finding to someone who did not raise
+    it. The router gates `PM_*` on AUDIT_COMPLIANCE.APPROVE, but that permission
+    is held at OWN_PLANT scope by every HSE manager at the site — including the
+    co-auditor who conducted the very discipline being escalated. The observed
+    failure: a finding escalated for the plant manager's decision was accepted
+    by the OHS co-auditor who raised it, and `plantManagerReview` then recorded
+    him as the reviewing plant manager. A permission cannot express "someone
+    other than the person who raised this", so identity is checked here.
+
+    Two rules, in this order, because they fail for different reasons and the
+    caller needs to be told which:
+
+      1. **Independence.** The audit team can never review its own escalation.
+         Checked FIRST — if the same person is somehow both auditor and
+         designated reviewer, the honest answer is "you conducted this audit",
+         not "go reassign the reviewer" (to themselves).
+      2. **Identity.** When a reviewer IS designated, they are the reviewer.
+         Anyone else holding APPROVE at the plant is not this audit's reviewer.
+
+    With no reviewer designated (`plantManagerUserId` is optional) rule 2 has
+    nothing to compare against and the permission gate stands alone — but rule 1
+    still applies.
+    """
+    auditor_ids = {audit.leadAuditorUserId, *_coauditor_ids(audit.coAuditors)} - {None}
+    if user_id in auditor_ids:
+        return (
+            "You conducted this audit, so you cannot take the plant manager's "
+            "decision on a finding escalated out of it. Escalation exists to "
+            "reach a reviewer independent of the audit team."
+        )
+    if audit.plantManagerUserId and user_id != audit.plantManagerUserId:
+        return (
+            "Only the plant manager assigned to this audit can decide an "
+            "escalated finding. Reassign the reviewer on the audit team if this "
+            "needs to move to someone else."
+        )
+    return None
+
+
 async def transition_checkpoint(
     db: AsyncSession, *, user: User, audit_id: str, checkpoint_id: str, action: str, payload: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3735,6 +3847,11 @@ async def transition_checkpoint(
         responder = (r.auditeeResponse or {}).get("respondent_user_id")
         if responder and responder == user.id:
             raise ValueError("You can't review your own auditee response")
+
+    if action in ("PM_ACCEPT", "PM_RAISE_CAPA", "PM_SEND_BACK"):
+        _blocked = pm_decision_block_reason(audit, user.id)
+        if _blocked:
+            raise ValueError(_blocked)
 
     # Min-length parity with the client forms (server is the real gate).
     if action == "AUDITEE_RESPOND" and len((payload.get("actionTaken") or payload.get("comment") or "").strip()) < 3:
@@ -3789,9 +3906,15 @@ async def transition_checkpoint(
     elif action in ("RAISE_CAPA", "PM_RAISE_CAPA"):
         spawned = await _spawn_capa(db, user=user, audit=audit, response=r)
         if not spawned:
-            # Never mint a CAPA-less ACCEPTED_WITH_CAPA terminal — fail the action
-            # so it can be retried (mirrors submit_audit's `if spawned` guard).
-            raise ValueError("Could not raise a CAPA for this checkpoint — please retry")
+            # Never mint a CAPA-less ACCEPTED_WITH_CAPA terminal — fail the
+            # action (mirrors submit_audit's `if spawned` guard). The reason is
+            # passed through verbatim: "please retry" was the message shown when
+            # the actor simply lacked CAPA.CREATE, sending them round a loop that
+            # could never succeed.
+            raise ValueError(
+                getattr(r, "capaSpawnError", None)
+                or "Could not raise a CAPA for this checkpoint — please retry"
+            )
         r.capaId = (r.capa or {}).get("capa_id")
         r.workflowState = "ACCEPTED_WITH_CAPA"
         r.overallStatus = "response_accepted"
