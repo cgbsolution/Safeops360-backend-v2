@@ -675,6 +675,12 @@ async def _deliver(b: CalendarBooking, *, force: bool = False) -> str:
         return "skipped"
     if res.ok:
         b.status = "BOOKED"
+        # Record the mailbox the event was ACTUALLY organised from. When the
+        # lead auditor has no mailbox in the tenant the service mailbox stands
+        # in, and the screen must show the real organiser rather than the one
+        # we asked for.
+        if res.organizer_email:
+            b.organizerEmail = res.organizer_email
         if not b.roomEmail:
             b.roomStatus = "NONE"
         elif deferred_room:

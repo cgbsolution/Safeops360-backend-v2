@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -121,6 +121,11 @@ class DeliveryResult:
     provider: str
     event_id: str | None = None
     join_url: str | None = None
+    # The mailbox the event was actually organised from. Differs from the
+    # requested one when the lead auditor has no mailbox in the tenant and the
+    # service mailbox stood in — the audit screen should say so rather than
+    # showing an organiser that is not real.
+    organizer_email: str | None = None
     error: str | None = None
     # False for a permanent rejection — the caller stops retrying immediately
     # instead of spending six attempts on a malformed mailbox address.
@@ -216,6 +221,27 @@ class _TokenCache:
 
 
 _tokens = _TokenCache()
+
+
+def _is_unknown_mailbox(r: httpx.Response) -> bool:
+    """Did Graph reject the ORGANISER's mailbox as unknown to the tenant?
+
+    App-only Graph writes an event INTO a mailbox, so the organiser must be a
+    real user in the tenant. A lead auditor whose address belongs to another
+    domain — a contractor, an external auditor, or any account that simply has
+    no Exchange licence — is a 404, not a permissions problem.
+
+    Matched narrowly on 404 plus Graph's own "invalid user" wording so an
+    unrelated 404 (a deleted event, say) does not silently reroute a meeting to
+    the service mailbox.
+    """
+    if r.status_code != 404:
+        return False
+    try:
+        detail = str((r.json().get("error") or {}).get("message") or "").lower()
+    except Exception:  # noqa: BLE001
+        detail = r.text.lower()
+    return "invalid" in detail and "user" in detail or "mailboxnotenabled" in detail.replace(" ", "")
 
 
 def _is_online_meeting_refusal(r: httpx.Response) -> bool:
@@ -388,6 +414,38 @@ class GraphCalendarProvider(CalendarProvider):
             if err:
                 return DeliveryResult(False, self.name, error=err)
 
+        # The lead auditor's address may not be a mailbox in this tenant — an
+        # external auditor, a contractor, or a demo account on another domain.
+        # Rather than failing the booking outright, organise it from the
+        # configured service mailbox and keep that person as an ATTENDEE, so
+        # they are still invited and the time is still held. A meeting nobody
+        # organises is worth less than one organised by the audit mailbox.
+        fallback = (get_settings().calendar_organizer_email or "").strip()
+        if (
+            r.status_code not in (200, 201)
+            and _is_unknown_mailbox(r)
+            and fallback
+            and fallback.lower() != (spec.organizer_email or "").lower()
+        ):
+            log.info(
+                "Graph does not know mailbox %s; organising from %s instead.",
+                spec.organizer_email, fallback,
+            )
+            displaced = spec.organizer_email
+            spec = replace(spec, organizer_email=fallback)
+            if displaced and not any(
+                a.email.lower() == displaced.lower() for a in spec.attendees
+            ):
+                spec.attendees = [*spec.attendees, Attendee(displaced, displaced, True)]
+            payload = self._event_body(spec)
+            if spec.transaction_id:
+                payload["transactionId"] = spec.transaction_id[:256]
+            r, err = await self._request(
+                "POST", f"/users/{fallback}/events", json=payload
+            )
+            if err:
+                return DeliveryResult(False, self.name, error=err)
+
         if r.status_code not in (200, 201):
             msg, retryable = _graph_error(r)
             return DeliveryResult(False, self.name, error=msg, retryable=retryable)
@@ -396,6 +454,7 @@ class GraphCalendarProvider(CalendarProvider):
             True,
             self.name,
             event_id=data.get("id"),
+            organizer_email=spec.organizer_email,
             join_url=(data.get("onlineMeeting") or {}).get("joinUrl"),
             # PENDING, not ACCEPTED: Exchange's booking assistant has not
             # answered yet at this point, and claiming the room now would be
