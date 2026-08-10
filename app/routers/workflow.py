@@ -321,7 +321,7 @@ async def reassign(
     if task.status != TaskStatus.PENDING.value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Task is not pending")
     role_codes = await get_user_role_codes(db, user.id)
-    is_privileged = any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes)
+    is_privileged = any(r in {"HSE_MANAGER", "ADMIN"} for r in role_codes)
     if task.assignedToId != user.id and not is_privileged:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the current task holder or HSE Manager can reassign")
 

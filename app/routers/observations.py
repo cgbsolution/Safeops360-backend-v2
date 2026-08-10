@@ -576,7 +576,7 @@ async def delete_observation(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Hard-delete an observation. Per the RBAC matrix, only HSE_MANAGER
-    (own plant), CORPORATE_HSE (all plants), and SYSTEM_ADMIN (all plants)
+    (own plant), CORPORATE_HSE (all plants), and ADMIN (all plants)
     have OBSERVATION.DELETE — the permission service enforces the scope.
     Cascades remove the workflow instance, tasks, history, and any
     attachments via DB foreign keys (ondelete=CASCADE)."""

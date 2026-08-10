@@ -49,7 +49,6 @@ VALID_LENSES = ("executive", "hse_manager", "site_lead")
 _ROLE_LENS = {
     "CORPORATE_HSE": "executive",
     "ADMIN": "executive",
-    "SYSTEM_ADMIN": "executive",
     "HSE_MANAGER": "hse_manager",
     "PLANT_HEAD": "site_lead",
     "DEPARTMENT_HEAD": "site_lead",

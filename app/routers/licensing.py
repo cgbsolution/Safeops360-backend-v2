@@ -47,7 +47,7 @@ from app.services.permissions import PermissionContext, can
 router = APIRouter(prefix="/api/licensing", tags=["licensing"])
 
 # Permission codes that mark a licence administrator. LICENSING.MANAGE is the
-# canonical one (seeded for SYSTEM_ADMIN); the CONFIGURATION.* fallbacks let it
+# canonical one (seeded for ADMIN); the CONFIGURATION.* fallbacks let it
 # work for system admins even before a reseed.
 _ADMIN_PERMS = (
     "LICENSING.MANAGE",

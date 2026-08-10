@@ -21,9 +21,13 @@ from app.models.user import Permission, Role, RolePermission, User, UserRole
 
 ADDITIONAL_ROLES: list[dict[str, Any]] = [
     # SUPER_ADMIN owns the organisation (single tenant, many plants). Everything
-    # SYSTEM_ADMIN can do, plus enabling/disabling modules org-wide.
-    {"code": "SUPER_ADMIN", "name": "Super Administrator", "description": "Organisation owner. Everything a System Administrator can do, plus enabling/disabling modules for the whole organisation.", "isSystem": True, "sortOrder": 0, "defaultLanding": "/organisation/modules"},
-    {"code": "SYSTEM_ADMIN", "name": "System Administrator", "description": "Full configuration access. Alias of ADMIN.", "isSystem": True, "sortOrder": 1, "defaultLanding": "/configuration/workflows"},
+    # ADMIN can do, plus enabling/disabling modules org-wide.
+    {"code": "SUPER_ADMIN", "name": "Super Administrator", "description": "Organisation owner. Everything an Administrator can do, plus enabling/disabling modules for the whole organisation.", "isSystem": True, "sortOrder": 0, "defaultLanding": "/organisation/modules"},
+    # SYSTEM_ADMIN was removed: it and ADMIN were declared aliases but had
+    # drifted into two different grant sets. ADMIN is now the single portal
+    # administrator and absorbs everything SYSTEM_ADMIN held (union assembled
+    # below the ROLE_GRANTS literal).
+    {"code": "ADMIN", "name": "Administrator", "description": "Full configuration access — users, roles, workflows, masters and every module across all plants.", "isSystem": True, "sortOrder": 1, "defaultLanding": "/configuration/workflows"},
     {"code": "CORPORATE_HSE", "name": "Corporate HSE", "description": "All-plants HSE leadership; manages master data and roll-up reports.", "isSystem": True, "sortOrder": 5, "defaultLanding": "/dashboard"},
     {"code": "PERMIT_ISSUER", "name": "Permit Issuer", "description": "Originates and approves permits as Issuer.", "isSystem": True, "sortOrder": 25, "defaultLanding": "/inbox"},
     {"code": "SAFETY_OFFICER", "name": "Safety Officer", "description": "Verifies observations, near-miss closure, permit safety conditions.", "isSystem": True, "sortOrder": 27, "defaultLanding": "/inbox"},
@@ -258,6 +262,7 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "PPE", "actions": ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
+    # Former standalone role; merged into ADMIN below, then dropped.
     "SYSTEM_ADMIN": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "ALL_PLANTS"} for m in OPERATIONAL_MODULES
     ] + [
@@ -266,8 +271,8 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "SKILL_MATRIX", "actions": ["COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE", "RECERT_CYCLE", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "PPE", "actions": ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "ALL_PLANTS"},
     ],
-    # SUPER_ADMIN is filled in below, derived from SYSTEM_ADMIN so the two can
-    # never drift apart the way ADMIN and SYSTEM_ADMIN have.
+    # SUPER_ADMIN is filled in below, derived from ADMIN so the two can
+    # never drift apart.
     # ─── Skill Matrix — 2 new roles (Phase 1 IMS), grants per spec §8.1 ───
     "HR_HEAD": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "SUSPEND", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
@@ -285,10 +290,16 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     ],
 }
 
-# SUPER_ADMIN = everything SYSTEM_ADMIN has + organisation ownership. Derived,
-# not copied, so a grant added to SYSTEM_ADMIN is automatically held here too.
+# ADMIN absorbs SYSTEM_ADMIN. The two were meant to be aliases and had drifted,
+# so take the UNION rather than pick one — that keeps every capability that
+# existed under either name. Duplicate (role, permission, scope) triples are
+# filtered at insert time.
+ROLE_GRANTS["ADMIN"] = [*ROLE_GRANTS["ADMIN"], *ROLE_GRANTS.pop("SYSTEM_ADMIN")]
+
+# SUPER_ADMIN = everything ADMIN has + organisation ownership. Derived, not
+# copied, so a grant added to ADMIN is automatically held here too.
 ROLE_GRANTS["SUPER_ADMIN"] = [
-    *ROLE_GRANTS["SYSTEM_ADMIN"],
+    *ROLE_GRANTS["ADMIN"],
     {"module": "ORGANISATION", "actions": ["MODULES"], "scope": "ALL_PLANTS"},
 ]
 
@@ -410,9 +421,9 @@ async def main() -> None:
                 )
             )
 
-        # SYSTEM_ADMIN overlay on the bootstrap admin
+        # ADMIN overlay on the bootstrap admin
         admin_user = next((u for u in all_users if "admin" in u.email.lower()), None)
-        sysadmin_role = roles_by_code.get("SYSTEM_ADMIN")
+        sysadmin_role = roles_by_code.get("ADMIN")
         if admin_user and sysadmin_role:
             existing = (
                 await db.execute(

@@ -227,7 +227,7 @@ async def propagate_audit(db: AsyncSession, incident: Incident) -> dict[str, Any
         return {"target": "audit_checkpoint", "created": 0, "reason": "audit has no resolvable discipline"}
 
     # System actor for the ad-hoc insertion.
-    system_user = (await db.execute(select(User).where(User.role == "SYSTEM_ADMIN").limit(1))).scalar_one_or_none()
+    system_user = (await db.execute(select(User).where(User.role == "ADMIN").limit(1))).scalar_one_or_none()
     if system_user is None:
         return {"target": "audit_checkpoint", "created": 0, "reason": "no system actor"}
     try:

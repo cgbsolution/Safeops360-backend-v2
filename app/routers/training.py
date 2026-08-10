@@ -391,7 +391,7 @@ async def decide_program_approval(
     """UNDER_REVIEW → APPROVED or back to DRAFT (rejected). HSE_MANAGER
     or ADMIN role required."""
     role_codes = await get_user_role_codes(db, user.id)
-    if not any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes):
+    if not any(r in {"HSE_MANAGER", "ADMIN"} for r in role_codes):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only HSE Manager / Admin can approve or reject training programs.",
@@ -424,7 +424,7 @@ async def retire_program(
     """APPROVED → RETIRED. New schedules cannot use this program but
     existing certificates stay valid until expiry. HSE_MANAGER required."""
     role_codes = await get_user_role_codes(db, user.id)
-    if not any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN", "LD_MANAGER"} for r in role_codes):
+    if not any(r in {"HSE_MANAGER", "ADMIN", "LD_MANAGER"} for r in role_codes):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only HSE Manager / LD Manager / Admin can retire training programs.",
@@ -696,7 +696,7 @@ async def create_schedule(
     # Permission: program scheduling is LD_MANAGER / HSE_MANAGER / ADMIN
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes
+        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN"} for r in role_codes
     ):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -805,7 +805,7 @@ async def update_schedule(
 ) -> TrainingScheduleOut:
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes
+        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN"} for r in role_codes
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only schedulers can edit.")
     schedule = await db.get(TrainingSchedule, schedule_id)
@@ -1094,7 +1094,7 @@ async def decide_registration(
     """Manager approves / rejects a self-nomination."""
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"SUPERVISOR", "DEPARTMENT_HEAD", "LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"}
+        r in {"SUPERVISOR", "DEPARTMENT_HEAD", "LD_MANAGER", "HSE_MANAGER", "ADMIN"}
         for r in role_codes
     ):
         raise HTTPException(
@@ -1133,7 +1133,7 @@ async def withdraw_registration(
     # Only the registered user OR a scheduler can withdraw
     role_codes = await get_user_role_codes(db, user.id)
     is_priv = any(
-        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes
+        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN"} for r in role_codes
     )
     if reg.userId != user.id and not is_priv:
         raise HTTPException(
@@ -1166,7 +1166,7 @@ async def capture_attendance_bulk(
     # Permission: the assigned trainer OR LD/HSE/Admin
     role_codes = await get_user_role_codes(db, user.id)
     is_priv = any(
-        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN", "TRAINER"}
+        r in {"LD_MANAGER", "HSE_MANAGER", "ADMIN", "TRAINER"}
         for r in role_codes
     )
     if session_obj.trainerId != user.id and not is_priv:
@@ -1294,7 +1294,7 @@ async def start_assessment(
     if reg.userId != user.id:
         role_codes = await get_user_role_codes(db, user.id)
         if not any(
-            r in {"TRAINER", "LD_MANAGER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"}
+            r in {"TRAINER", "LD_MANAGER", "HSE_MANAGER", "ADMIN"}
             for r in role_codes
         ):
             raise HTTPException(
@@ -1540,7 +1540,7 @@ async def list_certificates(
     plant-wide. Accepts user_id / program_id / status_filter query args."""
     role_codes = await get_user_role_codes(db, user.id)
     is_priv = any(
-        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SYSTEM_ADMIN", "CORPORATE_HSE", "PLANT_HEAD"}
+        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "CORPORATE_HSE", "PLANT_HEAD"}
         for r in role_codes
     )
     stmt = select(TrainingCertificate)
@@ -1594,7 +1594,7 @@ async def get_certificate(
     # Workers can only read their own
     role_codes = await get_user_role_codes(db, user.id)
     is_priv = any(
-        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SYSTEM_ADMIN", "CORPORATE_HSE", "PLANT_HEAD", "SAFETY_OFFICER", "SUPERVISOR"}
+        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "CORPORATE_HSE", "PLANT_HEAD", "SAFETY_OFFICER", "SUPERVISOR"}
         for r in role_codes
     )
     if cert.userId != user.id and not is_priv:
@@ -1666,7 +1666,7 @@ async def revoke_certificate_endpoint(
     """HSE Manager / LD Manager / Admin — revoke an active certificate."""
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SYSTEM_ADMIN", "PLANT_HEAD"}
+        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "PLANT_HEAD"}
         for r in role_codes
     ):
         raise HTTPException(
@@ -1698,7 +1698,7 @@ async def review_effectiveness_endpoint(
 ) -> TrainingCertificateOut:
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SYSTEM_ADMIN", "SUPERVISOR"}
+        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SUPERVISOR"}
         for r in role_codes
     ):
         raise HTTPException(
@@ -1731,7 +1731,7 @@ async def refresh_states_endpoint(
     button on the certificate dashboard fires it on demand."""
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "SYSTEM_ADMIN", "CORPORATE_HSE"}
+        r in {"HSE_MANAGER", "LD_MANAGER", "ADMIN", "CORPORATE_HSE"}
         for r in role_codes
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin / HSE / LD only.")
@@ -1895,7 +1895,7 @@ async def delete_training_record(
     """Hard-delete a training record. Per the RBAC matrix:
     - LD_MANAGER can delete OWN_RECORDS (own draft records)
     - HSE_MANAGER can delete OWN_PLANT
-    - SYSTEM_ADMIN can delete ALL_PLANTS
+    - ADMIN can delete ALL_PLANTS
     The permission service enforces the scope. TrainingRecord has no
     children to cascade — clean delete."""
     record = await db.get(TrainingRecord, record_id)

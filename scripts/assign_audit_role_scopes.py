@@ -8,7 +8,7 @@ services/audit_assignment.py):
     Auditee                    -> AUDIT_COMPLIANCE.UPDATE
 
 Every slot already resolved to more than five people at Meridian North Works,
-but almost all of them were ADMIN / SYSTEM_ADMIN accounts holding the
+but almost all of them were ADMIN accounts holding the
 permission incidentally, while the actual audit personas (Anjali Verma, Lead
 Auditor) were absent because the CAMS roles carried no AUDIT_COMPLIANCE grant
 at all. Run scripts/grant_audit_compliance_cams_auditors.py FIRST — that fixes

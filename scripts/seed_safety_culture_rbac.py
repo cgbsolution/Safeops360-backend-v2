@@ -54,7 +54,6 @@ GRANTS: dict[str, tuple[list[str], str]] = {
     # Enterprise EHS / risk leadership see the rollup + wire KRIs.
     "CORPORATE_HSE": (ALL, "ALL_PLANTS"),
     "ADMIN": (ALL, "ALL_PLANTS"),
-    "SYSTEM_ADMIN": (ALL, "ALL_PLANTS"),
 }
 
 # ERM leadership roles (may be absent in some tenants) — read + KRI wiring.

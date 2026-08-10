@@ -42,7 +42,7 @@ PERMISSION_CODE = "PTW.EXECUTE"
 SCOPE = "OWN_RECORDS"
 
 # Every role that holds any PTW grant today and could therefore be picked
-# as a Receiver. HSE_MANAGER / ADMIN / SYSTEM_ADMIN already hold EXECUTE at
+# as a Receiver. HSE_MANAGER / ADMIN already hold EXECUTE at
 # a wider scope and are deliberately left alone.
 TARGET_ROLES = [
     "WORKER",

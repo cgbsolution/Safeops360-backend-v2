@@ -157,7 +157,7 @@ async def delete_inspection(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Hard-delete an inspection. Per the RBAC matrix only HSE_MANAGER
-    (own plant) and SYSTEM_ADMIN have INSPECTION.DELETE."""
+    (own plant) and ADMIN have INSPECTION.DELETE."""
     insp = await db.get(Inspection, inspection_id)
     if insp is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Inspection not found")

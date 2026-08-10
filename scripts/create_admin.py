@@ -3,7 +3,7 @@
 A clean client install has the schema + RBAC roles (from seed-rbac) but no
 users. This bootstraps:
   * a Plant (if none exists), so the admin has a home plant, and
-  * a SYSTEM_ADMIN user with a bcrypt password, assigned the SYSTEM_ADMIN role.
+  * an ADMIN user with a bcrypt password, assigned the ADMIN role.
 
 That account can then log in, reach the Licence screen, manage users, and run
 the rest of onboarding. Idempotent on the email (updates the password if the
@@ -27,7 +27,7 @@ from app.core.security import hash_password
 from app.models.plant import Plant
 from app.models.user import Role, User, UserRole
 
-ADMIN_ROLE_CODE = "SYSTEM_ADMIN"
+ADMIN_ROLE_CODE = "ADMIN"
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -50,7 +50,7 @@ async def run(args: argparse.Namespace) -> int:
             await db.flush()
             print(f"Created plant {plant.code} — {plant.name}")
 
-        # 2. The SYSTEM_ADMIN role must exist (run seed-rbac first).
+        # 2. The ADMIN role must exist (run seed-rbac first).
         role = (
             await db.execute(select(Role).where(Role.code == ADMIN_ROLE_CODE))
         ).scalar_one_or_none()
@@ -83,7 +83,7 @@ async def run(args: argparse.Namespace) -> int:
             user.role = ADMIN_ROLE_CODE
             print(f"Updated existing user {user.email} (password reset, role={ADMIN_ROLE_CODE})")
 
-        # 4. Ensure the SYSTEM_ADMIN role assignment (ALL_PLANTS scope).
+        # 4. Ensure the ADMIN role assignment (ALL_PLANTS scope).
         existing = (
             await db.execute(
                 select(UserRole).where(UserRole.userId == user.id, UserRole.roleId == role.id)
@@ -91,7 +91,7 @@ async def run(args: argparse.Namespace) -> int:
         ).scalar_one_or_none()
         if existing is None:
             db.add(UserRole(userId=user.id, roleId=role.id, scopeType=None, scopeValue=None))
-            print("Assigned SYSTEM_ADMIN role")
+            print("Assigned ADMIN role")
 
         await db.commit()
         print("\nDone. Log in with:")
@@ -101,7 +101,7 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Create the first SYSTEM_ADMIN user")
+    p = argparse.ArgumentParser(description="Create the first ADMIN user")
     p.add_argument("--email", required=True)
     p.add_argument("--password", required=True)
     p.add_argument("--name", default="Administrator")

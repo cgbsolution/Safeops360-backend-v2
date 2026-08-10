@@ -586,7 +586,7 @@ async def delete_incident(
 ) -> None:
     """Soft-delete an incident (governed entity — never hard-deleted; the ORM
     guard in app.core.soft_delete blocks a hard delete). Per the RBAC matrix
-    INCIDENT.DELETE is held by HSE_MANAGER, CORPORATE_HSE, and SYSTEM_ADMIN —
+    INCIDENT.DELETE is held by HSE_MANAGER, CORPORATE_HSE, and ADMIN —
     the permission service enforces the scope (ALL_PLANTS / OWN_PLANT / …), so
     an HSE Manager granted ALL_PLANTS can delete an incident raised by any user
     at any plant.
@@ -595,7 +595,7 @@ async def delete_incident(
     (persons, witnesses, evidence, timeline, equipment, CAPAs, comments,
     attachments, investigation members) does NOT fire — the full investigation
     record is preserved and hidden behind the invisible soft-delete filter, and
-    a SYSTEM_ADMIN can restore() it within the 30-day window. Only the workflow
+    a ADMIN can restore() it within the 30-day window. Only the workflow
     instance is removed so the incident drops out of live inboxes/task lists; it
     doesn't FK-cascade from Incident, so we delete it explicitly."""
     incident = await db.get(Incident, incident_id)
@@ -1658,7 +1658,7 @@ async def delete_document_review(
 
 # Roles that can see / post privileged-legal comments. Anyone outside
 # this list never sees them in the GET response.
-_PRIVILEGED_ROLES = {"HSE_MANAGER", "PLANT_HEAD", "CORPORATE_HSE", "ADMIN", "SYSTEM_ADMIN"}
+_PRIVILEGED_ROLES = {"HSE_MANAGER", "PLANT_HEAD", "CORPORATE_HSE", "ADMIN"}
 
 
 def _can_see_privileged(user: User) -> bool:

@@ -3170,7 +3170,7 @@ async def cron_review_scheduler(
     """
     from datetime import timedelta
 
-    # Allow CORPORATE_HSE / ADMIN / SYSTEM_ADMIN to run this (cron-internal users)
+    # Allow CORPORATE_HSE / ADMIN to run this (cron-internal users)
     check = await can(db, user.id, "HIRA.EXECUTE", PermissionContext())
     if not check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Cron job requires HIRA.EXECUTE")

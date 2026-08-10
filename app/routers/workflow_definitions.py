@@ -1,6 +1,6 @@
 """Workflow definition admin router. Mirror of /api/workflow/definitions/*.
 
-Gated on CONFIGURATION.WORKFLOWS — only ADMIN / SYSTEM_ADMIN / CORPORATE_HSE
+Gated on CONFIGURATION.WORKFLOWS — only ADMIN / CORPORATE_HSE
 hold this in the default matrix. The visual workflow editor in the React app
 hits these endpoints to create, edit, version, restore, toggle, and test-run
 workflow definitions.

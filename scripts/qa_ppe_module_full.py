@@ -54,7 +54,7 @@ async def main() -> None:  # noqa: PLR0915
                 select(User)
                 .join(UserRole, UserRole.userId == User.id)
                 .join(Role, Role.id == UserRole.roleId)
-                .where(Role.code.in_(["HSE_MANAGER", "SYSTEM_ADMIN", "ADMIN"]))
+                .where(Role.code.in_(["HSE_MANAGER", "ADMIN"]))
                 .limit(1)
             )
         ).scalars().first()

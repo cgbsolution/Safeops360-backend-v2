@@ -6,7 +6,7 @@ custom-checkpoint authoring, so locking scheduling down by revoking CREATE
 would have silently stripped content authoring from the audit roles too.
 
 So scheduling gets its own permission, AUDIT_COMPLIANCE.SCHEDULE, granted to
-HSE_MANAGER (own plant) and ADMIN / SYSTEM_ADMIN (all plants) and nobody else.
+HSE_MANAGER (own plant) and ADMIN (all plants) and nobody else.
 Everyone keeps CREATE and therefore keeps library/template authoring.
 
 Widening this later is a tick-box in Configuration -> Roles: grant
@@ -30,7 +30,6 @@ CODE = "AUDIT_COMPLIANCE.SCHEDULE"
 GRANTS: dict[str, str] = {
     "HSE_MANAGER": "OWN_PLANT",
     "ADMIN": "ALL_PLANTS",
-    "SYSTEM_ADMIN": "ALL_PLANTS",
 }
 
 

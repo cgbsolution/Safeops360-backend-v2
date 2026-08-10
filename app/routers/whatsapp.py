@@ -31,7 +31,7 @@ from app.services import whatsapp
 
 router = APIRouter(prefix="/api/whatsapp", tags=["whatsapp"])
 
-_ADMIN_ROLES = {"HSE_MANAGER", "PLANT_HEAD", "CORPORATE_HSE", "ADMIN", "SYSTEM_ADMIN"}
+_ADMIN_ROLES = {"HSE_MANAGER", "PLANT_HEAD", "CORPORATE_HSE", "ADMIN"}
 
 
 # ─── Webhook ────────────────────────────────────────────────────────────────

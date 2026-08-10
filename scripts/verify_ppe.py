@@ -37,7 +37,7 @@ async def main() -> int:
         if lms is None:
             lms = (await db.execute(select(Plant))).scalars().first()
         users = (await db.execute(select(User).where(User.plantId == lms.id))).scalars().all()
-        admin = next((u for u in users if (u.role or "").upper() in ("ADMIN", "SYSTEM_ADMIN", "HSE_MANAGER", "SAFETY_OFFICER")), users[0])
+        admin = next((u for u in users if (u.role or "").upper() in ("ADMIN", "HSE_MANAGER", "SAFETY_OFFICER")), users[0])
         recipient = next((u for u in users if u.id != admin.id), users[0])
         print(f"Plant {lms.code} | {len(users)} users | issuer={admin.name} | recipient={recipient.name}")
 

@@ -476,7 +476,7 @@ async def manual_promote_to_incident(
     didn't (e.g. earlier transient bugs), and as an admin override when
     a non-Critical near miss is later judged to warrant investigation.
     Idempotent: returns the existing incident id if already promoted.
-    Permission gated to HSE_MANAGER / CORPORATE_HSE / SYSTEM_ADMIN."""
+    Permission gated to HSE_MANAGER / CORPORATE_HSE / ADMIN."""
     nm = await db.get(NearMiss, nm_id)
     if nm is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Near miss not found")
@@ -516,7 +516,7 @@ async def delete_near_miss(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Hard-delete a near miss. Per the RBAC matrix only HSE_MANAGER (own
-    plant), CORPORATE_HSE (all plants) and SYSTEM_ADMIN (all plants)
+    plant), CORPORATE_HSE (all plants) and ADMIN (all plants)
     have NEAR_MISS.DELETE — the permission service enforces the scope.
     Cascades the workflow chain + child rows (persons / CAPAs /
     attachments / comments) via FK ondelete=CASCADE.

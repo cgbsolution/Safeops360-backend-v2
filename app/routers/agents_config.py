@@ -19,7 +19,7 @@ Permission model:
   • GET endpoints require AGENT.RCA_INVOKE (someone who can use the
     agent can see its config).
   • PATCH + prompt-promote require AGENT.RCA_CONFIGURE (Corporate HSE
-    or SYSTEM_ADMIN per seed).
+    or ADMIN per seed).
   • The manual calibration trigger requires AGENT.RCA_CONFIGURE — it's
     an operational action.
   • The cost summary requires AGENT.AUDIT_VIEW (cost is sensitive info

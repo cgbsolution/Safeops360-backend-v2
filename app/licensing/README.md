@@ -148,7 +148,7 @@ there removes it from every plant, for every role, immediately.
   `module_not_entitled` (licence never had it → contact Vizionforge) because the
   user's next step is a different person.
 - **Who is a Super Admin:** the `ORGANISATION.MODULES` permission (canonical,
-  granted to `SUPER_ADMIN` only — never to `SYSTEM_ADMIN`/`ADMIN`), OR the
+  granted to `SUPER_ADMIN` only — never to `ADMIN`), OR the
   `SUPER_ADMIN` role code, OR the `SUPER_ADMIN_EMAIL` anchor account
   (default `info@cgbindia.com`) as break-glass. Any one suffices, so an RBAC
   edit can't orphan the organisation.

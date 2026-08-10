@@ -354,7 +354,7 @@ async def delete_flra(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Hard-delete an FLRA. Per the RBAC matrix only HSE_MANAGER (own plant)
-    and SYSTEM_ADMIN have FLRA.DELETE. Cascades remove team members,
+    and ADMIN have FLRA.DELETE. Cascades remove team members,
     crew signatures, job steps + hazards, fitness declarations, and
     attachments via FK ondelete=CASCADE."""
     flra = await db.get(FLRA, flra_id)
@@ -530,7 +530,7 @@ async def redo_flra(
         await db.execute(sig_q)
     ).scalar_one_or_none() is not None or flra.leaderId == user.id
     role_codes = await get_user_role_codes(db, user.id)
-    is_priv = any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN"} for r in role_codes)
+    is_priv = any(r in {"HSE_MANAGER", "ADMIN"} for r in role_codes)
     if not is_crew and not is_priv:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,

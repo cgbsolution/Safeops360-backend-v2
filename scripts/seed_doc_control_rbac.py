@@ -30,7 +30,6 @@ GRANTS: dict[str, tuple[list[str], str]] = {
     "PLANT_HEAD": (ACTIONS, "OWN_PLANT"),
     "CORPORATE_HSE": (["READ", "EXPORT"], "ALL_PLANTS"),
     "ADMIN": (ACTIONS, "ALL_PLANTS"),
-    "SYSTEM_ADMIN": (ACTIONS, "ALL_PLANTS"),
 }
 
 

@@ -446,7 +446,7 @@ async def decide_extension(
     permit = await _load_permit_or_403(db, permit_id, user, "PTW.UPDATE")
     role_codes = await get_user_role_codes(db, user.id)
     if not any(
-        r in {"PERMIT_ISSUER", "SAFETY_OFFICER", "HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN", "PLANT_HEAD"}
+        r in {"PERMIT_ISSUER", "SAFETY_OFFICER", "HSE_MANAGER", "ADMIN", "PLANT_HEAD"}
         for r in role_codes
     ):
         raise HTTPException(

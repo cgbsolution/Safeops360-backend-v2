@@ -89,7 +89,7 @@ async def list_processes(criticality: str | None = Query(None), siteId: str | No
     role_codes = await get_user_role_codes(db, user.id)
     rows = (await db.execute(select(BusinessProcess).where(BusinessProcess.isDeleted.is_(False)))).scalars().all()
     # Plant HSE Head: own-site OPS processes only (pragmatic site scope)
-    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "BCM_COORDINATOR", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "SYSTEM_ADMIN", "ADMIN")):
+    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "BCM_COORDINATOR", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "ADMIN")):
         from app.services.permissions import get_accessible_plants
         acc = await get_accessible_plants(db, user.id)
         if acc is not None:
@@ -576,7 +576,7 @@ async def activate_crisis(body: S.CrisisActivate, user: User = Depends(get_curre
     await _require(db, user, "CRISIS.ACTIVATE", plant_id=body.siteId)
     role_codes = await get_user_role_codes(db, user.id)
     # Plant HSE Head may only activate severity 1 on their own site (T3-11)
-    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "BCM_COORDINATOR", "SYSTEM_ADMIN", "ADMIN")):
+    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "BCM_COORDINATOR", "ADMIN")):
         if body.severityLevel != 1:
             raise HTTPException(403, "Plant HSE Head may only activate severity-1 crises.")
     cached = await svc.snapshot_plans_for_crisis(db, body.activatedPlanIds)

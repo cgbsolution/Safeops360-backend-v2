@@ -59,7 +59,7 @@ _WRITE = "INCIDENT.UPDATE"
 # Config masters (ThresholdRule, IncompatibilityMatrix, region mapping) are
 # Admin-only per the build spec's role table. `CONFIGURATION.MASTERS` is the
 # platform's existing code for master-data configuration and is held by ADMIN /
-# SYSTEM_ADMIN only — an invented code like "ADMIN.MANAGE" would not exist in
+# ADMIN only — an invented code like "ADMIN.MANAGE" would not exist in
 # the permission catalogue, and `can()` fails closed on an unknown code, so
 # those endpoints would have 403'd for everyone including administrators.
 _ADMIN = "CONFIGURATION.MASTERS"

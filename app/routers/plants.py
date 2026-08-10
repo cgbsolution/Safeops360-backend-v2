@@ -5,7 +5,7 @@ endpoint for the plant picker. The web version reads plants directly from
 Prisma, but the mobile app needs a REST surface.
 
 Filtered to the plants the caller can act in — `get_accessible_plants(None)`
-means SYSTEM_ADMIN sees everything, others see only their permitted scope.
+means ADMIN sees everything, others see only their permitted scope.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ async def _assert_plant_accessible(db: AsyncSession, user: User, plant_id: str) 
 
 # ─── Feature 8 — Cost of unsafety ───────────────────────────────────────────
 
-_COST_CONFIG_ROLES = {"PLANT_HEAD", "CORPORATE_HSE", "ADMIN", "SYSTEM_ADMIN"}
+_COST_CONFIG_ROLES = {"PLANT_HEAD", "CORPORATE_HSE", "ADMIN"}
 
 
 class CostConfigInput(BaseModel):

@@ -140,7 +140,7 @@ async def _scope_query(db: AsyncSession, user: User):
     stmt = select(EnterpriseRisk).where(EnterpriseRisk.isDeleted.is_(False))
 
     is_privileged = any(
-        r in role_codes for r in ("CRO", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "SYSTEM_ADMIN", "ADMIN", "CORPORATE_HSE")
+        r in role_codes for r in ("CRO", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "ADMIN", "CORPORATE_HSE")
     )
     if "PLANT_HSE_HEAD" in role_codes and not is_privileged:
         # Site rollup OPS risks only — no strategic/financial exposure.

@@ -63,7 +63,7 @@ QUALIFYING_TYPE = ObservationType.UNSAFE_ACT
 # in this system. The plant/corporate HSE leadership roles are included because
 # they own the safety hold itself.
 DECISION_ROLES = frozenset(
-    {"DEPARTMENT_HEAD", "HSE_MANAGER", "PLANT_HSE_HEAD", "CORPORATE_HSE", "SYSTEM_ADMIN", "ADMIN"}
+    {"DEPARTMENT_HEAD", "HSE_MANAGER", "PLANT_HSE_HEAD", "CORPORATE_HSE", "ADMIN"}
 )
 
 MIN_DECISION_REASON_CHARS = 10

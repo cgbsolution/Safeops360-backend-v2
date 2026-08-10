@@ -47,7 +47,7 @@ router = APIRouter(prefix="/api/erm/rca", tags=["erm-rca"])
 # domains on READ, EXCEPT a compliance-scoped role which is restricted to its
 # own domain (RCA-T16). Plant scope is enforced separately via QueryScope.
 _ALL_DOMAIN_ROLES = {
-    "CRO", "ADMIN", "SYSTEM_ADMIN", "RISK_CHAMPION", "RISK_OWNER", "EXECUTIVE_VIEWER", "HSE_MANAGER",
+    "CRO", "ADMIN", "RISK_CHAMPION", "RISK_OWNER", "EXECUTIVE_VIEWER", "HSE_MANAGER",
 }
 _DOMAIN_SCOPED_ROLES = {
     "COMPLIANCE_OFFICER": {"COMPLIANCE"},

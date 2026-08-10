@@ -490,7 +490,7 @@ async def delete_permit(
     """Soft-delete a permit (governed entity — never hard-deleted). Per the RBAC matrix:
     - PERMIT_ISSUER can delete OWN_RECORDS (their own draft permits)
     - HSE_MANAGER can delete OWN_PLANT
-    - SYSTEM_ADMIN can delete ALL_PLANTS
+    - ADMIN can delete ALL_PLANTS
     The permission service enforces the scope. Cascades remove workflow
     instance, tasks, history, child rows (isolations, gas readings,
     suspensions, extensions, approvals, attachments) via FK ondelete=CASCADE.
@@ -787,7 +787,7 @@ async def eligible_for_flra(
             | (Permit.scopeOfWork.ilike(like))
         )
     role_codes = await get_user_role_codes(db, user.id)
-    is_priv = any(r in {"HSE_MANAGER", "ADMIN", "SYSTEM_ADMIN", "CORPORATE_HSE"} for r in role_codes)
+    is_priv = any(r in {"HSE_MANAGER", "ADMIN", "CORPORATE_HSE"} for r in role_codes)
     if not is_priv:
         from app.models.permit import PermitCrewMember
         crew_subq = select(PermitCrewMember.permitId).where(PermitCrewMember.userId == user.id)

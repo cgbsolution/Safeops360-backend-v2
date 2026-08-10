@@ -18,7 +18,7 @@ from app.services.permissions import get_user_role_codes
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
-_ADMIN_ROLES = {"SYSTEM_ADMIN", "SUPER_ADMIN", "ADMIN", "PLATFORM_ADMIN"}
+_ADMIN_ROLES = {"SUPER_ADMIN", "ADMIN", "PLATFORM_ADMIN"}
 
 
 async def _require_admin(db: AsyncSession, user: User) -> None:

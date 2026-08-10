@@ -116,7 +116,7 @@ async def list_kris(
     cats = await _cat_index(db)
     code_to_id = {c.code: cid for cid, c in cats.items()}
     # Plant HSE Head: only own-site OPS KRIs (scoping mirrors Phase 1 register).
-    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "SYSTEM_ADMIN", "ADMIN")):
+    if "PLANT_HSE_HEAD" in role_codes and not any(r in role_codes for r in ("CRO", "RISK_CHAMPION", "EXECUTIVE_VIEWER", "ADMIN")):
         ops = code_to_id.get("OPS")
         rows = [k for k in rows if k.categoryId == ops]
 

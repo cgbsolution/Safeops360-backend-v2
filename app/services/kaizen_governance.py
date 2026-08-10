@@ -27,7 +27,7 @@ from app.models.user import User
 
 # Roles that are supervisor-and-above — excluded from the committee pool.
 _MGMT_ROLES = {
-    "HSE_MANAGER", "PLANT_HEAD", "ADMIN", "SYSTEM_ADMIN", "CORPORATE_HSE",
+    "HSE_MANAGER", "PLANT_HEAD", "ADMIN", "CORPORATE_HSE",
     "SAFETY_OFFICER", "MAINTENANCE_HEAD", "DEPARTMENT_HEAD", "SUPERVISOR",
 }
 _PROFANITY = {"damn", "hell", "stupid", "idiot", "crap", "useless"}  # minimal demo list
