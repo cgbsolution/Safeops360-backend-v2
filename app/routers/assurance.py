@@ -641,6 +641,11 @@ class MeetingBody(BaseModel):
     auditeeAcknowledged: bool = False
     auditeeAcknowledgedByUserId: str | None = None
     notes: str | None = None
+    # Carry these attendees onto the engagement's calendar bookings. Default
+    # False so an API caller that has not thought about it cannot mail invitations
+    # by omission; the form sends True, because a recorder who has just typed a
+    # list of people wants those people on the closing invite.
+    addToCalendar: bool = False
 
 
 @router.post("/meetings")
@@ -662,8 +667,24 @@ async def record_meeting(
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # The minute is now part of the calendar's desired state, so recompute it.
+    # Unconditional rather than only when addToCalendar is on: turning the flag
+    # OFF has to withdraw the people it previously added, and that only happens
+    # if the sync runs on the way down as well as on the way up.
+    #
+    # Best-effort by contract (`sync_engagement` never raises) — a mail server
+    # having a bad afternoon must not lose the meeting record.
+    from app.services import calendar_booking as _cal
+
+    cal = await _cal.sync_engagement(
+        db,
+        engagement_kind=body.engagementKind,
+        engagement_id=body.engagementId,
+        actor_id=user.id,
+    )
     await db.commit()
-    return {"id": row.id, "ok": True}
+    return {"id": row.id, "ok": True, "calendar": cal}
 
 
 @router.get("/meetings")

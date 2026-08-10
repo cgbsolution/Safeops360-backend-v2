@@ -94,10 +94,20 @@ class CalendarBooking(Base, IdMixin):
     timezone: Mapped[str] = mapped_column(String, nullable=False, default="Asia/Kolkata")
 
     # Whose mailbox holds the meeting. The lead auditor owns the audit's time,
-    # so they organise it; falls back to the configured service mailbox when the
-    # lead has no routable address.
+    # so they organise it; falls back to whoever scheduled the audit, then to
+    # the configured service mailbox.
+    #
+    # `organizerEmail` becomes STICKY once the booking is BOOKED. Graph cannot
+    # move an event between mailboxes, so recomputing the organiser after a
+    # fallback took effect would point the next update at a mailbox that does
+    # not hold the event — a 404 on every subsequent sync.
     organizerUserId: Mapped[str | None] = mapped_column(String)
     organizerEmail: Mapped[str | None] = mapped_column(String)
+    # Second mailbox to try when the first is not one Graph knows — the person
+    # who scheduled the engagement. Stored rather than resolved at delivery
+    # time because the retry job delivers from the row alone, with no engagement
+    # in hand and no session to look one up with.
+    organizerFallbackEmail: Mapped[str | None] = mapped_column(String)
 
     # [{userId, email, name, role, required, addedAt, removedAt}]
     attendees: Mapped[list] = mapped_column(JSON, nullable=False, default=list)

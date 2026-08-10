@@ -98,6 +98,11 @@ class EventSpec:
     timezone: str
     organizer_email: str
     organizer_name: str = ""
+    # Tried when `organizer_email` turns out not to be a mailbox this tenant
+    # knows — normally whoever scheduled the engagement. Preferred over the
+    # configured service mailbox because an invitation from the colleague who
+    # set the audit up is one the recipient can reply to.
+    organizer_fallback_email: str | None = None
     attendees: list[Attendee] = field(default_factory=list)
     body_html: str = ""
     location: str = ""
@@ -416,17 +421,27 @@ class GraphCalendarProvider(CalendarProvider):
 
         # The lead auditor's address may not be a mailbox in this tenant — an
         # external auditor, a contractor, or a demo account on another domain.
-        # Rather than failing the booking outright, organise it from the
-        # configured service mailbox and keep that person as an ATTENDEE, so
-        # they are still invited and the time is still held. A meeting nobody
-        # organises is worth less than one organised by the audit mailbox.
-        fallback = (get_settings().calendar_organizer_email or "").strip()
-        if (
-            r.status_code not in (200, 201)
-            and _is_unknown_mailbox(r)
-            and fallback
-            and fallback.lower() != (spec.organizer_email or "").lower()
+        # Rather than failing the booking outright, organise it from someone who
+        # IS in the tenant and keep the lead as an ATTENDEE, so they are still
+        # invited and the time is still held. A meeting nobody organises is
+        # worth less than one organised by a colleague.
+        #
+        # The scheduler is tried before the service mailbox: an invitation from
+        # the person who set the audit up is one the recipient can reply to,
+        # where a noreply service mailbox is a dead end. Each candidate is tried
+        # in turn because "in the tenant" is not something we can know without
+        # asking — the scheduler may have left, too.
+        settings_fallback = (get_settings().calendar_organizer_email or "").strip()
+        tried = {(spec.organizer_email or "").lower()}
+        for fallback in (
+            (spec.organizer_fallback_email or "").strip(),
+            settings_fallback,
         ):
+            if r.status_code in (200, 201) or not _is_unknown_mailbox(r):
+                break
+            if not fallback or fallback.lower() in tried:
+                continue
+            tried.add(fallback.lower())
             log.info(
                 "Graph does not know mailbox %s; organising from %s instead.",
                 spec.organizer_email, fallback,

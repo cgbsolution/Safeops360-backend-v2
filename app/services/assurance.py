@@ -311,6 +311,22 @@ async def upsert_meeting(
     if not isinstance(attendees, list) or not attendees:
         raise ValueError("At least one attendee is required — a meeting record with no attendees is not a record")
 
+    # An external attendee's address is what makes them invitable, so it is
+    # normalised here rather than trusted as typed. An entry with a malformed
+    # address keeps its place in the minute and simply loses the address: the
+    # record of who attended must not be rejected over a calendar nicety.
+    cleaned: list[dict[str, Any]] = []
+    for a in attendees:
+        if not isinstance(a, dict):
+            continue
+        email = (a.get("email") or "").strip().lower()
+        if email and ("@" not in email or email.startswith("@") or email.endswith("@")):
+            email = ""
+        cleaned.append({**a, "email": email} if email else {k: v for k, v in a.items() if k != "email"})
+    if not cleaned:
+        raise ValueError("At least one attendee is required — a meeting record with no attendees is not a record")
+    attendees = cleaned
+
     row = (
         await db.execute(
             select(EngagementMeeting).where(
@@ -333,6 +349,7 @@ async def upsert_meeting(
 
     row.heldAt = held_at
     row.attendees = attendees
+    row.addToCalendar = bool(payload.get("addToCalendar"))
     row.notes = payload.get("notes")
     if meeting_type == "OPENING":
         row.scopeConfirmed = bool(payload.get("scopeConfirmed"))
@@ -395,16 +412,25 @@ async def meetings_for(
                     {
                         "name": a.get("name") or "Unnamed attendee",
                         "organisation": a.get("organisation") or "External",
+                        "email": a.get("email") or None,
                         "role": a.get("role"),
                         "external": True,
                     }
                 )
+        # Who the calendar could actually reach. An external with no address is
+        # in the minute but not in anyone's calendar, and the form says so rather
+        # than leaving the recorder to assume the invitation went out.
+        unreachable = sum(
+            1 for a in attendees if a.get("external") and not a.get("email")
+        )
         return {
             "recorded": True,
             "meetingType": t,
             "heldAt": r.heldAt.isoformat() if r.heldAt else None,
             "attendees": attendees,
             "attendeeCount": len(attendees),
+            "addToCalendar": bool(getattr(r, "addToCalendar", False)),
+            "unreachableCount": unreachable,
             "scopeConfirmed": r.scopeConfirmed,
             "findingsSummaryPresented": r.findingsSummaryPresented,
             "auditeeAcknowledged": bool(r.auditeeAcknowledgedByUserId),

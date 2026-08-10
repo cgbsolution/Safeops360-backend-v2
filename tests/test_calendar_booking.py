@@ -19,9 +19,17 @@ discover in production:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from app.services.calendar_booking import _merge_attendees, _meeting_slots, _window
+from app.services import calendar_booking
+from app.services.calendar_booking import (
+    _cast_union,
+    _merge_attendees,
+    _meeting_slots,
+    _organizer,
+    _window,
+)
 from app.services.calendar_providers import Attendee, EventSpec, build_ics
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -125,6 +133,97 @@ def test_merge_is_idempotent():
     twice, added, removed = _merge_attendees(once, desired)
     assert added == set() and removed == set()
     assert [a["addedAt"] for a in once] == [a["addedAt"] for a in twice]
+
+
+def test_the_lead_auditor_organises_their_own_audit():
+    """ISO 19011 cl.5.5.2 puts the team leader in charge, and an invitation from
+    the person running the audit is the one an auditee can reply to."""
+    lead = {"userId": "u1", "email": "lead@x.com", "name": "Lead", "role": "LEAD_AUDITOR"}
+    scheduler = {"userId": "u9", "email": "sched@x.com", "name": "Scheduler"}
+    assert _organizer([lead], scheduler) == ("u1", "lead@x.com", "Lead")
+
+
+def test_the_scheduler_organises_when_the_lead_cannot():
+    """A lead auditor with no address is the common case, not the exotic one —
+    an external auditor or a seat that exists here but not in the mail tenant.
+    The person who set the audit up is real and accountable for it."""
+    cast = [{"userId": "u2", "email": "auditee@x.com", "name": "A", "role": "AUDITEE"}]
+    scheduler = {"userId": "u9", "email": "sched@x.com", "name": "Scheduler"}
+    assert _organizer(cast, scheduler) == ("u9", "sched@x.com", "Scheduler")
+
+
+def test_the_scheduler_beats_the_configured_service_mailbox(monkeypatch):
+    """A noreply service mailbox is a dead end for the recipient. The colleague
+    who scheduled the audit can be replied to, so they go first — the service
+    mailbox is for the unattended paths that have no human actor at all."""
+    monkeypatch.setattr(
+        calendar_booking, "get_settings",
+        lambda: SimpleNamespace(calendar_organizer_email="audits@tenant.com"),
+    )
+    cast = [{"userId": "u2", "email": "auditee@x.com", "name": "A", "role": "AUDITEE"}]
+    assert _organizer(cast, {"userId": "u9", "email": "sched@x.com"})[1] == "sched@x.com"
+    # …and with nobody to stand in, the service mailbox still does.
+    assert _organizer(cast, None)[1] == "audits@tenant.com"
+
+
+def test_a_scheduler_with_a_blank_address_falls_through(monkeypatch):
+    """An empty address written in as the organiser would be skipped at delivery
+    for having no mailbox — losing the candidates further down the chain."""
+    monkeypatch.setattr(
+        calendar_booking, "get_settings",
+        lambda: SimpleNamespace(calendar_organizer_email=""),
+    )
+    cast = [{"userId": "u2", "email": "auditee@x.com", "name": "A", "role": "AUDITEE"}]
+    assert _organizer(cast, {"userId": "u9", "email": "  "})[1] == "auditee@x.com"
+
+
+def test_a_booking_nobody_can_organise_is_left_without_one(monkeypatch):
+    """Skipped, not guessed at: there is no mailbox to write the event into, and
+    inventing one would report an invitation that was never sent."""
+    monkeypatch.setattr(
+        calendar_booking, "get_settings",
+        lambda: SimpleNamespace(calendar_organizer_email=""),
+    )
+    assert _organizer([{"name": "No address", "role": "AUDITEE"}], None) == (None, None, None)
+
+
+def test_the_team_entry_wins_when_someone_is_also_on_the_minute():
+    """The lead auditor attends the opening meeting, so they appear both on the
+    team and on its minute. Letting the minute's generic OTHER overwrite the
+    LEAD_AUDITOR seat would demote the organiser to a participant — and
+    `_organizer()` picks the organiser BY that role."""
+    team = [{"email": "lead@x.com", "role": "LEAD_AUDITOR", "required": True}]
+    minute = [{"email": "Lead@X.com", "role": "OTHER", "required": True}]
+    out = _cast_union(team, minute)
+    assert len(out) == 1
+    assert out[0]["role"] == "LEAD_AUDITOR"
+
+
+def test_the_minute_adds_people_the_team_never_knew_about():
+    """The whole point: department owners are identified AT the opening meeting
+    and exist nowhere in the audit team fields."""
+    team = [{"email": "lead@x.com", "role": "LEAD_AUDITOR", "required": True}]
+    opening = [{"email": "owner@x.com", "role": "OTHER", "required": True}]
+    closing = [{"email": "buyer@x.com", "role": "OTHER", "required": True}]
+    out = _cast_union(team, opening, closing)
+    assert [a["email"] for a in out] == ["lead@x.com", "owner@x.com", "buyer@x.com"]
+
+
+def test_someone_named_on_both_minutes_is_invited_once():
+    """An attendee at both meetings must not appear twice on the closing
+    invitation — Exchange would take the duplicate as a second attendee."""
+    opening = [{"email": "owner@x.com", "role": "OTHER", "required": True}]
+    closing = [{"email": "owner@x.com", "role": "OTHER", "required": False}]
+    out = _cast_union([], opening, closing)
+    assert len(out) == 1 and out[0]["required"] is True
+
+
+def test_an_attendee_with_no_address_is_dropped_from_the_cast():
+    """An external recorded without an email is a legitimate minute entry — a
+    contractor rep who attended — but there is no calendar to reach. Carrying
+    them into the cast would put a name on the invite list that never got it."""
+    out = _cast_union([{"name": "Contractor rep", "role": "OTHER", "required": True}])
+    assert out == []
 
 
 def test_email_matching_is_case_insensitive():

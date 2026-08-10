@@ -238,8 +238,10 @@ class EngagementMeeting(Base, IdMixin):
     ever assert a meeting the product had no evidence of. This is the evidence.
 
     `attendees` is a JSON list of either `{userId}` or
-    `{name, organisation, role}` — buyer auditors, certification-body assessors
-    and contractor representatives attend these meetings and are not users.
+    `{name, organisation, email, role}` — buyer auditors, certification-body
+    assessors and contractor representatives attend these meetings and are not
+    users. `email` is optional and only external entries carry it; an internal
+    attendee's address is read from their user record.
     """
 
     __tablename__ = "EngagementMeeting"
@@ -249,6 +251,15 @@ class EngagementMeeting(Base, IdMixin):
     meetingType: Mapped[str] = mapped_column(String, nullable=False)  # OPENING | CLOSING
     heldAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     attendees: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Carry these attendees onto the engagement's calendar bookings. The people
+    # identified at the opening meeting are usually the department owners who
+    # must be at the closing meeting, and this is the only place they are named
+    # — the audit team fields never learn about them.
+    #
+    # Stored rather than acted on once, because `calendar_booking` recomputes
+    # the whole desired state on every sync; a one-shot invite would be dropped
+    # by the next recompute. FALSE by default so historical minutes stay minutes.
+    addToCalendar: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Opening only.
     scopeConfirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Closing only.

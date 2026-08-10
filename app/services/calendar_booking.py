@@ -88,6 +88,7 @@ class _Spec:
         attendees: list[dict[str, Any]],
         body_html: str,
         location: str,
+        scheduler: dict[str, Any] | None = None,
     ) -> None:
         self.booking_type = booking_type
         self.subject = subject
@@ -96,6 +97,10 @@ class _Spec:
         self.attendees = attendees
         self.body_html = body_html
         self.location = location
+        # Whoever scheduled the engagement — the second candidate organiser, see
+        # `_organizer`. Not an attendee in their own right: a scheduler who is
+        # not on the audit team has no reason to be in the meeting.
+        self.scheduler = scheduler
 
 
 def _window(
@@ -156,6 +161,18 @@ async def _emails(db: AsyncSession, ids: Iterable[str | None]) -> dict[str, User
     return {u.id: u for u in rows}
 
 
+def _person(u: User | None, user_id: str | None) -> dict[str, Any] | None:
+    """A reachable person, with no seat in the meeting — the candidate organiser.
+
+    Separate from `_attendee` on purpose: the scheduler owning the event does not
+    put them in the room, and giving them an attendee entry would invite someone
+    who only pressed the button.
+    """
+    if u is None or not (u.email or "").strip():
+        return None
+    return {"userId": user_id, "email": u.email.strip(), "name": u.name or u.email}
+
+
 def _attendee(u: User | None, user_id: str | None, role: str, required: bool) -> dict[str, Any] | None:
     """One attendee entry, or None when the person cannot be reached.
 
@@ -172,6 +189,96 @@ def _attendee(u: User | None, user_id: str | None, role: str, required: bool) ->
         "role": role,
         "required": required,
     }
+
+
+async def _meeting_extras(
+    db: AsyncSession, kind: str, engagement_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    """People named on the opening / closing minutes, as calendar attendees.
+
+    The audit team fields answer "who is running this audit". They do not answer
+    "who is in the room" — the department owners are identified AT the opening
+    meeting, and the meeting record is the only place they are ever named. Left
+    out of the desired state, they would be invited to nothing.
+
+    Only records with `addToCalendar` contribute, and only people who can be
+    reached: an internal attendee resolves through their user record, an external
+    one through the address typed on the form. An external with no address is a
+    minute entry and nothing more — inviting them is not possible, and pretending
+    otherwise would put a name on the invite list that never received it.
+
+    Returns `{}` on any failure, including a database that has not had
+    `scripts/add_meeting_calendar_sync.py` run yet. Bookings are worth more than
+    the enrichment: a missing column must not stop the audit team's invites.
+    """
+    out: dict[str, list[dict[str, Any]]] = {"OPENING": [], "CLOSING": []}
+    try:
+        from app.models.assurance import EngagementMeeting
+
+        rows = (
+            await db.execute(
+                select(EngagementMeeting).where(
+                    EngagementMeeting.engagementKind == kind,
+                    EngagementMeeting.engagementId == engagement_id,
+                    EngagementMeeting.addToCalendar.is_(True),
+                )
+            )
+        ).scalars().all()
+        if not rows:
+            return out
+
+        uids = {
+            a["userId"]
+            for r in rows
+            for a in (r.attendees or [])
+            if isinstance(a, dict) and a.get("userId")
+        }
+        users = await _emails(db, uids)
+
+        for r in rows:
+            bucket = out.get((r.meetingType or "").upper())
+            if bucket is None:
+                continue
+            for a in r.attendees or []:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("userId"):
+                    ent = _attendee(users.get(a["userId"]), a["userId"], "OTHER", True)
+                    if ent:
+                        bucket.append(ent)
+                elif (a.get("email") or "").strip():
+                    bucket.append(
+                        {
+                            "userId": None,
+                            "email": a["email"].strip(),
+                            "name": a.get("name") or a["email"].strip(),
+                            "role": "OTHER",
+                            "required": True,
+                        }
+                    )
+    except Exception as e:  # noqa: BLE001
+        log.debug("meeting attendees skipped for %s %s: %s", kind, engagement_id, e)
+        return {"OPENING": [], "CLOSING": []}
+    return out
+
+
+def _cast_union(*groups: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Concatenate attendee groups, first mention winning on a duplicate email.
+
+    Order matters: the team's entry carries the real role and requiredness, so a
+    lead auditor who also appears on the minutes stays LEAD_AUDITOR rather than
+    being demoted to a generic participant.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for a in group:
+            key = (a.get("email") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(a)
+    return out
 
 
 def _body(
@@ -213,7 +320,12 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
 
     co_ids = [c.get("userId") for c in (audit.coAuditors or []) if isinstance(c, dict) and c.get("userId")]
     au_ids = [a.get("userId") for a in (audit.auditees or []) if isinstance(a, dict) and a.get("userId")]
-    users = await _emails(db, [audit.leadAuditorUserId, audit.plantManagerUserId, *co_ids, *au_ids])
+    users = await _emails(
+        db,
+        [audit.leadAuditorUserId, audit.plantManagerUserId, audit.createdByUserId, *co_ids, *au_ids],
+    )
+    scheduler = _person(users.get(audit.createdByUserId) if audit.createdByUserId else None,
+                        audit.createdByUserId)
 
     def cast(auditees_required: bool) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -254,7 +366,7 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
     except Exception as e:  # noqa: BLE001
         log.debug("supplier contact lookup skipped: %s", e)
 
-    site = getattr(audit, "plantName", None) or audit.plantId or ""
+    site = await _site_label(db, audit.plantId)
     scope = audit.scopeDescription or ", ".join(audit.scopeDepartments or []) or "Full scope"
     ref = audit.auditNumber
     link_path = f"/cams/audits/{audit.id}"
@@ -265,6 +377,17 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
     if supplier_contact:
         block_cast = [*block_cast, supplier_contact]
         meeting_cast = [*meeting_cast, supplier_contact]
+
+    # Whoever was named on the minutes joins the meetings — but not the fieldwork
+    # block. A department owner brought in at the opening meeting has no business
+    # holding eight hours of their day for an audit they are not conducting.
+    #
+    # The opening meeting's attendees carry forward to the CLOSING invite, which
+    # is the whole point of doing this: they are the people who own the findings
+    # being presented, and until now nothing put them on that invitation.
+    extras = await _meeting_extras(db, "AUDIT", audit.id)
+    opening_cast = _cast_union(meeting_cast, extras["OPENING"])
+    closing_cast = _cast_union(meeting_cast, extras["OPENING"], extras["CLOSING"])
 
     (op_s, op_e), (cl_s, cl_e) = _meeting_slots(start, end)
     return [
@@ -288,13 +411,14 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
         _Spec(
             OPENING_MEETING,
             f"Opening meeting: {audit.title} ({ref})",
             op_s,
             op_e,
-            meeting_cast,
+            opening_cast,
             _body(
                 heading="Opening meeting — ISO 19011 §6.4.2",
                 reference=ref,
@@ -308,13 +432,14 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
         _Spec(
             CLOSING_MEETING,
             f"Closing meeting: {audit.title} ({ref})",
             cl_s,
             cl_e,
-            meeting_cast,
+            closing_cast,
             _body(
                 heading="Closing meeting — ISO 19011 §6.4.9",
                 reference=ref,
@@ -328,6 +453,7 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
     ]
 
@@ -358,7 +484,9 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
         end = start + timedelta(hours=2)
 
     team_ids = [t for t in (eng.auditTeamIds or []) if isinstance(t, str)]
-    users = await _emails(db, [eng.leadAuditorId, eng.auditeeOwnerId, *team_ids])
+    created_by = getattr(eng, "createdBy", None)
+    users = await _emails(db, [eng.leadAuditorId, eng.auditeeOwnerId, created_by, *team_ids])
+    scheduler = _person(users.get(created_by) if created_by else None, created_by)
 
     def cast(auditee_required: bool) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -372,11 +500,18 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
                 out.append(ent)
         return out
 
-    site = eng.siteId or ""
+    site = await _site_label(db, eng.siteId)
     scope = eng.scopeStatement or eng.areaOrAssetRef or "Full scope"
     ref = eng.engagementCode
     link_path = f"/cams/engagements/{eng.id}"
     location = f"{site} — {eng.areaOrAssetRef}" if eng.areaOrAssetRef else site
+
+    # Same rule as an audit: the minutes name people the engagement record never
+    # knew about, and they belong on the meetings but not on the fieldwork block.
+    meeting_cast = cast(auditee_required=True)
+    extras = await _meeting_extras(db, "INSPECTION", eng.id)
+    opening_cast = _cast_union(meeting_cast, extras["OPENING"])
+    closing_cast = _cast_union(meeting_cast, extras["OPENING"], extras["CLOSING"])
 
     (op_s, op_e), (cl_s, cl_e) = _meeting_slots(start, end)
     return [
@@ -396,13 +531,14 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
         _Spec(
             OPENING_MEETING,
             f"Opening meeting: {eng.title} ({ref})",
             op_s,
             op_e,
-            cast(auditee_required=True),
+            opening_cast,
             _body(
                 heading="Opening meeting — ISO 19011 §6.4.2",
                 reference=ref,
@@ -413,13 +549,14 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
         _Spec(
             CLOSING_MEETING,
             f"Closing meeting: {eng.title} ({ref})",
             cl_s,
             cl_e,
-            cast(auditee_required=True),
+            closing_cast,
             _body(
                 heading="Closing meeting — ISO 19011 §6.4.9",
                 reference=ref,
@@ -430,6 +567,7 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
                 link_path=link_path,
             ),
             location,
+            scheduler,
         ),
     ]
 
@@ -437,6 +575,28 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
 # ─────────────────────────────────────────────────────────────────────
 # Sync
 # ─────────────────────────────────────────────────────────────────────
+
+
+async def _site_label(db: AsyncSession, site_id: str | None) -> str:
+    """Human-readable site name for the invitation.
+
+    `ComplianceAudit` carries only `plantId`; the name is resolved by the API
+    serialiser, which this service never goes through. Falling back to the raw
+    id put a cuid in the Location field of every meeting — technically accurate,
+    useless to the person reading the invite in Outlook.
+    """
+    if not site_id:
+        return ""
+    try:
+        from app.models.plant import Plant
+
+        p = await db.get(Plant, site_id)
+        if p is None:
+            return site_id
+        return f"{p.name} ({p.code})" if p.code else p.name
+    except Exception as e:  # noqa: BLE001
+        log.debug("site name lookup failed: %s", e)
+        return site_id
 
 
 async def _site_room(db: AsyncSession, site_id: str | None) -> tuple[str | None, str | None]:
@@ -564,16 +724,33 @@ def _merge_attendees(
     return out, added, removed
 
 
-def _organizer(attendees: list[dict[str, Any]]) -> tuple[str | None, str | None, str | None]:
+def _organizer(
+    attendees: list[dict[str, Any]], scheduler: dict[str, Any] | None = None
+) -> tuple[str | None, str | None, str | None]:
     """(userId, email, name) of whoever owns the meeting.
 
-    The lead auditor organises their own audit; the configured service mailbox
-    stands in when the lead has no routable address. With neither, there is no
-    mailbox to write into and the booking is skipped rather than guessed at.
+    In order:
+
+      1. **The lead auditor.** ISO 19011 cl.5.5.2 puts the audit team leader in
+         charge of the audit, and an invitation from the person running it is
+         the one an auditee can reply to.
+      2. **Whoever scheduled it.** A lead auditor without a routable mailbox is
+         the common case, not the exotic one — an external auditor, a contractor,
+         or a seat that exists in SafeOps360 but not in the mail tenant. The
+         person who set the audit up is signed in, real, and accountable for it,
+         so the meeting belongs in their calendar rather than nowhere.
+      3. **The configured service mailbox**, for the unattended paths — a
+         recurrence rule or the retry job, where there is no human actor at all.
+      4. Any attendee with an address, as a last resort.
+
+    A booking with none of these has no mailbox to be written into and is
+    skipped rather than guessed at.
     """
     lead = next((a for a in attendees if a.get("role") == "LEAD_AUDITOR"), None)
     if lead and lead.get("email"):
         return lead.get("userId"), lead["email"], lead.get("name")
+    if scheduler and (scheduler.get("email") or "").strip():
+        return scheduler.get("userId"), scheduler["email"].strip(), scheduler.get("name")
     fallback = (get_settings().calendar_organizer_email or "").strip()
     if fallback:
         return None, fallback, "SafeOps360"
@@ -591,6 +768,7 @@ def _to_event_spec(b: CalendarBooking) -> providers.EventSpec:
         timezone=b.timezone,
         organizer_email=b.organizerEmail or "",
         organizer_name="",
+        organizer_fallback_email=b.organizerFallbackEmail,
         attendees=[
             providers.Attendee(
                 email=a["email"],
@@ -854,9 +1032,17 @@ async def _sync_engagement_inner(
             b.attendees = merged
             attendees_added |= added
             attendees_removed |= removed
-            org_id, org_email, _org_name = _organizer(spec.attendees)
+            org_id, org_email, _org_name = _organizer(spec.attendees, spec.scheduler)
+            # Sticky once delivered. Graph cannot move an event between
+            # mailboxes, so if a fallback organiser took the event, recomputing
+            # back to the lead auditor would aim every later update at a mailbox
+            # that does not hold it — a 404 on each sync, forever. The mailbox
+            # that actually holds the event is the truth about it.
+            if b.status == "BOOKED" and b.organizerEmail:
+                org_id, org_email = b.organizerUserId, b.organizerEmail
             b.organizerUserId = org_id
             b.organizerEmail = org_email
+            b.organizerFallbackEmail = (spec.scheduler or {}).get("email")
             # Room. Sticky once a human has touched it — everything else on this
             # row is recomputed from the audit, but nothing in the audit record
             # implies which room, so a re-sync must not overwrite the choice.
