@@ -89,7 +89,19 @@ _PRODUCT: list[ModuleDefinition] = [
     _m("INSPECTION", "Inspection Schedule & Findings", "Assets & Inspection"),
     # Field Operations
     _m("CAPTURE", "Guided Field Capture", "Operational Safety"),
+    _m("FIELD_REPORTS", "Field Reports & Field RCA", "Operational Safety"),
     _m("ALERTS", "Daily Alert Brief", "Performance"),
+    # Emergency preparedness — /emergency-response.
+    _m("EMERGENCY_RESPONSE", "Emergency Response & Preparedness", "Operational Safety"),
+    # Behaviour-Based Safety — /bbs. Distinct from SCI (index + kaizen) and
+    # SAFETY_CULTURE (culture management); BBS is the observation programme.
+    _m("BBS", "Behaviour-Based Safety", "People & Competency"),
+    # Process & Chemical Safety
+    _m("PROCESS_SAFETY", "Process Safety Management", "Process & Chemical Safety"),
+    _m("CHEMICAL", "Chemical Management & SDS", "Process & Chemical Safety"),
+    # Occupational Health & Hygiene
+    _m("OCCUPATIONAL_HEALTH", "Occupational Health Centre", "Occupational Health & Hygiene"),
+    _m("INDUSTRIAL_HYGIENE", "Industrial Hygiene", "Occupational Health & Hygiene"),
     # Performance
     _m("MANHOURS", "Manhours & KPIs", "Performance"),
     _m("ANOMALIES", "Anomaly Detection", "Performance"),

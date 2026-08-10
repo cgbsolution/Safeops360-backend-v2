@@ -366,18 +366,28 @@ async def organisation_modules(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """The organisation-wide module allocation (Super Admin). Returns every
-    LICENSED product module with its current org-wide state, plus how many
-    factories exist so the screen can say what a change affects. Modules outside
-    the licence are not listed — they can never be switched on here."""
+    """The organisation-wide module allocation (Super Admin). Returns the FULL
+    product-module catalogue — every module this portal ships — each flagged
+    with whether the signed licence includes it.
+
+    Listing the whole catalogue (rather than only the licensed subset) is
+    deliberate: the Super Admin owns the organisation and needs to see every
+    module that exists, including the ones the current licence doesn't cover.
+    `licensed: false` modules are already blocked by the ceiling, so their
+    org-level setting is inert — but it is stored, so the moment a renewed
+    licence adds the module the organisation's decision is already in force
+    rather than defaulting to on.
+
+    Core modules are excluded: identity, RBAC, licensing and the dashboard shell
+    can never be switched off by anyone (TL-14)."""
     await _require_super_admin(db, user)
     from app.models.plant import Plant
 
     state = get_state()
-    licensed = [
+    catalogue = [
         MODULE_REGISTRY[c]
-        for c in sorted(state.enabled_module_set)
-        if c not in CORE_MODULE_CODES and c in MODULE_REGISTRY
+        for c in sorted(MODULE_REGISTRY)
+        if c not in CORE_MODULE_CODES
     ]
     rows = await org_entitlements.load_all(db)
     plant_count = (await db.execute(select(func.count()).select_from(Plant))).scalar() or 0
@@ -397,11 +407,15 @@ async def organisation_modules(
                 "group": m.group,
                 # No row → on, inherited from the licence.
                 "enabled": rows.get(m.code, {}).get("enabled", True),
+                # False = outside the signed licence. Shown so the catalogue is
+                # complete and honest; the toggle is stored but has no effect
+                # until a licence including the module is uploaded.
+                "licensed": m.code in state.enabled_module_set,
                 "note": rows.get(m.code, {}).get("note"),
                 "updatedBy": rows.get(m.code, {}).get("updatedBy"),
                 "updatedAt": rows.get(m.code, {}).get("updatedAt"),
             }
-            for m in licensed
+            for m in catalogue
         ],
     }
 
@@ -415,27 +429,48 @@ async def update_organisation_modules(
     """Set organisation-wide module states (Super Admin). Body:
         { "modules": { "CAMS": true, "PTW": {"enabled": false, "note": "..."} } }
 
-    Only licensed modules may be set — attempting to manage a module outside the
-    licence ceiling is rejected, so config can never grant entitlements. Turning
-    a module off here disables it at EVERY plant immediately; users hitting it
-    get 'Please contact your Super Admin to request access to this module.'"""
+    Any known product module may be set, licensed or not. This does NOT breach
+    the config-can't-grant rule: every write here is a restriction, and the
+    effective check is `licence AND org AND factory`, so recording a module as
+    org-enabled can never make an unlicensed module reachable — the ceiling
+    still fails it. Storing the decision for an unlicensed module is the point:
+    when a renewed licence adds it, the organisation's choice already applies
+    instead of silently defaulting to on.
+
+    Core modules are rejected outright — identity, RBAC, licensing and the
+    dashboard shell must stay reachable under every state (TL-14), so nobody,
+    Super Admin included, can switch them off.
+
+    Turning a licensed module off disables it at EVERY plant immediately; users
+    hitting it get 'Please contact your Super Admin to request access to this
+    module.'"""
     await _require_super_admin(db, user)
     changes = payload.get("modules")
     if not isinstance(changes, dict) or not changes:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Expected { modules: {code: bool|spec} }")
 
-    state = get_state()
-    licensed = {c for c in state.enabled_module_set if c not in CORE_MODULE_CODES}
-    bad = [c for c in changes if c not in licensed]
-    if bad:
+    unknown = [c for c in changes if c not in MODULE_REGISTRY]
+    if unknown:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail={
-                "error": "module_not_licensed",
-                "message": "Cannot manage modules outside the licence ceiling.",
-                "modules": bad,
+                "error": "unknown_module",
+                "message": "Unknown module code — not present in the module registry.",
+                "modules": unknown,
             },
         )
+    core = [c for c in changes if c in CORE_MODULE_CODES]
+    if core:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "core_module_immutable",
+                "message": "Core modules are always on and cannot be disabled.",
+                "modules": core,
+            },
+        )
+
+    state = get_state()
 
     # Accept either a bare bool (on/off) or a spec object {enabled, note}.
     normalised: dict[str, dict] = {}
@@ -454,15 +489,26 @@ async def update_organisation_modules(
     # per-factory handler relies on); set_modules refreshes the hot-path cache.
     await org_entitlements.set_modules(db, normalised, user.id)
     disabled = sorted(c for c, s in normalised.items() if not s["enabled"])
+    # Changes to modules the licence doesn't cover are stored but inert — say so
+    # rather than let the Super Admin believe they just turned something off
+    # that was never reachable in the first place.
+    inert = sorted(c for c in normalised if c not in state.enabled_module_set)
+    message = (
+        f"Saved. {len(disabled)} module(s) are now off for the whole organisation."
+        if disabled
+        else "Saved. All selected modules are available across the organisation."
+    )
+    if inert:
+        message += (
+            f" {len(inert)} of these are not in the current licence, so the setting"
+            " is stored but has no effect until a licence including them is uploaded."
+        )
     return {
         "applied": True,
         "modules": {c: s["enabled"] for c, s in normalised.items()},
         "disabledCount": len(disabled),
-        "message": (
-            f"Saved. {len(disabled)} module(s) are now off for the whole organisation."
-            if disabled
-            else "Saved. All selected modules are available across the organisation."
-        ),
+        "notLicensed": inert,
+        "message": message,
     }
 
 
