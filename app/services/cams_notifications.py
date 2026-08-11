@@ -20,9 +20,12 @@ below is the short list where waiting for a digest would be wrong.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
+from urllib.parse import quote
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +43,19 @@ class EventSpec:
     severity: str  # INFO | WARNING | CRITICAL
     # Immediate email, or hold for the digest? Reserved for events where a
     # delay changes the outcome, not merely the mood.
+    #
+    # This flag also OVERRIDES an OFF preference — see `should_deliver`. Keep it
+    # to the handful of events a person cannot opt out of and still be doing
+    # their job; `email_at_source` below is the softer setting for everything
+    # that merely should not wait for tomorrow's digest.
     immediate_email: bool = False
+    # Email when the event happens rather than batching it, but still honour an
+    # OFF preference. This is the right setting for a one-per-person-per-audit
+    # event — being told you are the lead auditor of an audit that runs on
+    # Thursday is not digest material, and it is not a mail storm either
+    # (exactly one lands per seat), but it is also not something a user should
+    # be unable to mute.
+    email_at_source: bool = False
 
 
 # The catalogue. The brief lists eleven minimum events; these are those plus the
@@ -49,8 +64,28 @@ CATALOGUE: dict[str, EventSpec] = {
     e.code: e
     for e in [
         # ── assignment ──
-        EventSpec("AUDITOR_ASSIGNED", "You were assigned as an auditor", "INFO"),
-        EventSpec("AUDITEE_ASSIGNED", "You were named as an auditee owner", "INFO"),
+        #
+        # These four fire once per person per audit, at the moment the audit is
+        # scheduled or the team is re-seated. `email_at_source` because the
+        # whole point of the message is lead time: an auditee who learns on
+        # Thursday's digest that they were named on Wednesday's audit has been
+        # told nothing useful.
+        EventSpec(
+            "AUDIT_SCHEDULED", "An audit you are named on was scheduled", "INFO",
+            email_at_source=True,
+        ),
+        EventSpec(
+            "AUDITOR_ASSIGNED", "You were assigned as an auditor", "INFO",
+            email_at_source=True,
+        ),
+        EventSpec(
+            "AUDITEE_ASSIGNED", "You were named as an auditee owner", "INFO",
+            email_at_source=True,
+        ),
+        EventSpec(
+            "PLANT_HEAD_ASSIGNED", "You were named as the reviewing plant head", "INFO",
+            email_at_source=True,
+        ),
         EventSpec("CHECKPOINTS_ALLOCATED", "Checkpoints were allocated to you", "INFO"),
         # ── execution ──
         EventSpec(
@@ -88,6 +123,8 @@ CATALOGUE: dict[str, EventSpec] = {
 }
 
 IMMEDIATE_EMAIL = {c for c, e in CATALOGUE.items() if e.immediate_email}
+# Emailed as they happen, but mutable by the user (unlike IMMEDIATE_EMAIL).
+EMAIL_AT_SOURCE = {c for c, e in CATALOGUE.items() if e.email_at_source}
 
 # Digest cadence. A user with no preference row gets DAILY, which is the setting
 # that keeps people subscribed.
@@ -119,6 +156,43 @@ def deep_link(entity_type: str, entity_id: str, *, checkpoint_id: str | None = N
     if entity_type == "AuditProgramme":
         return f"/cams/programme/{entity_id}"
     return "/cams"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Email links that survive not being signed in
+# ─────────────────────────────────────────────────────────────────────
+#
+# An in-app notification can use a bare path — the reader is, by definition,
+# already inside the app. An email cannot: the recipient is in Outlook, and
+# roughly half the time their session has expired. A bare `/cams/audits/<id>`
+# bounces them to the login page and then dumps them on the dashboard, having
+# thrown away the one thing the email was for.
+#
+# `/go` is a tiny public route on the web app that reads the session and either
+# forwards straight to `to`, or sends the user to `/login?callbackUrl=<to>` and
+# lets the login page finish the journey. Same URL either way, so the email does
+# not have to know whether the reader is signed in.
+
+
+def public_base_url() -> str:
+    """Origin of the web app, e.g. `https://safeops.example.com`.
+
+    Empty when `APP_PUBLIC_URL` is unset (local dev, tests). Callers degrade to
+    a relative path rather than emitting a broken absolute one — same
+    convention as the supplier-portal issuer.
+    """
+    return (os.getenv("APP_PUBLIC_URL") or "").rstrip("/")
+
+
+def login_aware_url(path: str) -> str:
+    """Absolute `/go` link that lands on `path` whether or not the reader is
+    signed in. Falls back to the bare path when no public URL is configured."""
+    if not path:
+        path = "/cams"
+    base = public_base_url()
+    if not base:
+        return path
+    return f"{base}/go?to={quote(path, safe='')}"
 
 
 async def notify(
@@ -166,6 +240,191 @@ async def notify(
         )
     await db.flush()
     return len(targets)
+
+
+def render_event_email(
+    *,
+    recipient_name: str | None,
+    title: str,
+    body: str,
+    link: str,
+    cta: str = "Open in SafeOps360",
+    facts: list[tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    """One event → `(plain_text, html)`.
+
+    Hand-rolled rather than templated for the same reason `render_digest_text`
+    is: this has to work on an airgapped install with no template engine and no
+    network, and the output has to be diffable in a test.
+    """
+    greeting = f"Hello {recipient_name}," if recipient_name else "Hello,"
+    rows = facts or []
+
+    lines = [greeting, "", title, ""]
+    if body:
+        lines += [body, ""]
+    for label, value in rows:
+        lines.append(f"{label}: {value}")
+    if rows:
+        lines.append("")
+    lines += [
+        f"{cta}: {link}",
+        "",
+        "You are receiving this because you are named on this audit.",
+        "Change your email frequency in SafeOps360 > Audit & Compliance > Settings.",
+    ]
+    text = "\n".join(lines)
+
+    def esc(s: str) -> str:
+        return (
+            (s or "")
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+
+    fact_html = "".join(
+        f'<tr><td style="padding:2px 12px 2px 0;color:#64748b;font-size:13px;">{esc(l)}</td>'
+        f'<td style="padding:2px 0;color:#0f172a;font-size:13px;font-weight:600;">{esc(v)}</td></tr>'
+        for l, v in rows
+    )
+    html = (
+        '<div style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;'
+        'color:#0f172a;line-height:1.5;">'
+        f"<p style=\"margin:0 0 12px;\">{esc(greeting)}</p>"
+        f'<p style="margin:0 0 12px;font-size:16px;font-weight:600;">{esc(title)}</p>'
+        + (
+            f'<p style="margin:0 0 16px;white-space:pre-line;">{esc(body)}</p>'
+            if body
+            else ""
+        )
+        + (
+            f'<table style="margin:0 0 20px;border-collapse:collapse;">{fact_html}</table>'
+            if fact_html
+            else ""
+        )
+        + f'<p style="margin:0 0 20px;"><a href="{esc(link)}" '
+        'style="display:inline-block;background:#1d4ed8;color:#ffffff;'
+        'text-decoration:none;padding:10px 18px;border-radius:6px;'
+        f'font-weight:600;font-size:14px;">{esc(cta)}</a></p>'
+        '<p style="margin:0;color:#94a3b8;font-size:12px;">'
+        "You are receiving this because you are named on this audit. "
+        "Change your email frequency in SafeOps360 &gt; Audit &amp; Compliance &gt; Settings."
+        "</p></div>"
+    )
+    return text, html
+
+
+async def deliver(
+    db: AsyncSession,
+    *,
+    user_ids: Iterable[str | None],
+    event: str,
+    title: str,
+    body: str = "",
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    link_path: str | None = None,
+    checkpoint_id: str | None = None,
+    actor_id: str | None = None,
+    subject_prefix: str = "[SafeOps360]",
+    cta: str = "Open in SafeOps360",
+    facts: list[tuple[str, str]] | None = None,
+) -> dict[str, int]:
+    """Raise an in-app notification AND (per preference) email it, per recipient.
+
+    The one entry point a caller should need. It differs from `notify` above in
+    three ways that matter:
+
+      • it consults `should_deliver`, so a user who muted a class is actually
+        muted rather than notified anyway;
+      • it sends the email at source for `EMAIL_AT_SOURCE` events instead of
+        leaving them for a digest job;
+      • the emailed link is `login_aware_url(...)`, so it works from Outlook
+        with an expired session.
+
+    Best-effort throughout — an SMTP outage or a missing recipient must never
+    roll back the audit that triggered it. Returns `{"inApp": n, "email": n}`.
+    """
+    spec = CATALOGUE.get(event)
+    if spec is None:
+        raise ValueError(f"Unknown CAMS notification event: {event}")
+
+    # Never notify the actor about their own action.
+    targets = [u for u in dict.fromkeys(u for u in user_ids if u) if u != actor_id]
+    if not targets:
+        return {"inApp": 0, "email": 0}
+
+    path = link_path or (
+        deep_link(entity_type, entity_id, checkpoint_id=checkpoint_id)
+        if entity_type and entity_id
+        else None
+    )
+
+    in_app = 0
+    # (recipient_email, recipient_name) — collected first, sent after the flush.
+    # A 12-person audit team sent serially is up to 12 × the SMTP timeout spent
+    # holding the caller's transaction open; `create_audit` is that caller.
+    mail_to: list[tuple[str, str | None]] = []
+
+    for uid in targets:
+        try:
+            channels = await should_deliver(db, user_id=uid, event=event)
+        except Exception as e:  # noqa: BLE001 — a preference read must not block delivery
+            print(f"[cams_notifications] preference read failed for {uid}: {e}", file=sys.stderr)
+            channels = {"inApp": True, "emailNow": event in EMAIL_AT_SOURCE or event in IMMEDIATE_EMAIL}
+
+        if channels.get("inApp", True):
+            db.add(
+                Notification(
+                    userId=uid,
+                    type=event,
+                    severity=spec.severity,
+                    title=title,
+                    body=body,
+                    entityType=entity_type,
+                    entityId=entity_id,
+                    linkUrl=path,
+                )
+            )
+            in_app += 1
+
+        if channels.get("emailNow"):
+            try:
+                user = await db.get(User, uid)
+                email = getattr(user, "email", None) if user else None
+                if email:
+                    mail_to.append((email, getattr(user, "name", None)))
+            except Exception as e:  # noqa: BLE001
+                print(f"[cams_notifications] recipient lookup for {uid} failed: {e}", file=sys.stderr)
+
+    await db.flush()
+
+    emailed = 0
+    if mail_to:
+        # Concurrent, so the wall-clock cost is one SMTP round-trip rather than
+        # one per recipient. `send_email` already offloads blocking smtplib to a
+        # thread and returns False rather than raising.
+        import asyncio
+
+        from app.services.notifications import send_email
+
+        link = login_aware_url(path or "/cams")
+
+        async def _one(addr: str, name: str | None) -> bool:
+            try:
+                text, html = render_event_email(
+                    recipient_name=name, title=title, body=body,
+                    link=link, cta=cta, facts=facts,
+                )
+                return await send_email([addr], f"{subject_prefix} {title}", text, html=html)
+            except Exception as e:  # noqa: BLE001
+                print(f"[cams_notifications] email to {addr} failed: {e}", file=sys.stderr)
+                return False
+
+        emailed = sum(
+            1 for ok in await asyncio.gather(*(_one(a, n) for a, n in mail_to)) if ok
+        )
+
+    return {"inApp": in_app, "email": emailed}
 
 
 async def build_digest(
@@ -262,10 +521,15 @@ __all__ = [
     "CATALOGUE",
     "EventSpec",
     "IMMEDIATE_EMAIL",
+    "EMAIL_AT_SOURCE",
     "DIGEST_FREQUENCIES",
     "DEFAULT_FREQUENCY",
     "deep_link",
+    "public_base_url",
+    "login_aware_url",
     "notify",
+    "deliver",
+    "render_event_email",
     "build_digest",
     "render_digest_text",
 ]
@@ -279,8 +543,10 @@ __all__ = [
 # toggles, and a class is the granularity people actually think in.
 
 EVENT_CLASS: dict[str, str] = {
+    "AUDIT_SCHEDULED": "ASSIGNMENT",
     "AUDITOR_ASSIGNED": "ASSIGNMENT",
     "AUDITEE_ASSIGNED": "ASSIGNMENT",
+    "PLANT_HEAD_ASSIGNED": "ASSIGNMENT",
     "CHECKPOINTS_ALLOCATED": "ASSIGNMENT",
     "ENGAGEMENT_STARTING_INCOMPLETE_TEAM": "EXECUTION",
     "FINDING_ROUTED": "EXECUTION",
@@ -408,9 +674,11 @@ async def should_deliver(
     in_app = row.inAppEnabled if row else True
     freq = row.emailFrequency if row else DEFAULT_FREQUENCY
     forced = event in IMMEDIATE_EMAIL
+    # Emailed as it happens, but muted by OFF — the difference from `forced`.
+    at_source = (event in EMAIL_AT_SOURCE) and freq != "OFF"
     return {
         "inApp": in_app,
-        "emailNow": forced or freq == "IMMEDIATE",
-        "emailDigest": (not forced) and freq in ("DAILY", "WEEKLY"),
+        "emailNow": forced or at_source or freq == "IMMEDIATE",
+        "emailDigest": (not forced) and (not at_source) and freq in ("DAILY", "WEEKLY"),
         "overriddenByUrgency": forced and freq == "OFF",
     }

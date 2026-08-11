@@ -16,11 +16,21 @@ people, and they receive the invite while nobody already booked is re-invited.
 
 What gets booked, per engagement:
 
-  AUDIT_BLOCK      the fieldwork window. Auditors required, auditees optional —
-                   an auditee is not sitting in the audit for eight hours, but
-                   their day should show it is happening.
-  OPENING_MEETING  ISO 19011 §6.4.2, at the head of the window. Everyone required.
-  CLOSING_MEETING  ISO 19011 §6.4.9, at the foot of it. Everyone required.
+  AUDIT_BLOCK      the fieldwork window, booked the moment the audit is
+                   scheduled. Auditors required, auditees optional — an auditee
+                   is not sitting in the audit for eight hours, but their day
+                   should show it is happening.
+
+  OPENING_MEETING  ISO 19011 §6.4.2 } booked ONLY once somebody records the
+  CLOSING_MEETING  ISO 19011 §6.4.9 } meeting and asks for it on the calendar.
+
+**Scheduling an audit books one event, not three.** The opening and closing
+meetings happen when the audit actually runs, at a time and with a cast nobody
+knows weeks ahead — the department owners who attend the opening meeting are
+identified AT that meeting. Creating them up front put two speculative events in
+every diary and named the wrong people in both. So the minute record owns them
+entirely: its `heldAt` is the time, its attendee list is the cast, and clearing
+`addToCalendar` withdraws the invitation again.
 
 Sync is best-effort and never raises into its caller. An audit that could not be
 created because Exchange was unreachable would be a worse product than one whose
@@ -191,15 +201,25 @@ def _attendee(u: User | None, user_id: str | None, role: str, required: bool) ->
     }
 
 
-async def _meeting_extras(
+async def _meeting_records(
     db: AsyncSession, kind: str, engagement_id: str
-) -> dict[str, list[dict[str, Any]]]:
-    """People named on the opening / closing minutes, as calendar attendees.
+) -> dict[str, dict[str, Any] | None]:
+    """The opening / closing minutes, as bookable meetings.
+
+    **A meeting is booked because someone recorded it, never because an audit was
+    scheduled.** Opening and closing meetings are held when the audit actually
+    runs, at a time and with a cast that nobody knows weeks in advance — so
+    inventing them at scheduling time put three events in people's calendars when
+    only the fieldwork window had been agreed.
+
+    The record is therefore the whole source of truth for these two bookings:
+    `heldAt` gives the time, its attendee list gives the cast. Returns the type
+    keyed to `None` when no record exists, which is what tells the caller there
+    is no meeting to book.
 
     The audit team fields answer "who is running this audit". They do not answer
     "who is in the room" — the department owners are identified AT the opening
-    meeting, and the meeting record is the only place they are ever named. Left
-    out of the desired state, they would be invited to nothing.
+    meeting, and the meeting record is the only place they are ever named.
 
     Only records with `addToCalendar` contribute, and only people who can be
     reached: an internal attendee resolves through their user record, an external
@@ -211,7 +231,7 @@ async def _meeting_extras(
     `scripts/add_meeting_calendar_sync.py` run yet. Bookings are worth more than
     the enrichment: a missing column must not stop the audit team's invites.
     """
-    out: dict[str, list[dict[str, Any]]] = {"OPENING": [], "CLOSING": []}
+    out: dict[str, dict[str, Any] | None] = {"OPENING": None, "CLOSING": None}
     try:
         from app.models.assurance import EngagementMeeting
 
@@ -236,9 +256,14 @@ async def _meeting_extras(
         users = await _emails(db, uids)
 
         for r in rows:
-            bucket = out.get((r.meetingType or "").upper())
-            if bucket is None:
+            mtype = (r.meetingType or "").upper()
+            if mtype not in out:
                 continue
+            held = r.heldAt
+            if held is not None and held.tzinfo is None:
+                held = held.replace(tzinfo=timezone.utc)
+            out[mtype] = {"heldAt": held, "attendees": []}
+            bucket = out[mtype]["attendees"]
             for a in r.attendees or []:
                 if not isinstance(a, dict):
                     continue
@@ -257,9 +282,66 @@ async def _meeting_extras(
                         }
                     )
     except Exception as e:  # noqa: BLE001
-        log.debug("meeting attendees skipped for %s %s: %s", kind, engagement_id, e)
-        return {"OPENING": [], "CLOSING": []}
+        log.debug("meeting records skipped for %s %s: %s", kind, engagement_id, e)
+        return {"OPENING": None, "CLOSING": None}
     return out
+
+
+def _meeting_spec(
+    booking_type: str,
+    record: dict[str, Any] | None,
+    *,
+    subject: str,
+    heading: str,
+    purpose: str,
+    reference: str,
+    title: str,
+    site: str,
+    scope: str,
+    link_path: str,
+    location: str,
+    scheduler: dict[str, Any] | None,
+    fallback_window: tuple[datetime, datetime],
+) -> "_Spec | None":
+    """One opening/closing meeting booking, or None when there is nothing to book.
+
+    Returning None is the point of this function. A meeting exists on the
+    calendar only once somebody has recorded it and asked for it to be on the
+    calendar — until then the audit has agreed a fieldwork window and nothing
+    else, and putting two more events in nine diaries would be inventing
+    commitments that were never made.
+
+    Time comes from the minute's `heldAt`, not from the audit window, because
+    that is the field the recorder actually filled in. The window is only a
+    fallback for a record that somehow carries no time.
+    """
+    if not record:
+        return None
+    attendees = record.get("attendees") or []
+    if not attendees:
+        # A record whose named people are all unreachable. The minute stands;
+        # there is simply nobody to invite.
+        return None
+    start = record.get("heldAt") or fallback_window[0]
+    minutes = (
+        get_settings().calendar_opening_meeting_minutes
+        if booking_type == OPENING_MEETING
+        else get_settings().calendar_closing_meeting_minutes
+    )
+    end = start + timedelta(minutes=max(int(minutes or 30), 5))
+    return _Spec(
+        booking_type,
+        subject,
+        start,
+        end,
+        attendees,
+        _body(
+            heading=heading, reference=reference, title=title,
+            site=site, scope=scope, purpose=purpose, link_path=link_path,
+        ),
+        location,
+        scheduler,
+    )
 
 
 def _cast_union(*groups: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -385,12 +467,13 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
     # The opening meeting's attendees carry forward to the CLOSING invite, which
     # is the whole point of doing this: they are the people who own the findings
     # being presented, and until now nothing put them on that invitation.
-    extras = await _meeting_extras(db, "AUDIT", audit.id)
-    opening_cast = _cast_union(meeting_cast, extras["OPENING"])
-    closing_cast = _cast_union(meeting_cast, extras["OPENING"], extras["CLOSING"])
-
+    records = await _meeting_records(db, "AUDIT", audit.id)
     (op_s, op_e), (cl_s, cl_e) = _meeting_slots(start, end)
-    return [
+
+    # The fieldwork block is the ONLY booking an engagement implies. The opening
+    # and closing meetings are booked when somebody records them — see
+    # `_meeting_spec`.
+    specs: list[_Spec] = [
         _Spec(
             AUDIT_BLOCK,
             f"Audit: {audit.title} ({ref})",
@@ -403,59 +486,41 @@ async def _specs_for_audit(db: AsyncSession, audit) -> list[_Spec]:
                 title=audit.title,
                 site=site,
                 scope=scope,
-                purpose=(
-                    "This block reserves the audit window. Auditors are required for the "
+                purpose=("This block reserves the audit window. Auditors are required for the "
                     "full period; auditees are invited as optional so the time shows on "
-                    "their calendar and they can be reached during fieldwork."
-                ),
+                    "their calendar and they can be reached during fieldwork."),
                 link_path=link_path,
             ),
             location,
             scheduler,
-        ),
-        _Spec(
-            OPENING_MEETING,
-            f"Opening meeting: {audit.title} ({ref})",
-            op_s,
-            op_e,
-            opening_cast,
-            _body(
-                heading="Opening meeting — ISO 19011 §6.4.2",
-                reference=ref,
-                title=audit.title,
-                site=site,
-                scope=scope,
-                purpose=(
-                    "Confirm the audit scope, criteria and plan, introduce the audit team, "
-                    "and identify the department owners who will respond to findings."
-                ),
-                link_path=link_path,
-            ),
-            location,
-            scheduler,
-        ),
-        _Spec(
-            CLOSING_MEETING,
-            f"Closing meeting: {audit.title} ({ref})",
-            cl_s,
-            cl_e,
-            closing_cast,
-            _body(
-                heading="Closing meeting — ISO 19011 §6.4.9",
-                reference=ref,
-                title=audit.title,
-                site=site,
-                scope=scope,
-                purpose=(
-                    "Present the findings and conclusions, agree corrective-action ownership "
-                    "and due dates, and record the auditee's acknowledgement."
-                ),
-                link_path=link_path,
-            ),
-            location,
-            scheduler,
-        ),
+        )
     ]
+    opening = _meeting_spec(
+        OPENING_MEETING, records.get("OPENING"),
+        subject=f"Opening meeting: {audit.title} ({ref})",
+        heading="Opening meeting — ISO 19011 §6.4.2",
+        purpose=(
+            "Confirm the audit scope, criteria and plan, introduce the audit team, "
+            "and identify the department owners who will respond to findings."
+        ),
+        reference=ref, title=audit.title, site=site, scope=scope,
+        link_path=link_path, location=location, scheduler=scheduler,
+        fallback_window=(op_s, op_e),
+    )
+    closing = _meeting_spec(
+        CLOSING_MEETING, records.get("CLOSING"),
+        subject=f"Closing meeting: {audit.title} ({ref})",
+        heading="Closing meeting — ISO 19011 §6.4.9",
+        purpose=(
+            "Present the findings and conclusions, agree corrective-action ownership "
+            "and due dates, and record the auditee's acknowledgement."
+        ),
+        reference=ref, title=audit.title, site=site, scope=scope,
+        link_path=link_path, location=location, scheduler=scheduler,
+        fallback_window=(cl_s, cl_e),
+    )
+    return [*specs, *(x for x in (opening, closing) if x)]
+
 
 
 async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
@@ -509,67 +574,58 @@ async def _specs_for_engagement(db: AsyncSession, eng) -> list[_Spec]:
     # Same rule as an audit: the minutes name people the engagement record never
     # knew about, and they belong on the meetings but not on the fieldwork block.
     meeting_cast = cast(auditee_required=True)
-    extras = await _meeting_extras(db, "INSPECTION", eng.id)
-    opening_cast = _cast_union(meeting_cast, extras["OPENING"])
-    closing_cast = _cast_union(meeting_cast, extras["OPENING"], extras["CLOSING"])
-
+    records = await _meeting_records(db, "INSPECTION", eng.id)
     (op_s, op_e), (cl_s, cl_e) = _meeting_slots(start, end)
-    return [
+
+    # The fieldwork block is the ONLY booking an engagement implies. The opening
+    # and closing meetings are booked when somebody records them — see
+    # `_meeting_spec`.
+    specs: list[_Spec] = [
         _Spec(
             AUDIT_BLOCK,
             f"{eng.engagementType.replace('_', ' ').title()}: {eng.title} ({ref})",
             start,
             end,
-            cast(auditee_required=False),
+            block_cast,
             _body(
-                heading="Engagement fieldwork — please keep this time free",
+                heading="Audit fieldwork — please keep this time free",
                 reference=ref,
                 title=eng.title,
                 site=site,
                 scope=scope,
-                purpose="This block reserves the fieldwork window for this engagement.",
+                purpose=("This block reserves the fieldwork window for this engagement."),
                 link_path=link_path,
             ),
             location,
             scheduler,
-        ),
-        _Spec(
-            OPENING_MEETING,
-            f"Opening meeting: {eng.title} ({ref})",
-            op_s,
-            op_e,
-            opening_cast,
-            _body(
-                heading="Opening meeting — ISO 19011 §6.4.2",
-                reference=ref,
-                title=eng.title,
-                site=site,
-                scope=scope,
-                purpose="Confirm scope, criteria and plan, and introduce the team.",
-                link_path=link_path,
-            ),
-            location,
-            scheduler,
-        ),
-        _Spec(
-            CLOSING_MEETING,
-            f"Closing meeting: {eng.title} ({ref})",
-            cl_s,
-            cl_e,
-            closing_cast,
-            _body(
-                heading="Closing meeting — ISO 19011 §6.4.9",
-                reference=ref,
-                title=eng.title,
-                site=site,
-                scope=scope,
-                purpose="Present findings and conclusions and agree corrective actions.",
-                link_path=link_path,
-            ),
-            location,
-            scheduler,
-        ),
+        )
     ]
+    opening = _meeting_spec(
+        OPENING_MEETING, records.get("OPENING"),
+        subject=f"Opening meeting: {eng.title} ({ref})",
+        heading="Opening meeting — ISO 19011 §6.4.2",
+        purpose=(
+            "Confirm the audit scope, criteria and plan, introduce the audit team, "
+            "and identify the department owners who will respond to findings."
+        ),
+        reference=ref, title=eng.title, site=site, scope=scope,
+        link_path=link_path, location=location, scheduler=scheduler,
+        fallback_window=(op_s, op_e),
+    )
+    closing = _meeting_spec(
+        CLOSING_MEETING, records.get("CLOSING"),
+        subject=f"Closing meeting: {eng.title} ({ref})",
+        heading="Closing meeting — ISO 19011 §6.4.9",
+        purpose=(
+            "Present the findings and conclusions, agree corrective-action ownership "
+            "and due dates, and record the auditee's acknowledgement."
+        ),
+        reference=ref, title=eng.title, site=site, scope=scope,
+        link_path=link_path, location=location, scheduler=scheduler,
+        fallback_window=(cl_s, cl_e),
+    )
+    return [*specs, *(x for x in (opening, closing) if x)]
+
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1054,13 +1110,35 @@ async def _sync_engagement_inner(
             b.updatedBy = actor_id
             pending.append(b)
 
+        # ── Withdraw meetings that are no longer wanted ────────────────
+        #
+        # A meeting booking exists only while its minute asks for it. Deleting
+        # the record, or clearing "add these attendees to the calendar", has to
+        # take the invitation back out of everyone's diary — otherwise turning
+        # the switch off would be a promise the product does not keep, and the
+        # meeting would sit in nine calendars with nothing behind it.
+        #
+        # Scoped to the meeting types only: the fieldwork block is always in the
+        # desired set, so it can never be swept up by this.
+        results: dict[str, str] = {}
+        wanted = {sp.booking_type for sp in specs}
+        for btype in (OPENING_MEETING, CLOSING_MEETING):
+            stale = existing.get(btype)
+            if stale is None or btype in wanted or stale.status == "CANCELLED":
+                continue
+            await _cancel_one(
+                stale,
+                "This meeting is no longer scheduled in SafeOps360.",
+                actor_id,
+            )
+            results[stale.bookingType] = "withdrawn"
+
         # All three deliveries at once. The session is inside the transaction
         # that created the audit, so the wall-clock cost of this call is time a
         # Postgres transaction stays open — one round trip, not three.
         outcomes = await asyncio.gather(
             *(_deliver(b, force=force) for b in pending), return_exceptions=True
         )
-        results: dict[str, str] = {}
         for b, outcome in zip(pending, outcomes):
             if isinstance(outcome, BaseException):
                 # A provider that raised despite its contract must still leave a

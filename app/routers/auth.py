@@ -188,14 +188,26 @@ async def me(
     return await _user_to_out(db, user)
 
 
+def _is_pickable(email: str) -> bool:
+    """May the login page's demo picker reveal this account?
+
+    The demo domain, plus any address named in DEMO_SEARCH_EXTRA_EMAILS. Both
+    picker endpoints answer before anyone has signed in, so this is the whole
+    boundary between a demo convenience and a public directory of real staff.
+    """
+    e = (email or "").strip().lower()
+    return e.endswith("@safeops360.in") or e in settings.demo_search_allowed_emails
+
+
 @router.get("/demo-user")
 async def demo_user_lookup(email: str, db: AsyncSession = Depends(get_db)) -> dict[str, str | None]:
     """Public lookup used by the login page's demo role picker — given the
     composed demo email, returns just the user's display name + designation.
-    Restricted to @safeops360.in addresses so it can't be used as a generic
-    user-enumeration oracle."""
+    Restricted to @safeops360.in addresses plus the explicitly listed accounts in
+    DEMO_SEARCH_EXTRA_EMAILS, so it can't be used as a generic user-enumeration
+    oracle."""
     e = (email or "").strip().lower()
-    if not e or not e.endswith("@safeops360.in"):
+    if not e or not _is_pickable(e):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "demo email required")
     row = (await db.execute(select(User).where(User.email == e))).scalar_one_or_none()
     if row is None:
@@ -208,9 +220,10 @@ async def demo_user_search(q: str, limit: int = 25, db: AsyncSession = Depends(g
     """Public name/email search used by the login page's demo account picker.
 
     Same enumeration stance as /demo-user above: restricted to @safeops360.in
-    demo accounts, so this is not a generic directory oracle for real tenants.
-    Returns the identity fields the picker renders — name, plant, department,
-    role — plus the email it fills into the sign-in form.
+    demo accounts plus the addresses named in DEMO_SEARCH_EXTRA_EMAILS, so this
+    is not a generic directory oracle for real tenants. Returns the identity
+    fields the picker renders — name, plant, department, role — plus the email
+    it fills into the sign-in form.
     """
     term = (q or "").strip()
     if len(term) < 2:
@@ -218,10 +231,15 @@ async def demo_user_search(q: str, limit: int = 25, db: AsyncSession = Depends(g
     capped = max(1, min(limit, 50))
     pattern = f"%{term.lower()}%"
 
+    allowed = settings.demo_search_allowed_emails
+    scope = User.email.ilike("%@safeops360.in")
+    if allowed:
+        scope = scope | func.lower(User.email).in_(sorted(allowed))
+
     stmt = (
         select(User, Plant)
         .outerjoin(Plant, Plant.id == User.plantId)
-        .where(User.email.ilike("%@safeops360.in"))
+        .where(scope)
         .where(func.lower(User.name).like(pattern) | func.lower(User.email).like(pattern))
         .order_by(User.name)
         .limit(capped)

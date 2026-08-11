@@ -82,6 +82,11 @@ class MyCountResponse(BaseModel):
     unreadMyTasks: int = 0
     unreadPendingVerification: int = 0
     unreadOverdueEscalated: int = 0
+    # Unread rows in the Notification table — the Inbox's sixth tab. Events with
+    # no workflow task behind them (an audit assignment, an overdue risk
+    # treatment). Kept OUT of `count`, which older clients read as the pending
+    # task total; the sidebar badge adds the two itself.
+    unreadNotifications: int = 0
 
 
 class WorkflowTaskOut(BaseModel):

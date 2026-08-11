@@ -82,6 +82,24 @@ class Settings(BaseSettings):
     # enable in any internet-reachable environment.
     expose_dev_otp: bool = False
 
+    # Accounts the login page's demo picker may find, beyond the @safeops360.in
+    # demo domain. Comma-separated addresses.
+    #
+    # Explicit addresses rather than a domain on purpose. `/api/auth/demo-search`
+    # is UNAUTHENTICATED — it answers before anyone signs in — so allowing a real
+    # company domain would turn the login page into a staff directory anyone
+    # could enumerate. Named accounts on a real domain (a group HSE manager, a
+    # pilot user) are listed here one at a time, as a deliberate act.
+    demo_search_extra_emails: str = ""
+
+    @property
+    def demo_search_allowed_emails(self) -> set[str]:
+        return {
+            e.strip().lower()
+            for e in self.demo_search_extra_emails.split(",")
+            if e.strip()
+        }
+
     # ── Email (SMTP) ────────────────────────────────────────────────────────
     # Typed access to the same values `.env` exposes. The best-effort email
     # sender prefers these (falls back to os.getenv for backwards-compat).

@@ -2341,6 +2341,21 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
     await _cal.sync_engagement(
         db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
     )
+
+    # ── And the moment the time is claimed, the people are told ───────────
+    #
+    # The calendar invite says WHEN. It does not say what the audit is, which
+    # disciplines are yours, or what you are expected to do — and a calendar
+    # invite from a system address is routinely accepted unread. Every seat now
+    # also gets an in-app notification and an email carrying a role-specific
+    # deep link into the audit.
+    #
+    # Best-effort by contract (`notify_audit_scheduled` swallows its own
+    # exceptions), for the same reason as the calendar sync above: an audit must
+    # not fail to be created because SMTP was down.
+    from app.services import cams_audit_notifications as _camsnotif
+
+    await _camsnotif.notify_audit_scheduled(db, audit=audit, actor_id=user.id)
     return audit
 
 
@@ -2856,6 +2871,14 @@ async def update_audit_team(
 
     override_manual = bool(data.get("overrideManualAllocations"))
 
+    # Who is seated BEFORE anything is reassigned. The JSON columns are
+    # overwritten in place below, so this is the only chance to know who is
+    # genuinely new — and without it, adding one auditee would re-notify the
+    # entire team, which is how a notification channel gets muted.
+    from app.services import cams_audit_notifications as _camsnotif
+
+    _team_before = _camsnotif.team_snapshot(audit)
+
     # Only the keys actually supplied are touched, so a call that names auditees
     # cannot blank the co-auditors it never mentioned.
     co_in = data.get("coAuditors")
@@ -2992,6 +3015,12 @@ async def update_audit_team(
     cal = await _cal.sync_engagement(
         db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
     )
+
+    # …and the same diff drives the notification. Only the seats that are new
+    # since `_team_before` hear about it. Best-effort, as above.
+    fanout = await _camsnotif.notify_team_changed(
+        db, audit=audit, before=_team_before, actor_id=user.id
+    )
     return {
         "ok": True,
         "coAuditors": len(co_auditors),
@@ -3000,6 +3029,8 @@ async def update_audit_team(
         "auditorReassignments": auditor_changed,
         "calendarInvitesSent": cal.get("attendeesAdded", 0),
         "calendarInvitesWithdrawn": cal.get("attendeesRemoved", 0),
+        "notificationsSent": fanout.get("inApp", 0),
+        "emailsSent": fanout.get("email", 0),
     }
 
 

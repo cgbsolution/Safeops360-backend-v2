@@ -692,6 +692,26 @@ async def my_count(
     pending = int((await db.execute(pending_stmt)).scalar_one())
     completed = int((await db.execute(completed_stmt)).scalar_one())
 
+    # Notifications are not workflow tasks and have no assignee or SLA, but they
+    # are the other half of what the Inbox shows — before the Notifications tab
+    # existed, an audit assignment landed in the Inbox and the sidebar badge
+    # stayed at zero. Reported as its OWN field rather than folded into `count`:
+    # `count` is documented as the legacy pending-task number and other clients
+    # read it that way, so widening it here would quietly change their meaning.
+    # The sidebar adds the two.
+    from app.models.notification import Notification
+
+    unread_notifications = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(Notification)
+                .where(Notification.userId == user.id)
+                .where(Notification.isRead == False)  # noqa: E712
+            )
+        ).scalar_one()
+    )
+
     return MyCountResponse(
         count=pending,
         pending=pending,
@@ -707,6 +727,7 @@ async def my_count(
         unreadMyTasks=unread_my,
         unreadPendingVerification=unread_pv,
         unreadOverdueEscalated=unread_oe,
+        unreadNotifications=unread_notifications,
     )
 
 
