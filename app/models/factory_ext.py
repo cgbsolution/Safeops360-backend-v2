@@ -307,3 +307,64 @@ class FactoryEquipmentInspection(Base, IdMixin):
         Index("ix_FactoryEquipmentInspection_factoryProfileId", "factoryProfileId"),
         Index("ix_FactoryEquipmentInspection_siteId", "siteId"),
     )
+
+
+# ── Factory Profile Change Request (governed edit + version history) ──────────
+class FactoryProfileChangeRequest(Base, IdMixin):
+    """A proposed edit to an ACTIVE factory profile's master data.
+
+    Once a profile reaches lifecycleStage ACTIVE its identity/statutory fields
+    are governed: an edit is captured here as a diff and applied only after the
+    Unit (Plant Head) and then the Compliance Team (Lead Auditor) approve —
+    two sequential approvals, PENDING_UNIT → PENDING_COMPLIANCE → APPLIED.
+
+    Rows are never deleted. APPLIED / REJECTED / WITHDRAWN rows *are* the
+    version history, so a factory's profile can always be replayed field by
+    field with who asked, who approved and when. Edits made while the profile is
+    still being drafted (lifecycleStage before ACTIVE) land here too, with
+    ``autoApplied=True`` — history without a gate.
+    """
+
+    __tablename__ = "FactoryProfileChangeRequest"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+
+    version: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-based, per profile
+    # [{field, label, from, to}] — the proposed diff, computed on submit.
+    changes: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    reason: Mapped[str | None] = mapped_column(Text)
+    # PENDING_UNIT | PENDING_COMPLIANCE | APPLIED | REJECTED | WITHDRAWN
+    status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING_UNIT")
+
+    requestedBy: Mapped[str | None] = mapped_column(String)
+    requestedByRole: Mapped[str | None] = mapped_column(String)
+    requestedAt: Mapped[datetime] = _created()
+
+    unitApprovedBy: Mapped[str | None] = mapped_column(String)  # Plant Head
+    unitApprovedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    unitApprovalComment: Mapped[str | None] = mapped_column(Text)
+
+    complianceApprovedBy: Mapped[str | None] = mapped_column(String)  # Lead Auditor
+    complianceApprovedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    complianceApprovalComment: Mapped[str | None] = mapped_column(Text)
+
+    rejectedBy: Mapped[str | None] = mapped_column(String)
+    rejectedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejectedAtStep: Mapped[str | None] = mapped_column(String)  # UNIT | COMPLIANCE
+    rejectionReason: Mapped[str | None] = mapped_column(Text)
+
+    appliedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    autoApplied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_FactoryProfileChangeRequest_factoryProfileId", "factoryProfileId"),
+        Index("ix_FactoryProfileChangeRequest_siteId", "siteId"),
+        Index("ix_FactoryProfileChangeRequest_status", "status"),
+    )

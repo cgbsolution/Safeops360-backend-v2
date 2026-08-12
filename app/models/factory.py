@@ -41,7 +41,12 @@ def _updated():
 class FactoryProfile(Base, IdMixin):
     __tablename__ = "FactoryProfile"
 
-    siteId: Mapped[str] = mapped_column(String, unique=True, nullable=False)  # Plant.id — 1:1
+    # Plant.id — 1:1, and still mandatory at the DB level: every child row, the
+    # RBAC plant scope and every live compliance rollup key off it. What is
+    # optional is the *operator* having to pick one — for a Page-owned in-house
+    # factory the create endpoint provisions the Site itself
+    # (services/factory.ensure_site_for_profile).
+    siteId: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     factoryCode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     factoryName: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="OPERATIONAL")
@@ -125,6 +130,9 @@ class Building(Base, IdMixin):
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     factoryProfile: Mapped["FactoryProfile"] = relationship(back_populates="buildings")
+    floorRegister: Mapped[list["BuildingFloor"]] = relationship(
+        back_populates="building", cascade="all, delete-orphan"
+    )
 
     createdAt: Mapped[datetime] = _created()
     createdBy: Mapped[str | None] = mapped_column(String)
@@ -136,6 +144,106 @@ class Building(Base, IdMixin):
         Index("ix_Building_factoryProfileId", "factoryProfileId"),
         Index("ix_Building_siteId", "siteId"),
         Index("ix_Building_buildingType", "buildingType"),
+    )
+
+
+# ── Building Floor ───────────────────────────────────────────────────────────
+class BuildingFloor(Base, IdMixin):
+    """A named, addressable level within a Building.
+
+    ``Building.floors`` (an Int) stays the headline count; these rows are what
+    activities are actually mapped onto, so a layout reads "Block A / Floor 1 /
+    Sewing" end to end. ``floorLevel`` is the sortable ordinal (-1 basement,
+    0 ground, 1, 2 …) and is unique per building among non-deleted rows.
+    """
+
+    __tablename__ = "BuildingFloor"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    buildingId: Mapped[str] = mapped_column(ForeignKey("Building.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+
+    floorLabel: Mapped[str] = mapped_column(String, nullable=False)
+    floorLevel: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Standardised units — baked into the column name, never user-selectable.
+    areaSqm: Mapped[float | None] = mapped_column(Float)              # m²
+    headroomM: Mapped[float | None] = mapped_column(Float)            # m
+    occupancyPersons: Mapped[int | None] = mapped_column(Integer)     # persons
+    notes: Mapped[str | None] = mapped_column(Text)
+    isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    building: Mapped["Building"] = relationship(back_populates="floorRegister")
+    activities: Mapped[list["BuildingFloorActivity"]] = relationship(
+        back_populates="floor", cascade="all, delete-orphan"
+    )
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_BuildingFloor_factoryProfileId", "factoryProfileId"),
+        Index("ix_BuildingFloor_buildingId", "buildingId"),
+        Index("ix_BuildingFloor_siteId", "siteId"),
+    )
+
+
+# ── Building Floor Activity ──────────────────────────────────────────────────
+class BuildingFloorActivity(Base, IdMixin):
+    """One process / activity carried out on a floor. Many per floor — the
+    multi-process mapping a single ``Building.buildingType`` could never express
+    (Floor 1 Sewing, Floor 2 Packing, Floor 3 Canteen, a DG yard carrying both a
+    1250 kVA set and the STP).
+
+    ``processId`` optionally binds the activity to the ProductionProcess
+    register (loose link, no FK: a process may be archived independently) so the
+    process flow and the physical layout stay one dataset.
+
+    Every quantity column carries ONE fixed unit in its name — measurement units
+    are standardised references here, never a per-row dropdown.
+    """
+
+    __tablename__ = "BuildingFloorActivity"
+
+    factoryProfileId: Mapped[str] = mapped_column(ForeignKey("FactoryProfile.id", ondelete="CASCADE"), nullable=False)
+    buildingId: Mapped[str] = mapped_column(String, nullable=False)
+    floorId: Mapped[str] = mapped_column(ForeignKey("BuildingFloor.id", ondelete="CASCADE"), nullable=False)
+    siteId: Mapped[str] = mapped_column(String, nullable=False)
+
+    # PROCESS | UTILITY | WELFARE | STORAGE | ADMIN | EFFLUENT | POWER | OTHER
+    activityType: Mapped[str] = mapped_column(String, nullable=False, default="PROCESS")
+    activityName: Mapped[str] = mapped_column(String, nullable=False)
+    processId: Mapped[str | None] = mapped_column(String)
+    description: Mapped[str | None] = mapped_column(Text)
+    sequenceOrder: Mapped[int | None] = mapped_column(Integer)
+
+    # Standardised measures (fixed units — mirrored by UNITS in facilities/lib.ts)
+    areaSqm: Mapped[float | None] = mapped_column(Float)                       # m²
+    headcount: Mapped[int | None] = mapped_column(Integer)                     # persons
+    productionCapacityPcsPerDay: Mapped[float | None] = mapped_column(Float)   # pcs/day
+    fabricConsumptionMPerDay: Mapped[float | None] = mapped_column(Float)      # m/day
+    powerRatingKva: Mapped[float | None] = mapped_column(Float)                # kVA
+    waterCapacityKld: Mapped[float | None] = mapped_column(Float)              # KL/day
+    wasteGeneratedKgPerDay: Mapped[float | None] = mapped_column(Float)        # kg/day
+
+    keyHazards: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    floor: Mapped["BuildingFloor"] = relationship(back_populates="activities")
+
+    createdAt: Mapped[datetime] = _created()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _updated()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    isDeleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_BuildingFloorActivity_factoryProfileId", "factoryProfileId"),
+        Index("ix_BuildingFloorActivity_buildingId", "buildingId"),
+        Index("ix_BuildingFloorActivity_floorId", "floorId"),
+        Index("ix_BuildingFloorActivity_siteId", "siteId"),
     )
 
 

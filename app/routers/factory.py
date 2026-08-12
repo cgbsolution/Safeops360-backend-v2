@@ -8,8 +8,10 @@ endpoints plant-scoped + RBAC-enforced.
 Permission codes (seeded in seed-rbac.ts):
   FACILITY.READ    view profiles / buildings / consolidated dashboard
   FACILITY.CREATE  create a factory profile (1:1 with a Site)
-  FACILITY.UPDATE  edit profile + manage buildings
+  FACILITY.UPDATE  edit profile + manage buildings / floors / floor activities
   FACILITY.DELETE  archive a factory profile (soft delete)
+  FACILITY.PROFILE_APPROVE_UNIT        Plant Head sign-off on a profile edit
+  FACILITY.PROFILE_APPROVE_COMPLIANCE  Lead Auditor sign-off on a profile edit
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.models.factory import (
     Building,
+    BuildingFloor,
+    BuildingFloorActivity,
     FactoryCertification,
     FactoryComplianceSnapshot,
     FactoryContact,
@@ -37,11 +41,13 @@ from app.models.factory_ext import (
     FactoryEquipment,
     FactoryEquipmentInspection,
     FactoryLifecycleEvent,
+    FactoryProfileChangeRequest,
     HazardousMaterial,
     RegulatoryRegistration,
 )
 from app.models.user import User
 from app.schemas import factory as S
+from app.schemas import factory_ext as Sx
 from app.services import factory as svc
 from app.services import factory_ext as svc_ext
 from app.services import factory_snapshot as snap_svc
@@ -91,11 +97,63 @@ def _social_out(s: SocialComplianceProfile) -> S.SocialComplianceProfileOut:
     return S.SocialComplianceProfileOut.model_validate(s)
 
 
+def _building_out(b: Building, floors_by_building: dict[str, list[S.BuildingFloorOut]]) -> S.BuildingOut:
+    o = S.BuildingOut.model_validate(b)
+    o.floorRegister = floors_by_building.get(b.id, [])
+    return o
+
+
+async def _building_detail(db: AsyncSession, b: Building) -> S.BuildingOut:
+    """One building with its floor register attached (single-row equivalent of
+    the batched `_floors_by_building` used by the profile detail page)."""
+    return _building_out(b, await _floors_by_building(db, b.factoryProfileId))
+
+
 def _cert_out(c: FactoryCertification) -> S.FactoryCertificationOut:
     o = S.FactoryCertificationOut.model_validate(c)
     o.status = svc.compute_cert_status(c.expiryDate, c.renewalLeadDays, c.status)
     o.daysToExpiry = svc.cert_days_to_expiry(c.expiryDate)
     return o
+
+
+async def _floors_by_building(db: AsyncSession, profile_id: str) -> dict[str, list[S.BuildingFloorOut]]:
+    """Floor register + mapped activities, grouped by buildingId.
+
+    Loaded with explicit selects (never the lazy relationship, which would fire
+    outside the async greenlet) and assembled in Python so the whole detail page
+    costs two queries regardless of how many buildings a factory has.
+    """
+    floors = (
+        await db.execute(
+            select(BuildingFloor)
+            .where(BuildingFloor.factoryProfileId == profile_id)
+            .where(BuildingFloor.isDeleted.is_(False))
+            .order_by(BuildingFloor.floorLevel.asc(), BuildingFloor.floorLabel.asc())
+        )
+    ).scalars().all()
+    if not floors:
+        return {}
+    activities = (
+        await db.execute(
+            select(BuildingFloorActivity)
+            .where(BuildingFloorActivity.factoryProfileId == profile_id)
+            .where(BuildingFloorActivity.isDeleted.is_(False))
+            .order_by(
+                BuildingFloorActivity.sequenceOrder.asc().nulls_last(),
+                BuildingFloorActivity.activityName.asc(),
+            )
+        )
+    ).scalars().all()
+    acts_by_floor: dict[str, list[S.FloorActivityOut]] = {}
+    for a in activities:
+        acts_by_floor.setdefault(a.floorId, []).append(S.FloorActivityOut.model_validate(a))
+
+    out: dict[str, list[S.BuildingFloorOut]] = {}
+    for f in floors:
+        floor_out = S.BuildingFloorOut.model_validate(f)
+        floor_out.activities = acts_by_floor.get(f.id, [])
+        out.setdefault(f.buildingId, []).append(floor_out)
+    return out
 
 
 async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfileDetail:
@@ -108,6 +166,7 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
             .order_by(Building.buildingName.asc())
         )
     ).scalars().all()
+    floors_by_building = await _floors_by_building(db, p.id)
     workforce = (
         await db.execute(
             select(WorkforceComposition)
@@ -158,7 +217,7 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
     extras = await svc_ext.load_profile_extras(db, p.id)
     return S.FactoryProfileDetail(
         **base.model_dump(),
-        buildings=[S.BuildingOut.model_validate(b) for b in buildings],
+        buildings=[_building_out(b, floors_by_building) for b in buildings],
         currentWorkforce=_workforce_out(current) if current else None,
         workforceHistory=[_workforce_out(w) for w in workforce],
         processes=[S.ProductionProcessOut.model_validate(pr) for pr in processes],
@@ -169,6 +228,9 @@ async def _profile_detail(db: AsyncSession, p: FactoryProfile) -> S.FactoryProfi
         hazardousMaterials=extras["hazardousMaterials"],
         regulatoryRegistrations=extras["regulatoryRegistrations"],
         lifecycleEvents=extras["lifecycleEvents"],
+        changeRequests=extras["changeRequests"],
+        pendingChangeRequest=extras["pendingChangeRequest"],
+        editRequiresApproval=svc_ext.profile_edit_is_governed(p.lifecycleStage),
     )
 
 
@@ -298,21 +360,45 @@ async def list_profiles(
 @router.post("/profiles", response_model=S.FactoryProfileDetail, status_code=201)
 async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "FACILITY.CREATE", plant_id=body.siteId)
+    if not body.siteId:
+        # Leaving the Site blank provisions one. `can()` is permissive when no
+        # plant_id is supplied, so without this a plant-scoped user could mint
+        # Sites outside their scope — creating the Site link is exactly what
+        # FACILITY.SITE_LINK governs.
+        await _require(db, user, "FACILITY.SITE_LINK")
 
-    # Enforce the 1:1 site mapping (TF-01) — a Site carries one profile. The DB
-    # unique constraint covers soft-deleted rows too, so check ANY existing row
-    # (not just active) and return a clean 409 rather than a 500 unique-violation.
-    existing = (
-        await db.execute(select(FactoryProfile).where(FactoryProfile.siteId == body.siteId))
-    ).scalars().first()
-    if existing and not existing.isDeleted:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A factory profile already exists for this site.")
-    if existing and existing.isDeleted:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A factory profile for this site was archived; restore it instead of creating a new one.")
+    if body.siteId:
+        # Enforce the 1:1 site mapping (TF-01) — a Site carries one profile. The
+        # DB unique constraint covers soft-deleted rows too, so check ANY existing
+        # row (not just active) and return a clean 409 rather than a 500
+        # unique-violation. An auto-provisioned Site is new, so it can't collide.
+        existing = (
+            await db.execute(select(FactoryProfile).where(FactoryProfile.siteId == body.siteId))
+        ).scalars().first()
+        if existing and not existing.isDeleted:
+            raise HTTPException(status.HTTP_409_CONFLICT, "A factory profile already exists for this site.")
+        if existing and existing.isDeleted:
+            raise HTTPException(status.HTTP_409_CONFLICT, "A factory profile for this site was archived; restore it instead of creating a new one.")
+
+    factory_code = body.factoryCode or await svc.next_factory_code(db)
+    # Site selection is optional: supplier factories map onto an existing Site,
+    # a Page-owned in-house factory gets one provisioned from its own identity.
+    try:
+        site_id = await svc.ensure_site_for_profile(
+            db,
+            site_id=body.siteId,
+            factory_name=body.factoryName,
+            factory_code=factory_code,
+            city=body.city,
+            state=body.state,
+            primary_industry=body.primaryIndustry,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
     p = FactoryProfile(
-        siteId=body.siteId,
-        factoryCode=body.factoryCode or await svc.next_factory_code(db),
+        siteId=site_id,
+        factoryCode=factory_code,
         factoryName=body.factoryName,
         status=body.status,
         ownershipType=body.ownershipType,
@@ -339,12 +425,16 @@ async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_
     await db.flush()  # assign p.id before attaching buildings
 
     for b in body.buildings:
-        db.add(Building(
+        row = Building(
             factoryProfileId=p.id, siteId=p.siteId, buildingName=b.buildingName, buildingType=b.buildingType,
             floors=b.floors, areaSqm=b.areaSqm, maxOccupancy=b.maxOccupancy, currentOccupancy=b.currentOccupancy,
             yearBuilt=b.yearBuilt, assemblyPoint=b.assemblyPoint, emergencyExits=b.emergencyExits,
             occupancyCertificateNo=b.occupancyCertificateNo, isActive=b.isActive, createdBy=user.id,
-        ))
+        )
+        db.add(row)
+        await db.flush()  # assign row.id before its floor register
+        # The wizard's floor count becomes real, mappable floors.
+        await _seed_floor_register(db, row, user.id)
     await db.flush()
     await svc.recompute_building_count(db, p.id)
 
@@ -404,7 +494,27 @@ async def get_profile(profile_id: str, user: User = Depends(get_current_user), d
 
 
 @router.patch("/profiles/{profile_id}", response_model=S.FactoryProfileDetail)
-async def update_profile(profile_id: str, body: S.FactoryProfileUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def update_profile(
+    profile_id: str,
+    body: S.FactoryProfileUpdate,
+    reason: str | None = Query(None, description="Why the profile is being changed — recorded on the change request"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Edit a factory profile.
+
+    Two paths, decided by the profile's own lifecycle stage:
+
+    * **Still being drafted** (INITIATED / EXECUTION / VALIDATION) — the edit is
+      written straight through, and recorded as an ``autoApplied`` change-request
+      row so the version history has no gaps.
+    * **Governed** (lifecycleStage ACTIVE) — nothing is written. A change request
+      is opened instead and must be approved by the Plant Head at the Unit, then
+      by the Compliance Team's Lead Auditor, before the values land. The response
+      is the *unchanged* profile carrying ``pendingChangeRequest``.
+
+    Either way an edit is never silent: every version is attributable.
+    """
     p = await db.get(FactoryProfile, profile_id)
     if not p or p.isDeleted:
         raise HTTPException(404, "Factory profile not found")
@@ -413,13 +523,198 @@ async def update_profile(profile_id: str, body: S.FactoryProfileUpdate, user: Us
     data = body.model_dump(exclude_unset=True)
     if "registrationNos" in data and data["registrationNos"] is not None:
         data["registrationNos"] = [r if isinstance(r, dict) else r.model_dump() for r in body.registrationNos]
+
+    diff = svc_ext.build_profile_diff(p, data)
+    if not diff:
+        # Nothing actually changed — don't open an approval nobody needs. The
+        # completeness recompute still runs, since it also reflects child data
+        # (workforce) that may have moved since the last write.
+        if "profileStatus" not in data:
+            p.profileStatus = await svc.compute_profile_status(db, p)
+            await db.commit()
+            await db.refresh(p)
+        return await _profile_detail(db, p)
+
+    governed = svc_ext.profile_edit_is_governed(p.lifecycleStage)
+    if governed:
+        open_cr = await svc_ext.open_change_request(db, p.id)
+        if open_cr is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Change request v{open_cr.version} is already awaiting "
+                f"{svc_ext.CR_STEP_ROLE_LABEL.get(open_cr.status, 'approval')}. "
+                "Resolve or withdraw it before submitting another edit.",
+            )
+        cr = FactoryProfileChangeRequest(
+            factoryProfileId=p.id,
+            siteId=p.siteId,
+            version=await svc_ext.next_change_request_version(db, p.id),
+            changes=diff,
+            reason=reason,
+            status=svc_ext.CR_PENDING_UNIT,
+            requestedBy=user.id,
+            requestedByRole=getattr(user, "role", None),
+            requestedAt=_now(),
+            createdBy=user.id,
+        )
+        db.add(cr)
+        await db.commit()
+        await db.refresh(p)
+        return await _profile_detail(db, p)
+
+    # Pre-approval drafting — apply now, still record the version.
     for k, v in data.items():
         setattr(p, k, v)
     p.updatedBy = user.id
     # keep profileStatus honest unless the caller explicitly set it
     if "profileStatus" not in data:
         p.profileStatus = await svc.compute_profile_status(db, p)
+    db.add(FactoryProfileChangeRequest(
+        factoryProfileId=p.id,
+        siteId=p.siteId,
+        version=await svc_ext.next_change_request_version(db, p.id),
+        changes=diff,
+        reason=reason,
+        status=svc_ext.CR_APPLIED,
+        requestedBy=user.id,
+        requestedByRole=getattr(user, "role", None),
+        requestedAt=_now(),
+        appliedAt=_now(),
+        autoApplied=True,
+        createdBy=user.id,
+    ))
 
+    await db.commit()
+    await db.refresh(p)
+    return await _profile_detail(db, p)
+
+
+# ── Profile change requests (Plant Head → Compliance Lead Auditor) ───────────
+@router.get("/profiles/{profile_id}/change-requests", response_model=list[Sx.ChangeRequestOut])
+async def list_change_requests(profile_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Full version history for a profile, newest first."""
+    await _read_profile(db, user, profile_id)
+    extras = await svc_ext.load_profile_extras(db, profile_id)
+    return extras["changeRequests"]
+
+
+async def _open_cr_or_404(db: AsyncSession, request_id: str) -> FactoryProfileChangeRequest:
+    cr = await db.get(FactoryProfileChangeRequest, request_id)
+    if not cr or cr.isDeleted:
+        raise HTTPException(404, "Change request not found")
+    return cr
+
+
+@router.post("/change-requests/{request_id}/approve", response_model=S.FactoryProfileDetail)
+async def approve_change_request(
+    request_id: str,
+    body: Sx.ChangeRequestDecision,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Approve the current step of a change request.
+
+    PENDING_UNIT → PENDING_COMPLIANCE (Plant Head), then
+    PENDING_COMPLIANCE → APPLIED (Lead Auditor), which is where the proposed
+    values are finally written onto the profile.
+    """
+    cr = await _open_cr_or_404(db, request_id)
+    if cr.status not in svc_ext.CR_OPEN_STATUSES:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Change request is already {cr.status}.")
+    p = await db.get(FactoryProfile, cr.factoryProfileId)
+    if not p or p.isDeleted:
+        raise HTTPException(404, "Factory profile not found")
+    await _require(db, user, svc_ext.CR_STEP_PERMISSION[cr.status], plant_id=cr.siteId)
+
+    # Segregation of duties: the person who asked for a change cannot be the one
+    # who signs it off. An approval by the requester is not an approval.
+    if cr.requestedBy and cr.requestedBy == user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "You raised this change request — it must be approved by someone else.",
+        )
+
+    now = _now()
+    if cr.status == svc_ext.CR_PENDING_UNIT:
+        cr.unitApprovedBy = user.id
+        cr.unitApprovedAt = now
+        cr.unitApprovalComment = body.comment
+        cr.status = svc_ext.CR_PENDING_COMPLIANCE
+    else:
+        if cr.unitApprovedBy and cr.unitApprovedBy == user.id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "You gave the Unit approval — the Compliance sign-off must be a second person.",
+            )
+        cr.complianceApprovedBy = user.id
+        cr.complianceApprovedAt = now
+        cr.complianceApprovalComment = body.comment
+        cr.status = svc_ext.CR_APPLIED
+        cr.appliedAt = now
+        svc_ext.apply_change_request(p, cr)
+        p.updatedBy = user.id
+        p.lastReviewedAt = now
+        p.profileStatus = await svc.compute_profile_status(db, p)
+        db.add(FactoryLifecycleEvent(
+            factoryProfileId=p.id, siteId=p.siteId, fromStage=p.lifecycleStage, toStage=p.lifecycleStage,
+            action="ADVANCE", performedBy=user.id, performedByRole=getattr(user, "role", None),
+            comment=f"Profile change request v{cr.version} approved and applied "
+                    f"({len(cr.changes or [])} field(s)).",
+            createdBy=user.id,
+        ))
+    cr.updatedBy = user.id
+    await db.commit()
+    await db.refresh(p)
+    return await _profile_detail(db, p)
+
+
+@router.post("/change-requests/{request_id}/reject", response_model=S.FactoryProfileDetail)
+async def reject_change_request(
+    request_id: str,
+    body: Sx.ChangeRequestRejection,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reject at whichever step the request is sitting. The profile is untouched;
+    the rejected row stays as history and the requester may submit a fresh one."""
+    cr = await _open_cr_or_404(db, request_id)
+    if cr.status not in svc_ext.CR_OPEN_STATUSES:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Change request is already {cr.status}.")
+    p = await db.get(FactoryProfile, cr.factoryProfileId)
+    if not p or p.isDeleted:
+        raise HTTPException(404, "Factory profile not found")
+    await _require(db, user, svc_ext.CR_STEP_PERMISSION[cr.status], plant_id=cr.siteId)
+
+    cr.rejectedAtStep = "UNIT" if cr.status == svc_ext.CR_PENDING_UNIT else "COMPLIANCE"
+    cr.status = svc_ext.CR_REJECTED
+    cr.rejectedBy = user.id
+    cr.rejectedAt = _now()
+    cr.rejectionReason = body.reason
+    cr.updatedBy = user.id
+    db.add(FactoryLifecycleEvent(
+        factoryProfileId=p.id, siteId=p.siteId, fromStage=p.lifecycleStage, toStage=p.lifecycleStage,
+        action="REJECT", performedBy=user.id, performedByRole=getattr(user, "role", None),
+        comment=f"Profile change request v{cr.version} rejected at {cr.rejectedAtStep}: {body.reason}",
+        createdBy=user.id,
+    ))
+    await db.commit()
+    await db.refresh(p)
+    return await _profile_detail(db, p)
+
+
+@router.post("/change-requests/{request_id}/withdraw", response_model=S.FactoryProfileDetail)
+async def withdraw_change_request(request_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """The requester (or anyone who may edit the profile) pulls a request back
+    before it is decided — e.g. to correct it and resubmit."""
+    cr = await _open_cr_or_404(db, request_id)
+    if cr.status not in svc_ext.CR_OPEN_STATUSES:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Change request is already {cr.status}.")
+    p = await db.get(FactoryProfile, cr.factoryProfileId)
+    if not p or p.isDeleted:
+        raise HTTPException(404, "Factory profile not found")
+    await _require(db, user, "FACILITY.UPDATE", plant_id=cr.siteId)
+    cr.status = svc_ext.CR_WITHDRAWN
+    cr.updatedBy = user.id
     await db.commit()
     await db.refresh(p)
     return await _profile_detail(db, p)
@@ -436,9 +731,10 @@ async def delete_profile(profile_id: str, user: User = Depends(get_current_user)
     # Cascade the soft-delete to children (the DB FK cascade only fires on a
     # HARD delete, so a soft-deleted profile would otherwise leave active orphans).
     for model in (
-        Building, WorkforceComposition, ProductionProcess, FactoryCertification, FactoryContact,
-        SocialComplianceProfile, FactoryEquipment, FactoryEquipmentInspection, HazardousMaterial,
-        RegulatoryRegistration, FactoryLifecycleEvent,
+        Building, BuildingFloor, BuildingFloorActivity, WorkforceComposition, ProductionProcess,
+        FactoryCertification, FactoryContact, SocialComplianceProfile, FactoryEquipment,
+        FactoryEquipmentInspection, HazardousMaterial, RegulatoryRegistration,
+        FactoryLifecycleEvent, FactoryProfileChangeRequest,
     ):
         await db.execute(
             update(model)
@@ -464,7 +760,8 @@ async def list_buildings(profile_id: str, user: User = Depends(get_current_user)
             .order_by(Building.buildingName.asc())
         )
     ).scalars().all()
-    return [S.BuildingOut.model_validate(b) for b in rows]
+    floors_by_building = await _floors_by_building(db, profile_id)
+    return [_building_out(b, floors_by_building) for b in rows]
 
 
 @router.post("/profiles/{profile_id}/buildings", response_model=S.BuildingOut, status_code=201)
@@ -481,10 +778,11 @@ async def create_building(profile_id: str, body: S.BuildingCreate, user: User = 
     )
     db.add(b)
     await db.flush()
+    await _seed_floor_register(db, b, user.id)
     await svc.recompute_building_count(db, p.id)
     await db.commit()
     await db.refresh(b)
-    return S.BuildingOut.model_validate(b)
+    return await _building_detail(db, b)
 
 
 @router.patch("/buildings/{building_id}", response_model=S.BuildingOut)
@@ -498,11 +796,13 @@ async def update_building(building_id: str, body: S.BuildingUpdate, user: User =
         setattr(b, k, v)
     b.updatedBy = user.id
     await db.flush()
+    # Raising the floor count opens up the new levels for mapping straight away.
+    await _seed_floor_register(db, b, user.id)
     if p:
         await svc.recompute_building_count(db, p.id)
     await db.commit()
     await db.refresh(b)
-    return S.BuildingOut.model_validate(b)
+    return await _building_detail(db, b)
 
 
 @router.delete("/buildings/{building_id}", status_code=204)
@@ -513,8 +813,248 @@ async def delete_building(building_id: str, user: User = Depends(get_current_use
     await _require(db, user, "FACILITY.UPDATE", plant_id=b.siteId)
     b.isDeleted = True
     b.updatedBy = user.id
+    # Cascade to the floor register + its activity mapping (the DB FK cascade
+    # only fires on a HARD delete, so these would otherwise be live orphans).
+    for model in (BuildingFloor, BuildingFloorActivity):
+        await db.execute(
+            update(model)
+            .where(model.buildingId == b.id)
+            .where(model.isDeleted.is_(False))
+            .values(isDeleted=True, updatedBy=user.id)
+        )
     await db.flush()
     await svc.recompute_building_count(db, b.factoryProfileId)
+    await db.commit()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Floor register + per-floor activity mapping
+# ────────────────────────────────────────────────────────────────────────────
+# `Building.floors` is a count; these are the addressable levels, and each one
+# carries as many activities as it actually hosts — Block A / Floor 1 / Sewing,
+# Floor 2 / Packing, Floor 3 / Canteen, DG yard / 1250 kVA DG set + STP.
+# Every measure has a fixed unit baked into its field name; there is no unit
+# picker anywhere in this register by design.
+# ════════════════════════════════════════════════════════════════════════════
+async def _building_for_write(db: AsyncSession, user: User, building_id: str) -> Building:
+    b = await db.get(Building, building_id)
+    if not b or b.isDeleted:
+        raise HTTPException(404, "Building not found")
+    await _require(db, user, "FACILITY.UPDATE", plant_id=b.siteId)
+    return b
+
+
+async def _floor_for_write(db: AsyncSession, user: User, floor_id: str) -> BuildingFloor:
+    f = await db.get(BuildingFloor, floor_id)
+    if not f or f.isDeleted:
+        raise HTTPException(404, "Floor not found")
+    await _require(db, user, "FACILITY.UPDATE", plant_id=f.siteId)
+    return f
+
+
+async def _floor_out(db: AsyncSession, f: BuildingFloor) -> S.BuildingFloorOut:
+    o = S.BuildingFloorOut.model_validate(f)
+    rows = (
+        await db.execute(
+            select(BuildingFloorActivity)
+            .where(BuildingFloorActivity.floorId == f.id)
+            .where(BuildingFloorActivity.isDeleted.is_(False))
+            .order_by(
+                BuildingFloorActivity.sequenceOrder.asc().nulls_last(),
+                BuildingFloorActivity.activityName.asc(),
+            )
+        )
+    ).scalars().all()
+    o.activities = [S.FloorActivityOut.model_validate(a) for a in rows]
+    return o
+
+
+async def _assert_free_floor_level(db: AsyncSession, building_id: str, level: int, *, exclude_id: str | None = None) -> None:
+    stmt = (
+        select(BuildingFloor.id)
+        .where(BuildingFloor.buildingId == building_id)
+        .where(BuildingFloor.floorLevel == level)
+        .where(BuildingFloor.isDeleted.is_(False))
+    )
+    if exclude_id:
+        stmt = stmt.where(BuildingFloor.id != exclude_id)
+    if (await db.execute(stmt)).scalars().first():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"This building already has a floor at level {level}. "
+            "Edit that floor instead, or give this one a different level.",
+        )
+
+
+@router.get("/buildings/{building_id}/floors", response_model=list[S.BuildingFloorOut])
+async def list_floors(building_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    b = await db.get(Building, building_id)
+    if not b or b.isDeleted:
+        raise HTTPException(404, "Building not found")
+    await _require(db, user, "FACILITY.READ", plant_id=b.siteId)
+    floors = (
+        await db.execute(
+            select(BuildingFloor)
+            .where(BuildingFloor.buildingId == building_id)
+            .where(BuildingFloor.isDeleted.is_(False))
+            .order_by(BuildingFloor.floorLevel.asc())
+        )
+    ).scalars().all()
+    return [await _floor_out(db, f) for f in floors]
+
+
+@router.post("/buildings/{building_id}/floors", response_model=S.BuildingFloorOut, status_code=201)
+async def create_floor(building_id: str, body: S.BuildingFloorCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    b = await _building_for_write(db, user, building_id)
+    await _assert_free_floor_level(db, b.id, body.floorLevel)
+    f = BuildingFloor(
+        factoryProfileId=b.factoryProfileId, buildingId=b.id, siteId=b.siteId,
+        floorLabel=body.floorLabel, floorLevel=body.floorLevel, areaSqm=body.areaSqm,
+        headroomM=body.headroomM, occupancyPersons=body.occupancyPersons, notes=body.notes,
+        isActive=body.isActive, createdBy=user.id,
+    )
+    db.add(f)
+    await db.flush()
+    for idx, a in enumerate(body.activities):
+        db.add(_new_activity(f, a, idx, user.id))
+    # A floor register that outgrows the headline count keeps the count honest —
+    # never shrinks it, since a building may have levels not yet registered.
+    registered = len(await _active_floor_ids(db, b.id))
+    if registered > b.floors:
+        b.floors = registered
+        b.updatedBy = user.id
+    await db.commit()
+    await db.refresh(f)
+    return await _floor_out(db, f)
+
+
+async def _active_floor_ids(db: AsyncSession, building_id: str) -> list[str]:
+    return list(
+        (
+            await db.execute(
+                select(BuildingFloor.id)
+                .where(BuildingFloor.buildingId == building_id)
+                .where(BuildingFloor.isDeleted.is_(False))
+            )
+        ).scalars().all()
+    )
+
+
+def _default_floor_label(level: int) -> str:
+    if level == 0:
+        return "Ground Floor"
+    return f"Basement {-level}" if level < 0 else f"Floor {level}"
+
+
+async def _seed_floor_register(db: AsyncSession, b: Building, user_id: str) -> None:
+    """Give a building the floor rows its `floors` count implies.
+
+    Saying "Block A has 4 floors" should be enough to start mapping what is on
+    each of them — nobody should have to re-enter the same four levels by hand.
+    Additive only: existing levels are left alone and a level is never removed,
+    so lowering the count (or renaming a floor) is safe.
+    """
+    existing = (
+        await db.execute(
+            select(BuildingFloor.floorLevel)
+            .where(BuildingFloor.buildingId == b.id)
+            .where(BuildingFloor.isDeleted.is_(False))
+        )
+    ).scalars().all()
+    have = set(existing)
+    for level in range(max(b.floors, 1)):
+        if level in have:
+            continue
+        db.add(BuildingFloor(
+            factoryProfileId=b.factoryProfileId, buildingId=b.id, siteId=b.siteId,
+            floorLabel=_default_floor_label(level), floorLevel=level, createdBy=user_id,
+        ))
+
+
+def _new_activity(f: BuildingFloor, a: S.FloorActivityCreate, idx: int, user_id: str) -> BuildingFloorActivity:
+    return BuildingFloorActivity(
+        factoryProfileId=f.factoryProfileId, buildingId=f.buildingId, floorId=f.id, siteId=f.siteId,
+        activityType=a.activityType, activityName=a.activityName, processId=a.processId,
+        description=a.description,
+        sequenceOrder=a.sequenceOrder if a.sequenceOrder is not None else idx + 1,
+        areaSqm=a.areaSqm, headcount=a.headcount,
+        productionCapacityPcsPerDay=a.productionCapacityPcsPerDay,
+        fabricConsumptionMPerDay=a.fabricConsumptionMPerDay,
+        powerRatingKva=a.powerRatingKva, waterCapacityKld=a.waterCapacityKld,
+        wasteGeneratedKgPerDay=a.wasteGeneratedKgPerDay,
+        keyHazards=a.keyHazards, isActive=a.isActive, createdBy=user_id,
+    )
+
+
+@router.patch("/floors/{floor_id}", response_model=S.BuildingFloorOut)
+async def update_floor(floor_id: str, body: S.BuildingFloorUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    f = await _floor_for_write(db, user, floor_id)
+    data = body.model_dump(exclude_unset=True)
+    if "floorLevel" in data and data["floorLevel"] is not None and data["floorLevel"] != f.floorLevel:
+        await _assert_free_floor_level(db, f.buildingId, data["floorLevel"], exclude_id=f.id)
+    for k, v in data.items():
+        setattr(f, k, v)
+    f.updatedBy = user.id
+    await db.commit()
+    await db.refresh(f)
+    return await _floor_out(db, f)
+
+
+@router.delete("/floors/{floor_id}", status_code=204)
+async def delete_floor(floor_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    f = await _floor_for_write(db, user, floor_id)
+    f.isDeleted = True
+    f.updatedBy = user.id
+    await db.execute(
+        update(BuildingFloorActivity)
+        .where(BuildingFloorActivity.floorId == f.id)
+        .where(BuildingFloorActivity.isDeleted.is_(False))
+        .values(isDeleted=True, updatedBy=user.id)
+    )
+    await db.commit()
+
+
+@router.post("/floors/{floor_id}/activities", response_model=S.FloorActivityOut, status_code=201)
+async def create_floor_activity(floor_id: str, body: S.FloorActivityCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    f = await _floor_for_write(db, user, floor_id)
+    existing = len(
+        (
+            await db.execute(
+                select(BuildingFloorActivity.id)
+                .where(BuildingFloorActivity.floorId == f.id)
+                .where(BuildingFloorActivity.isDeleted.is_(False))
+            )
+        ).scalars().all()
+    )
+    a = _new_activity(f, body, existing, user.id)
+    db.add(a)
+    await db.commit()
+    await db.refresh(a)
+    return S.FloorActivityOut.model_validate(a)
+
+
+@router.patch("/floor-activities/{activity_id}", response_model=S.FloorActivityOut)
+async def update_floor_activity(activity_id: str, body: S.FloorActivityUpdate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    a = await db.get(BuildingFloorActivity, activity_id)
+    if not a or a.isDeleted:
+        raise HTTPException(404, "Floor activity not found")
+    await _require(db, user, "FACILITY.UPDATE", plant_id=a.siteId)
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(a, k, v)
+    a.updatedBy = user.id
+    await db.commit()
+    await db.refresh(a)
+    return S.FloorActivityOut.model_validate(a)
+
+
+@router.delete("/floor-activities/{activity_id}", status_code=204)
+async def delete_floor_activity(activity_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    a = await db.get(BuildingFloorActivity, activity_id)
+    if not a or a.isDeleted:
+        raise HTTPException(404, "Floor activity not found")
+    await _require(db, user, "FACILITY.UPDATE", plant_id=a.siteId)
+    a.isDeleted = True
+    a.updatedBy = user.id
     await db.commit()
 
 

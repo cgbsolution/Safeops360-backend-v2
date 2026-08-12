@@ -11,12 +11,14 @@ degrades to an empty field rather than an error.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.factory import Building, FactoryProfile, WorkforceComposition
+from app.models.plant import Plant
 
 # Re-use the CAMS batch name helper — same DB, same Plant table.
 from app.services.cams import plant_name_map  # noqa: F401  (re-exported for the router)
@@ -26,6 +28,68 @@ from app.services.cams import plant_name_map  # noqa: F401  (re-exported for the
 async def next_factory_code(db: AsyncSession) -> str:
     n = (await db.execute(select(func.count()).select_from(FactoryProfile))).scalar() or 0
     return f"FAC-{(n + 1):04d}"
+
+
+# ── Site (Plant) auto-provisioning for in-house factories ───────────────────
+def _slug_code(source: str) -> str:
+    """A Plant.code-safe token from a factory code/name (A-Z0-9 and dashes)."""
+    token = re.sub(r"[^A-Za-z0-9]+", "-", source).strip("-").upper()
+    return (token or "SITE")[:20]
+
+
+async def _unique_plant_code(db: AsyncSession, base: str) -> str:
+    """`base`, or base-2, base-3 … — Plant.code is unique."""
+    code = base
+    for n in range(2, 100):
+        exists = (await db.execute(select(Plant.id).where(Plant.code == code))).scalars().first()
+        if not exists:
+            return code
+        code = f"{base[:17]}-{n}"
+    raise ValueError(f"Could not derive a free Plant code from '{base}'")
+
+
+async def ensure_site_for_profile(
+    db: AsyncSession,
+    *,
+    site_id: str | None,
+    factory_name: str,
+    factory_code: str,
+    city: str,
+    state: str,
+    primary_industry: str,
+) -> str:
+    """Resolve the Site (Plant) a new factory profile links to.
+
+    A supplier factory is mapped onto a Site that already exists — pass its id
+    and it is validated and returned. A Page-owned in-house factory usually has
+    no separate Site concept in the operator's head, so `site_id=None` means
+    "this factory IS the site": a Plant row is provisioned from the factory's
+    own identity and its id returned.
+
+    The 1:1 FactoryProfile↔Plant invariant is therefore never relaxed — only the
+    data-entry burden is. Everything downstream (RBAC plant scoping, the
+    building/workforce/certification registers, the live compliance rollups)
+    keeps working unchanged because it all keys off a real siteId.
+    """
+    if site_id:
+        plant = await db.get(Plant, site_id)
+        if plant is None:
+            raise ValueError("The selected Site no longer exists.")
+        return plant.id
+
+    code = await _unique_plant_code(db, _slug_code(factory_code or factory_name))
+    plant = Plant(
+        code=code,
+        name=factory_name,
+        location=city or "—",
+        state=state or "—",
+        # Plant.unitType is a free-text descriptor elsewhere in the platform;
+        # the factory's own industry is the most honest value available here.
+        unitType=primary_industry or "Factory",
+    )
+    db.add(plant)
+    await db.flush()  # assign plant.id
+    return plant.id
 
 
 # ── buildingCount sync ───────────────────────────────────────────────────────

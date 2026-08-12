@@ -20,8 +20,33 @@ HazmatClassLit = Literal["LOW", "MEDIUM", "HIGH"]
 GhsSignalLit = Literal["DANGER", "WARNING", "NONE"]
 RegClassificationLit = Literal["SCHEDULED_SUBSTANCE", "HIGH_HAZARD", "NOTIFIED", "OTHER"]
 PcbStatusLit = Literal["REGISTERED", "PENDING", "NOT_REGISTERED"]
+# Statutory licences / consents a factory must hold. Extended beyond the
+# original eight so the register can hold the certificates an Indian garment
+# unit is actually asked for at audit — the structural stability certificate,
+# the fire NOC / compliance certificate (separate from the fire *licence*), the
+# SPCB (e.g. KSPCB) consents to establish and to operate, and the lift, PESO,
+# trade and CLRA licences. `OTHER` remains the escape hatch, but a typed value
+# is what makes a licence reportable and renewal-alertable.
 RegistrationTypeLit = Literal[
-    "FACTORY_ACT", "ESI", "PF", "GST", "FIRE_LICENSE", "PCB", "BOILER", "BUILDING_CERT", "OTHER"
+    "FACTORY_ACT",
+    "ESI",
+    "PF",
+    "GST",
+    "FIRE_LICENSE",
+    "FIRE_NOC",
+    "STABILITY_CERT",
+    "PCB",
+    "PCB_CONSENT_ESTABLISH",
+    "PCB_CONSENT_OPERATE",
+    "HAZWASTE_AUTHORISATION",
+    "BOILER",
+    "PESO_LICENSE",
+    "LIFT_LICENSE",
+    "ELECTRICAL_SAFETY",
+    "TRADE_LICENSE",
+    "CLRA_LICENSE",
+    "BUILDING_CERT",
+    "OTHER",
 ]
 RenewalFrequencyLit = Literal["ANNUAL", "BIENNIAL", "TRIENNIAL", "ONEOFF", "ONGOING"]
 RegStatusLit = Literal["VALID", "EXPIRING_SOON", "EXPIRED", "PENDING_RENEWAL", "SUSPENDED"]
@@ -436,3 +461,60 @@ class LifecycleStatusOut(BaseModel):
     allowedNextStages: list[str] = []
     canRequestRevisions: bool = False
     events: list[LifecycleEventOut] = []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Profile change requests (governed edit + version history)
+# ════════════════════════════════════════════════════════════════════════════
+ChangeRequestStatusLit = Literal[
+    "PENDING_UNIT", "PENDING_COMPLIANCE", "APPLIED", "REJECTED", "WITHDRAWN"
+]
+
+
+class FieldChange(BaseModel):
+    field: str
+    label: str
+    # Rendered values — the diff is for humans reading an audit trail, so both
+    # sides are stringified at submit time rather than kept as mixed JSON types.
+    from_: str | None = Field(None, alias="from")
+    to: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ChangeRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    factoryProfileId: str
+    siteId: str
+    version: int
+    changes: list[dict[str, Any]] = []
+    reason: str | None = None
+    status: str
+    requestedBy: str | None = None
+    requestedByName: str | None = None  # enriched in the router
+    requestedByRole: str | None = None
+    requestedAt: datetime | None = None
+    unitApprovedBy: str | None = None
+    unitApprovedByName: str | None = None
+    unitApprovedAt: datetime | None = None
+    unitApprovalComment: str | None = None
+    complianceApprovedBy: str | None = None
+    complianceApprovedByName: str | None = None
+    complianceApprovedAt: datetime | None = None
+    complianceApprovalComment: str | None = None
+    rejectedBy: str | None = None
+    rejectedByName: str | None = None
+    rejectedAt: datetime | None = None
+    rejectedAtStep: str | None = None
+    rejectionReason: str | None = None
+    appliedAt: datetime | None = None
+    autoApplied: bool = False
+
+
+class ChangeRequestDecision(BaseModel):
+    comment: str | None = None
+
+
+class ChangeRequestRejection(BaseModel):
+    reason: str = Field(min_length=1)

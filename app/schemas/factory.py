@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # Extension-layer Out schemas embedded in FactoryProfileDetail (one-way import —
 # factory_ext does not import this module, so there is no cycle).
 from app.schemas.factory_ext import (
+    ChangeRequestOut as FxChangeRequestOut,
     EquipmentOut as FxEquipmentOut,
     HazmatOut as FxHazmatOut,
     LifecycleEventOut as FxLifecycleEventOut,
@@ -76,6 +77,113 @@ class BuildingUpdate(BaseModel):
     isActive: bool | None = None
 
 
+# ── Floor register + per-floor activity mapping ─────────────────────────────
+# Every measurement below carries ONE fixed unit, encoded in the field name:
+# area m², height m, production pcs/day, fabric m/day, power kVA, water KL/day
+# (KLD), waste kg/day. Units are standardised references — deliberately not a
+# per-row dropdown, so estate-wide reporting and benchmarking stay comparable.
+ActivityTypeLit = Literal[
+    "PROCESS", "UTILITY", "WELFARE", "STORAGE", "ADMIN", "EFFLUENT", "POWER", "OTHER"
+]
+
+
+class FloorActivityCreate(BaseModel):
+    activityType: ActivityTypeLit = "PROCESS"
+    activityName: str = Field(min_length=1)
+    processId: str | None = None  # loose link to ProductionProcess.id
+    description: str | None = None
+    sequenceOrder: int | None = None
+    areaSqm: float | None = Field(None, ge=0)
+    headcount: int | None = Field(None, ge=0)
+    productionCapacityPcsPerDay: float | None = Field(None, ge=0)
+    fabricConsumptionMPerDay: float | None = Field(None, ge=0)
+    powerRatingKva: float | None = Field(None, ge=0)
+    waterCapacityKld: float | None = Field(None, ge=0)
+    wasteGeneratedKgPerDay: float | None = Field(None, ge=0)
+    keyHazards: list[str] = []
+    isActive: bool = True
+
+
+class FloorActivityUpdate(BaseModel):
+    activityType: ActivityTypeLit | None = None
+    activityName: str | None = None
+    processId: str | None = None
+    description: str | None = None
+    sequenceOrder: int | None = None
+    areaSqm: float | None = None
+    headcount: int | None = None
+    productionCapacityPcsPerDay: float | None = None
+    fabricConsumptionMPerDay: float | None = None
+    powerRatingKva: float | None = None
+    waterCapacityKld: float | None = None
+    wasteGeneratedKgPerDay: float | None = None
+    keyHazards: list[str] | None = None
+    isActive: bool | None = None
+
+
+class FloorActivityOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    factoryProfileId: str
+    buildingId: str
+    floorId: str
+    siteId: str
+    activityType: str
+    activityName: str
+    processId: str | None = None
+    description: str | None = None
+    sequenceOrder: int | None = None
+    areaSqm: float | None = None
+    headcount: int | None = None
+    productionCapacityPcsPerDay: float | None = None
+    fabricConsumptionMPerDay: float | None = None
+    powerRatingKva: float | None = None
+    waterCapacityKld: float | None = None
+    wasteGeneratedKgPerDay: float | None = None
+    keyHazards: list[str] = []
+    isActive: bool
+    updatedAt: datetime | None = None
+
+
+class BuildingFloorCreate(BaseModel):
+    floorLabel: str = Field(min_length=1)
+    floorLevel: int = 0  # -1 basement | 0 ground | 1, 2, 3 …
+    areaSqm: float | None = Field(None, ge=0)          # m²
+    headroomM: float | None = Field(None, ge=0)        # m
+    occupancyPersons: int | None = Field(None, ge=0)   # persons
+    notes: str | None = None
+    isActive: bool = True
+    # Quick-add activities alongside the floor (same shape as the tab's editor).
+    activities: list[FloorActivityCreate] = []
+
+
+class BuildingFloorUpdate(BaseModel):
+    floorLabel: str | None = None
+    floorLevel: int | None = None
+    areaSqm: float | None = None
+    headroomM: float | None = None
+    occupancyPersons: int | None = None
+    notes: str | None = None
+    isActive: bool | None = None
+
+
+class BuildingFloorOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    factoryProfileId: str
+    buildingId: str
+    siteId: str
+    floorLabel: str
+    floorLevel: int
+    areaSqm: float | None = None
+    headroomM: float | None = None
+    occupancyPersons: int | None = None
+    notes: str | None = None
+    isActive: bool
+    activities: list[FloorActivityOut] = []
+    updatedAt: datetime | None = None
+
+
 class BuildingOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -92,6 +200,9 @@ class BuildingOut(BaseModel):
     emergencyExits: int | None = None
     occupancyCertificateNo: str | None = None
     isActive: bool
+    # Floor register with its mapped activities (attached in the router — never
+    # lazy-loaded, which would fire outside the async greenlet).
+    floorRegister: list[BuildingFloorOut] = []
     updatedAt: datetime | None = None
 
 
@@ -423,7 +534,13 @@ class ComplianceTabResponse(BaseModel):
 # Factory Profile
 # ════════════════════════════════════════════════════════════════════════════
 class FactoryProfileCreate(BaseModel):
-    siteId: str  # Plant.id — mandatory 1:1 link
+    # Plant.id — the 1:1 Site link. OPTIONAL on the way in: mapping a supplier
+    # factory onto an existing Site is meaningful, but for a Page-owned in-house
+    # unit it is bookkeeping the operator shouldn't have to do. Omit it and the
+    # create endpoint provisions the Site from this factory's own name / code /
+    # location, so the internal 1:1 invariant (and every plant-scoped
+    # permission, register and rollup that depends on it) still holds.
+    siteId: str | None = None
     factoryName: str = Field(min_length=2)
     factoryCode: str | None = None  # auto-generated when omitted
     status: FactoryStatusLit = "OPERATIONAL"
@@ -531,6 +648,15 @@ class FactoryProfileDetail(FactoryProfileOut):
     hazardousMaterials: list[FxHazmatOut] = []
     regulatoryRegistrations: list[FxRegulatoryOut] = []
     lifecycleEvents: list[FxLifecycleEventOut] = []
+    # Governed-edit trail. `pendingChangeRequest` is the single in-flight request
+    # (a profile can only have one at a time); `changeRequests` is the full
+    # version history, newest first.
+    pendingChangeRequest: FxChangeRequestOut | None = None
+    changeRequests: list[FxChangeRequestOut] = []
+    # True when this profile's master data is governed — i.e. an edit becomes a
+    # change request needing Plant Head then Lead Auditor approval rather than
+    # being written straight through.
+    editRequiresApproval: bool = False
 
 
 class FactoryProfileListResponse(BaseModel):

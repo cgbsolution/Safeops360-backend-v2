@@ -21,6 +21,8 @@ from app.models.audit_compliance import (
 )
 from app.models.cams import CamsFinding
 from app.models.chemical import ChemicalDisposalRecord, ChemicalMaster
+from app.models.factory import FactoryCertification, FactoryProfile
+from app.models.factory_ext import RegulatoryRegistration
 from app.models.programme import ProgrammeCycle
 
 
@@ -127,6 +129,52 @@ REGISTRY: dict[str, EntitySpec] = {
         read_perm="INCIDENT.READ",
         write_perm="INCIDENT.UPDATE",
         categories=frozenset({"DISPOSAL_MANIFEST", "CERTIFICATE", "CORRESPONDENCE", "OTHER"}),
+    ),
+    # ── Facilities: statutory licences, certifications and profile documents ─
+    #
+    # The Factory Licences register (RegulatoryRegistration) held dates and a
+    # dormant `documentationIds` JSON column but no way to attach the licence
+    # itself, so the statutory approvals a factory is asked for at audit — the
+    # factory licence, fire NOC, structural stability certificate, the SPCB
+    # (e.g. KSPCB) consents — lived in somebody's shared drive. Registering here
+    # gives each licence row the same versioned, permissioned, soft-deletable
+    # document store every other module already uses: a centralised repository
+    # of statutory approvals that survives a renewal (re-upload against the same
+    # `slotKey` supersedes rather than overwrites).
+    "factory_registration": EntitySpec(
+        label="Factory licence / registration",
+        model=RegulatoryRegistration,
+        plant_attr="siteId",
+        read_perm="FACILITY.READ",
+        write_perm="FACILITY.UPDATE",
+        categories=frozenset(
+            {"LICENSE", "CERTIFICATE", "CONSENT", "RENEWAL_APPLICATION",
+             "INSPECTION_REPORT", "CORRESPONDENCE", "OTHER"}
+        ),
+    ),
+    # Buyer / social-compliance certificates (SA8000, WRAP, ISO, SMETA …) —
+    # `FactoryCertification.attachmentIds` was the same dormant hook.
+    "factory_certification": EntitySpec(
+        label="Factory certification",
+        model=FactoryCertification,
+        plant_attr="siteId",
+        read_perm="FACILITY.READ",
+        write_perm="FACILITY.CERT_MANAGE",
+        categories=frozenset({"CERTIFICATE", "AUDIT_REPORT", "SCOPE_DOCUMENT", "CORRESPONDENCE", "OTHER"}),
+    ),
+    # Profile-level documents that belong to the factory rather than to any one
+    # licence: the site layout / plot plan, the occupancy certificate, land
+    # records, the signed profile itself.
+    "factory_profile": EntitySpec(
+        label="Factory profile",
+        model=FactoryProfile,
+        plant_attr="siteId",
+        read_perm="FACILITY.READ",
+        write_perm="FACILITY.UPDATE",
+        categories=frozenset(
+            {"SITE_LAYOUT", "OCCUPANCY_CERTIFICATE", "LAND_RECORD", "LICENSE",
+             "CERTIFICATE", "REPORT", "OTHER"}
+        ),
     ),
     # ── Follow-ups (spec §5.3 #2-4) — each is a single line once wired: ──────
     #   "eai_entry":        EAI SDS sheets      → read EAI.READ  / write EAI.UPDATE

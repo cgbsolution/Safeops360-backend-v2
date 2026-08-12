@@ -16,10 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.factory_ext import (
     FactoryEquipment,
     FactoryLifecycleEvent,
+    FactoryProfileChangeRequest,
     HazardousMaterial,
     RegulatoryRegistration,
 )
 from app.schemas import factory_ext as Sx
+from app.services.cams import user_name_map
 
 # Days-before-due that flips a computed status to the "soon" band.
 SHELF_LIFE_LEAD_DAYS = 30
@@ -297,6 +299,189 @@ def validate_regulatory(data: dict) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Profile change requests (governed edit → Plant Head → Lead Auditor)
+# ════════════════════════════════════════════════════════════════════════════
+# Editable master-data fields, with the label the audit trail shows. Anything
+# not listed here is either immutable (siteId, factoryCode) or lives in its own
+# governed sub-register (buildings, workforce, certifications …).
+PROFILE_FIELD_LABELS: dict[str, str] = {
+    "factoryName": "Factory name",
+    "status": "Operational status",
+    "ownershipType": "Ownership",
+    "primaryIndustry": "Primary industry",
+    "addressLine": "Address",
+    "city": "City",
+    "state": "State",
+    "pincode": "Pincode",
+    "latitude": "Latitude",
+    "longitude": "Longitude",
+    "establishedYear": "Established year",
+    "factoryLicenseNo": "Factory licence no.",
+    "factoryLicenseValidUntil": "Licence valid until",
+    "registrationNos": "Registrations",
+    "applicableActs": "Applicable acts",
+    "pollutionControlBoard": "Pollution Control Board",
+    "totalLandAreaSqm": "Total land area (m²)",
+    "builtUpAreaSqm": "Built-up area (m²)",
+    "buildingCount": "Building count",
+    "profileStatus": "Profile status",
+}
+
+# A profile's master data becomes governed once it has been signed off — i.e.
+# reached the terminal ACTIVE lifecycle stage. Before that the factory is still
+# being drafted and edits are written straight through (with history).
+GOVERNED_STAGES = frozenset({"ACTIVE"})
+
+# status → the permission that may act on it, and where it goes next.
+CR_PENDING_UNIT = "PENDING_UNIT"
+CR_PENDING_COMPLIANCE = "PENDING_COMPLIANCE"
+CR_APPLIED = "APPLIED"
+CR_REJECTED = "REJECTED"
+CR_WITHDRAWN = "WITHDRAWN"
+
+CR_OPEN_STATUSES = (CR_PENDING_UNIT, CR_PENDING_COMPLIANCE)
+
+# Who signs off at each step. Two sequential approvals: the Unit signs off that
+# the change is factually right, Compliance signs off that it is admissible.
+CR_STEP_PERMISSION: dict[str, str] = {
+    CR_PENDING_UNIT: "FACILITY.PROFILE_APPROVE_UNIT",
+    CR_PENDING_COMPLIANCE: "FACILITY.PROFILE_APPROVE_COMPLIANCE",
+}
+CR_STEP_ROLE_LABEL: dict[str, str] = {
+    CR_PENDING_UNIT: "Plant Head (Unit)",
+    CR_PENDING_COMPLIANCE: "Compliance Team — Lead Auditor",
+}
+
+
+def profile_edit_is_governed(stage: str | None) -> bool:
+    return (stage or "") in GOVERNED_STAGES
+
+
+def _render(value) -> str | None:
+    """Stringify a field value for the human-readable diff."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _aware(value).date().isoformat()
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(" ".join(str(v) for v in item.values() if v not in (None, "")))
+            else:
+                parts.append(str(item))
+        return ", ".join(p for p in parts if p) or "—"
+    return str(value)
+
+
+def _comparable(value):
+    """Normalise for equality so a Pydantic model and a stored dict compare equal."""
+    if isinstance(value, (list, tuple)):
+        return [_comparable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _comparable(v) for k, v in sorted(value.items())}
+    if hasattr(value, "model_dump"):
+        return _comparable(value.model_dump())
+    if isinstance(value, datetime):
+        return _aware(value)
+    return value
+
+
+def build_profile_diff(profile, data: dict) -> list[dict]:
+    """The [{field, label, from, to}] diff between a profile and a proposed
+    update payload. Unchanged fields are dropped, so an empty result means the
+    submit was a no-op and the caller should not open a change request."""
+    diff: list[dict] = []
+    for field, new_value in data.items():
+        if field not in PROFILE_FIELD_LABELS:
+            continue
+        old_value = getattr(profile, field, None)
+        if _comparable(old_value) == _comparable(new_value):
+            continue
+        diff.append(
+            {
+                "field": field,
+                "label": PROFILE_FIELD_LABELS[field],
+                "from": _render(old_value),
+                "to": _render(new_value),
+                # The raw value the approval actually applies. Kept alongside the
+                # rendered strings so applying a request never re-parses display
+                # text (dates especially would not survive the round trip).
+                "value": _jsonable(new_value),
+            }
+        )
+    return diff
+
+
+def _jsonable(value):
+    """Value coerced into something the JSON column can hold verbatim."""
+    if isinstance(value, datetime):
+        return _aware(value).isoformat()
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
+
+
+def apply_change_request(profile, cr: FactoryProfileChangeRequest) -> None:
+    """Write an approved request's values onto the profile. Datetime fields are
+    revived from their ISO form; everything else is stored as-is."""
+    datetime_fields = {"factoryLicenseValidUntil"}
+    for change in cr.changes or []:
+        field = change.get("field")
+        if field not in PROFILE_FIELD_LABELS:
+            continue
+        value = change.get("value")
+        if field in datetime_fields and isinstance(value, str) and value:
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError:
+                continue
+        setattr(profile, field, value)
+
+
+async def next_change_request_version(db: AsyncSession, profile_id: str) -> int:
+    from sqlalchemy import func as _func
+
+    current = (
+        await db.execute(
+            select(_func.max(FactoryProfileChangeRequest.version)).where(
+                FactoryProfileChangeRequest.factoryProfileId == profile_id
+            )
+        )
+    ).scalar()
+    return int(current or 0) + 1
+
+
+async def open_change_request(db: AsyncSession, profile_id: str) -> FactoryProfileChangeRequest | None:
+    """The single in-flight request for a profile, if any."""
+    return (
+        await db.execute(
+            select(FactoryProfileChangeRequest)
+            .where(FactoryProfileChangeRequest.factoryProfileId == profile_id)
+            .where(FactoryProfileChangeRequest.status.in_(CR_OPEN_STATUSES))
+            .where(FactoryProfileChangeRequest.isDeleted.is_(False))
+            .order_by(FactoryProfileChangeRequest.version.desc())
+        )
+    ).scalars().first()
+
+
+def change_request_out(cr: FactoryProfileChangeRequest, names: dict[str, str] | None = None) -> Sx.ChangeRequestOut:
+    o = Sx.ChangeRequestOut.model_validate(cr)
+    names = names or {}
+    o.requestedByName = names.get(cr.requestedBy or "")
+    o.unitApprovedByName = names.get(cr.unitApprovedBy or "")
+    o.complianceApprovedByName = names.get(cr.complianceApprovedBy or "")
+    o.rejectedByName = names.get(cr.rejectedBy or "")
+    return o
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Lifecycle transition rules
 # ════════════════════════════════════════════════════════════════════════════
 # Forward transitions only (the revision loop-back VALIDATION→EXECUTION is its
@@ -379,9 +564,32 @@ async def load_profile_extras(db: AsyncSession, profile_id: str) -> dict:
             .order_by(FactoryLifecycleEvent.createdAt.desc())
         )
     ).scalars().all()
+    # Governed-edit trail: newest first, and the one open request (if any)
+    # surfaced separately so the detail page can show its approval banner
+    # without the client having to re-derive "which of these is in flight".
+    change_rows = (
+        await db.execute(
+            select(FactoryProfileChangeRequest)
+            .where(FactoryProfileChangeRequest.factoryProfileId == profile_id)
+            .where(FactoryProfileChangeRequest.isDeleted.is_(False))
+            .order_by(FactoryProfileChangeRequest.version.desc())
+        )
+    ).scalars().all()
+    names = await user_name_map(
+        db,
+        [
+            uid
+            for cr in change_rows
+            for uid in (cr.requestedBy, cr.unitApprovedBy, cr.complianceApprovedBy, cr.rejectedBy)
+        ],
+    )
+    change_requests = [change_request_out(cr, names) for cr in change_rows]
+    pending = next((c for c in change_requests if c.status in CR_OPEN_STATUSES), None)
     return {
         "equipment": [equipment_out(e) for e in equipment],
         "hazardousMaterials": [hazmat_out(h) for h in hazmat],
         "regulatoryRegistrations": [regulatory_out(r) for r in regs],
         "lifecycleEvents": [lifecycle_event_out(ev) for ev in events],
+        "changeRequests": change_requests,
+        "pendingChangeRequest": pending,
     }

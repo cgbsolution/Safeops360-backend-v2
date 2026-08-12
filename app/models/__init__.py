@@ -159,6 +159,8 @@ from app.models.erm_attachments import ControlAttachment, RiskAttachment
 from app.models.notification import Notification
 from app.models.factory import (
     Building,
+    BuildingFloor,
+    BuildingFloorActivity,
     FactoryCertification,
     FactoryComplianceSnapshot,
     FactoryContact,
@@ -172,6 +174,7 @@ from app.models.factory_ext import (
     FactoryEquipment,
     FactoryEquipmentInspection,
     FactoryLifecycleEvent,
+    FactoryProfileChangeRequest,
     HazardousMaterial,
     RegulatoryRegistration,
 )
@@ -423,7 +426,10 @@ __all__ = [
     "CamsTemplateSection",
     "Equipment",
     "Building",
+    "BuildingFloor",
+    "BuildingFloorActivity",
     "FactoryProfile",
+    "FactoryProfileChangeRequest",
     "FactoryCertification",
     "FactoryComplianceSnapshot",
     "FactoryContact",
