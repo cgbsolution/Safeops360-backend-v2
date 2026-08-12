@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
@@ -98,6 +99,13 @@ def _social_out(s: SocialComplianceProfile) -> S.SocialComplianceProfileOut:
 
 
 def _building_out(b: Building, floors_by_building: dict[str, list[S.BuildingFloorOut]]) -> S.BuildingOut:
+    # `BuildingOut.floorRegister` is a declared field, so Pydantic's
+    # from_attributes reads `b.floorRegister` — an unloaded lazy relationship,
+    # which emits IO outside the async greenlet (MissingGreenlet → 500).
+    # Assigning after model_validate() is too late; the attribute must already
+    # be resolved when validation runs. set_committed_value() marks it loaded
+    # without any IO, then the real register (queried in one batch) is attached.
+    set_committed_value(b, "floorRegister", [])
     o = S.BuildingOut.model_validate(b)
     o.floorRegister = floors_by_building.get(b.id, [])
     return o
@@ -150,6 +158,10 @@ async def _floors_by_building(db: AsyncSession, profile_id: str) -> dict[str, li
 
     out: dict[str, list[S.BuildingFloorOut]] = {}
     for f in floors:
+        # Same lazy-relationship trap as _building_out(): `activities` is a
+        # declared field, so validation touches f.activities before the line
+        # below can set it. Mark it loaded (no IO) first.
+        set_committed_value(f, "activities", [])
         floor_out = S.BuildingFloorOut.model_validate(f)
         floor_out.activities = acts_by_floor.get(f.id, [])
         out.setdefault(f.buildingId, []).append(floor_out)
@@ -853,6 +865,9 @@ async def _floor_for_write(db: AsyncSession, user: User, floor_id: str) -> Build
 
 
 async def _floor_out(db: AsyncSession, f: BuildingFloor) -> S.BuildingFloorOut:
+    # See _building_out(): validating the ORM row would lazy-load `activities`
+    # outside the greenlet. Mark it loaded first; the real rows are attached below.
+    set_committed_value(f, "activities", [])
     o = S.BuildingFloorOut.model_validate(f)
     rows = (
         await db.execute(

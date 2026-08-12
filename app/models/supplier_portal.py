@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
@@ -65,6 +66,21 @@ class SupplierPortalToken(Base, IdMixin):
 
     supplierContactEmail: Mapped[str] = mapped_column(String, nullable=False)
     supplierContactName: Mapped[str | None] = mapped_column(String)
+
+    # SUPPLIER_MANAGER | CO_AUDITOR | AUDITEE — what this holder may do.
+    #
+    # A supplier audit has several external parties and they are not
+    # interchangeable: the supplier manager answers for the factory, an external
+    # co-auditor CONDUCTS part of the audit, an auditee responds to findings
+    # against their area. One token per audit could not express that.
+    #
+    # Plain text, not a Postgres enum, matching `engagementKind` above: a role
+    # list that needs DDL to grow is a role list that gets worked around.
+    role: Mapped[str] = mapped_column(String, nullable=False, default="SUPPLIER_MANAGER")
+
+    # Disciplines an external CO_AUDITOR is scoped to. Empty = every discipline
+    # in the audit's scope, the same convention `selectedDisciplineIds` uses.
+    disciplineCodes: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
     expiresAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     createdAt: Mapped[datetime] = mapped_column(

@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -137,6 +137,20 @@ class CoAuditorAssignment(BaseModel):
     disciplineIds: list[str] = []
 
 
+class ExternalParty(BaseModel):
+    """An external participant on a SUPPLIER audit, identified by email.
+
+    They hold no platform seat, so there is no userId to validate against
+    `assert_assignable` — the address IS the identity, and it is what the access
+    link is issued to. Disciplines scope a co-auditor to the part of the audit
+    they were brought in to conduct.
+    """
+
+    email: EmailStr
+    name: str | None = None
+    disciplineIds: list[str] = []
+
+
 class CreateAuditBody(BaseModel):
     plantId: str
     title: str = Field(min_length=4)
@@ -167,6 +181,12 @@ class CreateAuditBody(BaseModel):
     coAuditors: list[CoAuditorAssignment | str] = []
     auditees: list[AuditeeAssignment] = []
     plantManagerUserId: str | None = None
+    # ── External parties (supplier audits only) ────────────────────────────
+    # A supplier audit's counterparts have no accounts: the supplier manager
+    # stands in for our plant manager, and external co-auditors and auditees
+    # work from an emailed link. Each gets its own credential.
+    externalCoAuditors: list[ExternalParty] = []
+    externalAuditees: list[ExternalParty] = []
     openingRemarks: str = ""
 
 
@@ -938,8 +958,18 @@ async def create_audit(
         audit = await svc.create_audit(db, user=user, data=data)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+    # Read BEFORE refresh: the links hang off the in-memory instance and are not
+    # a column, so `db.refresh` would discard them.
+    links = getattr(audit, "_issuedPortalLinks", []) or []
     await db.refresh(audit)
-    return {"id": audit.id, "auditNumber": audit.auditNumber, "totalCheckpoints": audit.totalCheckpoints}
+    return {
+        "id": audit.id,
+        "auditNumber": audit.auditNumber,
+        "totalCheckpoints": audit.totalCheckpoints,
+        # Returned ONCE. Only a hash of each token is stored, so this response is
+        # the only place the usable links exist — dropping it means re-issuing.
+        "portalLinks": links,
+    }
 
 
 @router.post("/{audit_id}/disciplines")

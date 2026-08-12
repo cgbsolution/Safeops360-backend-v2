@@ -4,6 +4,8 @@
     "category_name": "Compliance with Laws and Workplace Regulations",
     "category_color": "#7C3AED",
     "category_icon": "scale",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-LAWS-001",
@@ -147,6 +149,8 @@
     "category_name": "Hours of work",
     "category_color": "#0EA5E9",
     "category_icon": "clock",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-HOURS-001",
@@ -173,6 +177,8 @@
     "category_name": "Compensation and Benefits",
     "category_color": "#16A34A",
     "category_icon": "wallet",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-WAGES-001",
@@ -253,6 +259,8 @@
     "category_name": "Health and Safety",
     "category_color": "#DC2626",
     "category_icon": "shield",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-HS-001",
@@ -378,6 +386,8 @@
     "category_name": "Freedom of association and collective bargaining",
     "category_color": "#EA580C",
     "category_icon": "users",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-FOA-001",
@@ -395,6 +405,8 @@
     "category_name": "Prohibition of Child Labor",
     "category_color": "#BE123C",
     "category_icon": "user-x",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-CHILD-001",
@@ -421,6 +433,8 @@
     "category_name": "Prohibition of Discrimination",
     "category_color": "#DB2777",
     "category_icon": "user-minus",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-DISCRIM-001",
@@ -438,6 +452,8 @@
     "category_name": "Prohibition of Forced labor",
     "category_color": "#9333EA",
     "category_icon": "lock",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-FORCED-001",
@@ -455,6 +471,8 @@
     "category_name": "Environment",
     "category_color": "#059669",
     "category_icon": "leaf",
+    "subject_scope": "VENDOR",
+    "audit_category": "SOCIAL_COMPLIANCE",
     "checkpoints": [
       {
         "code": "PI-SC-ENV-001",

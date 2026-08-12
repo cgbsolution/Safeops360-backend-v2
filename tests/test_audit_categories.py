@@ -1,22 +1,30 @@
 """Audit categories — the chain from category to checkpoints.
 
-The scheduler now picks a CATEGORY first (Internal / QMS-EMS-OHS / Social
-Compliance) and the category decides which disciplines are on offer. Same house
-style as `test_supplier_audits.py`: the classifier is a pure function over
-already-loaded rows, so it is covered directly with no async-DB harness.
+The scheduler picks an audit SUBJECT and then a CATEGORY within it, and the
+category decides which disciplines are on offer:
+
+    Own facility -> Internal, QMS/EMS/OHS
+    Supplier     -> Social Compliance, Supplier Code of Conduct
+
+Social Compliance sits on the SUPPLIER side: its questions — valid factory
+licence, minimum wages, no child labour — are put to a supplier's factory, and
+for our own site the internal HR/EHS audit already covers that ground.
+
+Same house style as `test_supplier_audits.py`: the classifier is a pure function
+over already-loaded rows, so it is covered directly with no async-DB harness.
 
 Four things are worth pinning, because each is a way this can be quietly wrong
 rather than loudly broken:
 
   1. Every category in the menu resolves to a library that is actually seeded —
      a category with no checklist is a promise the instance cannot keep.
-  2. Supplier checklists carry NO category. Category and subject are different
-     axes, and collapsing them is how a supplier audit ends up scoped against a
-     plant checklist.
+  2. Category and subject stay separate axes, and every category's declared
+     subject matches its library's scope. Collapsing them is how a supplier
+     audit ends up scoped against a plant checklist.
   3. The seeded content matches the source workbooks: a discipline that silently
      loses its checkpoints still renders as a tickable chip that materialises
      nothing.
-  4. The audit FORMAT is standardised — all three categories grade on
+  4. The audit FORMAT is standardised — every category grades on
      `page_grading`, so one conduct screen and one score rollup serve all of
      them. This is the requirement that the categories be interchangeable in
      everything except which questions they ask.
@@ -68,9 +76,33 @@ def test_every_category_maps_to_a_library_and_back():
         assert library_audit_category(cat["industryCode"], []) == cat["code"]
 
 
-def test_the_three_categories_are_the_menu_in_order():
+def test_the_menu_is_own_facility_then_supplier():
     codes = [c["code"] for c in list_audit_categories()]
-    assert codes == ["INTERNAL", "MANAGEMENT_SYSTEMS", "SOCIAL_COMPLIANCE"]
+    assert codes == ["INTERNAL", "MANAGEMENT_SYSTEMS", "SOCIAL_COMPLIANCE", "SUPPLIER_COC"]
+
+
+def test_social_compliance_is_a_supplier_category_not_an_own_facility_one():
+    """The move that prompted this. Its questions — valid factory licence,
+    minimum wages, no child labour — are put to a SUPPLIER's factory; for our own
+    site the internal HR/EHS audit covers the same ground, and offering it there
+    produced a report reading as though we screened ourselves as a vendor."""
+    by_code = {c["code"]: c for c in AUDIT_CATEGORIES}
+    assert by_code["SOCIAL_COMPLIANCE"]["subjectType"] == "VENDOR"
+    assert by_code["SUPPLIER_COC"]["subjectType"] == "VENDOR"
+    assert by_code["INTERNAL"]["subjectType"] == "OWN_SITE"
+    assert by_code["MANAGEMENT_SYSTEMS"]["subjectType"] == "OWN_SITE"
+
+
+def test_every_category_declares_a_subject_and_it_matches_its_library():
+    """The two must agree. A category declared VENDOR whose library classifies
+    OWN_SITE would be offered on the supplier side and then refused by
+    `create_audit`'s subject guard — visible only at submit."""
+    for cat in AUDIT_CATEGORIES:
+        assert cat["subjectType"] in ("OWN_SITE", "VENDOR")
+        name, _count, _discs = SEEDED.get(cat["code"], (None, None, None))
+        if name is None:
+            continue  # SUPPLIER_COC is not seeded from a workbook here
+        assert library_subject_scope(cat["industryCode"], _load(name)) == cat["subjectType"]
 
 
 def test_list_audit_categories_hands_out_copies():
@@ -81,8 +113,12 @@ def test_list_audit_categories_hands_out_copies():
     assert list_audit_categories()[0]["label"] == "Internal"
 
 
-def test_every_category_library_is_seeded():
+def test_every_workbook_backed_category_library_is_seeded():
+    """SUPPLIER_COC is imported by its own script rather than extracted from a
+    workbook, so it has no JSON here — the rest must."""
     for cat in AUDIT_CATEGORIES:
+        if cat["code"] not in SEEDED:
+            continue
         name, _count, _discs = SEEDED[cat["code"]]
         assert (DATA / name).exists(), f"{cat['code']} has no seed data"
 
@@ -90,13 +126,21 @@ def test_every_category_library_is_seeded():
 # ── 2. Category and subject are different axes ────────────────────────────
 
 
-def test_supplier_checklists_carry_no_category():
-    """None, not a fourth category. A supplier checklist is reached through the
-    audit SUBJECT; treating it as a category would put it in the own-facility
-    picker, which is exactly the mismatch `library_subject_scope` exists to
-    prevent."""
-    assert library_audit_category("SUPPLIER_COC", []) is None
+def test_a_categorised_supplier_checklist_stays_on_the_supplier_side():
+    """The Supplier Code of Conduct IS a category now — a VENDOR one. What must
+    never happen is it leaking into the own-facility picker, and `subjectType`
+    rather than the absence of a category is what keeps it out."""
+    assert library_audit_category("SUPPLIER_COC", []) == "SUPPLIER_COC"
+    by_code = {c["code"]: c for c in AUDIT_CATEGORIES}
+    assert by_code["SUPPLIER_COC"]["subjectType"] == "VENDOR"
+
+
+def test_buyer_regimes_still_carry_no_category():
+    """SMETA/BSCI/WRAP and friends ship as structure with no checkpoints and are
+    reached through the subject alone. An uncategorised library must resolve to
+    None, not be guessed into the nearest category."""
     assert library_audit_category("REGIME_SMETA_LIKE", [{"regimeCode": "SMETA"}]) is None
+    assert library_audit_category("REGIME_WRAP_LIKE", []) is None
 
 
 def test_retired_industry_libraries_carry_no_category():
@@ -104,10 +148,12 @@ def test_retired_industry_libraries_carry_no_category():
     assert library_audit_category("GARMENTS_TEXTILE", []) is None
 
 
-def test_all_three_categories_are_own_facility():
-    """A category audits OUR site. If one classified as VENDOR it would vanish
-    from the own-facility picker it was written for."""
+def test_the_own_facility_categories_classify_as_own_site():
+    """Checked against the industry-code fallback (empty categories), which is
+    what a library loaded without the explicit hook falls back to."""
     for cat in AUDIT_CATEGORIES:
+        if cat["subjectType"] != "OWN_SITE":
+            continue
         assert library_subject_scope(cat["industryCode"], []) == "OWN_SITE"
 
 
@@ -224,10 +270,11 @@ def test_audit_type_is_resolvable_from_a_category_for_every_category():
         "INTERNAL": "internal_audit",
         "MANAGEMENT_SYSTEMS": "management_system_audit",
         "SOCIAL_COMPLIANCE": "social_compliance_audit",
+        "SUPPLIER_COC": "supplier_coc_audit",
     }
-    # An uncategorised library (supplier / retired) finds nothing and keeps the
-    # generic type — the fallback must not invent a category for it.
-    assert library_audit_category("SUPPLIER_COC", []) not in by_code
+    # An uncategorised library (a buyer regime, a retired industry) finds nothing
+    # and keeps the generic type — the fallback must not invent a category for it.
+    assert library_audit_category("CEMENT", []) not in by_code
 
 
 def test_discipline_codes_do_not_collide_across_categories():

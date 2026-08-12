@@ -214,7 +214,15 @@ def build_social() -> list[dict]:
             colour, icon, _base = SOCIAL_STYLE[code]
             cats.append({
                 "category_code": code, "category_name": sec,
-                "category_color": colour, "category_icon": icon, "checkpoints": [],
+                "category_color": colour, "category_icon": icon,
+                # Declared on every category so `library_subject_scope` and
+                # `library_audit_category` both classify this library without a
+                # code change. This checklist audits a SUPPLIER's factory —
+                # licences, wages, child labour — so it belongs to the vendor
+                # subject, not to an audit of our own site.
+                "subject_scope": "VENDOR",
+                "audit_category": "SOCIAL_COMPLIANCE",
+                "checkpoints": [],
             })
         if not q or not cats:
             continue

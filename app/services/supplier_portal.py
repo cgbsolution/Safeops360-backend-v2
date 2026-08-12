@@ -119,22 +119,42 @@ class IssuedToken:
     portalPath: str
 
 
+#: Who an external link can be issued to. Not interchangeable — see the model.
+PORTAL_ROLES = ("SUPPLIER_MANAGER", "CO_AUDITOR", "AUDITEE")
+
+
 async def issue_token(
     db: AsyncSession,
     *,
     audit_id: str,
     contact_email: str,
     contact_name: str | None = None,
+    role: str = "SUPPLIER_MANAGER",
+    discipline_codes: list[str] | None = None,
     vendor_profile_id: str | None = None,
     actor_id: str | None = None,
     ttl_days: int = DEFAULT_TTL_DAYS,
 ) -> IssuedToken:
-    """Mint a token for one audit and revoke any previous live one.
+    """Mint a token for one PERSON on one audit, revoking their previous one.
 
     Re-issuing revokes the predecessor rather than running two live credentials
-    for the same audit: two valid tokens means revoking the leaked one does not
+    for the same person: two valid tokens means revoking the leaked one does not
     actually close access.
+
+    That rule used to be scoped to the whole AUDIT, which made a second
+    recipient impossible — issuing a co-auditor's link silently killed the
+    supplier manager's. It is now scoped to (audit, email, role), which is the
+    narrowest key that still guarantees one live credential per person. The
+    partial unique index enforces the same thing at the database, so a caller
+    that forgets cannot create a second live link behind our back.
     """
+    role = (role or "SUPPLIER_MANAGER").upper()
+    if role not in PORTAL_ROLES:
+        raise ValueError(f"Unknown portal role '{role}'. Expected one of {', '.join(PORTAL_ROLES)}.")
+    email = (contact_email or "").strip()
+    if not email:
+        raise ValueError("A portal token needs an email address — it is the holder's identity.")
+
     ttl = max(1, min(int(ttl_days or DEFAULT_TTL_DAYS), MAX_TTL_DAYS))
     now = _utcnow()
 
@@ -142,13 +162,15 @@ async def issue_token(
         await db.execute(
             select(SupplierPortalToken).where(
                 SupplierPortalToken.auditId == audit_id,
+                func.lower(SupplierPortalToken.supplierContactEmail) == email.lower(),
+                SupplierPortalToken.role == role,
                 SupplierPortalToken.revokedAt.is_(None),
             )
         )
     ).scalars().all():
         prior.revokedAt = now
         prior.revokedById = actor_id
-        prior.revokedReason = "Superseded by a newly issued token"
+        prior.revokedReason = "Superseded by a newly issued token for the same recipient"
 
     raw = secrets.token_urlsafe(32)
     row = SupplierPortalToken(
@@ -157,14 +179,63 @@ async def issue_token(
         vendorProfileId=vendor_profile_id,
         tokenHash=hash_token(raw),
         tokenPrefix=_prefix(raw),
-        supplierContactEmail=contact_email,
+        supplierContactEmail=email,
         supplierContactName=contact_name,
+        role=role,
+        disciplineCodes=list(discipline_codes or []),
         expiresAt=now + timedelta(days=ttl),
         createdById=actor_id,
     )
     db.add(row)
     await db.flush()
     return IssuedToken(token=row, rawToken=raw, portalPath=f"/supplier/{raw}")
+
+
+async def issue_tokens(
+    db: AsyncSession,
+    *,
+    audit_id: str,
+    recipients: list[dict[str, Any]],
+    vendor_profile_id: str | None = None,
+    actor_id: str | None = None,
+    ttl_days: int = DEFAULT_TTL_DAYS,
+) -> list[IssuedToken]:
+    """Issue one link per recipient, skipping duplicates within the batch.
+
+    `recipients` are `{email, name?, role?, disciplineCodes?}`. De-duplicated on
+    (email, role) BEFORE issuing, because the same pair twice in one batch would
+    otherwise have the second revoke the first and return a link the caller then
+    reports alongside a dead one.
+
+    A bad address fails that recipient only. Scheduling an audit must not be lost
+    because someone mistyped one co-auditor's email, and a partially-issued batch
+    is visible in the result — the caller reports which links went out.
+    """
+    out: list[IssuedToken] = []
+    seen: set[tuple[str, str]] = set()
+    for r in recipients or []:
+        email = (r.get("email") or "").strip()
+        role = (r.get("role") or "SUPPLIER_MANAGER").upper()
+        if not email:
+            continue
+        key = (email.lower(), role)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            await issue_token(
+                db,
+                audit_id=audit_id,
+                contact_email=email,
+                contact_name=r.get("name"),
+                role=role,
+                discipline_codes=r.get("disciplineCodes"),
+                vendor_profile_id=vendor_profile_id,
+                actor_id=actor_id,
+                ttl_days=ttl_days,
+            )
+        )
+    return out
 
 
 async def revoke_token(

@@ -472,15 +472,24 @@ def attachment_storage_path(
 # makes "the disciplines populate from the category" true rather than a
 # coincidence of whichever library sorted first.
 #
-# Ordered as they appear in the wizard. `INTERNAL` is first because it is the
-# audit this instance runs most, and the one the other two were standardised
-# against.
+# Ordered as they appear in the wizard, and each declares the audit SUBJECT it
+# belongs to. `subjectType` is what keeps the two axes from tangling: a category
+# is offered only for the subject it was written for, so an own-facility audit
+# cannot be scoped against a supplier checklist and vice versa.
+#
+# `SOCIAL_COMPLIANCE` is VENDOR. The PIL Social Compliance checklist asks whether
+# "the factory" holds a valid licence, pays minimum wages and employs no child
+# labour — questions put to a SUPPLIER's factory during a social audit, not to
+# our own site, where the same ground is covered by the internal HR/EHS audit.
+# Offering it for an own-facility audit produced a report that read as though we
+# were screening ourselves as a vendor.
 AUDIT_CATEGORIES: list[dict[str, Any]] = [
     {
         "code": "INTERNAL",
         "label": "Internal",
         "description": "Page Industries internal audit — HR, EHS and Production.",
         "industryCode": "PAGE_INDUSTRIES",
+        "subjectType": "OWN_SITE",
         "auditType": "internal_audit",
         "standards": ["Page Industries Internal Audit"],
     },
@@ -489,6 +498,7 @@ AUDIT_CATEGORIES: list[dict[str, Any]] = [
         "label": "QMS, EMS, OHS",
         "description": "Integrated management-system audit against ISO 9001, 14001, 45001 and 50001.",
         "industryCode": "PAGE_IMS",
+        "subjectType": "OWN_SITE",
         "auditType": "management_system_audit",
         "standards": [
             "ISO 9001:2015", "ISO 14001:2015", "ISO 45001:2018", "ISO 50001:2018",
@@ -497,10 +507,20 @@ AUDIT_CATEGORIES: list[dict[str, Any]] = [
     {
         "code": "SOCIAL_COMPLIANCE",
         "label": "Social Compliance",
-        "description": "PIL Social Compliance Audit checklist — labour, wages, safety and environment.",
+        "description": "PIL Social Compliance Audit checklist — labour, wages, safety and environment at a supplier's factory.",
         "industryCode": "PAGE_SOCIAL",
+        "subjectType": "VENDOR",
         "auditType": "social_compliance_audit",
         "standards": ["PIL Social Compliance Audit Checklist (Annexure-2, v4)"],
+    },
+    {
+        "code": "SUPPLIER_COC",
+        "label": "Supplier Code of Conduct",
+        "description": "Supplier Code of Conduct — labour standards, health & safety, environment, ethics and management system.",
+        "industryCode": "SUPPLIER_COC",
+        "subjectType": "VENDOR",
+        "auditType": "supplier_coc_audit",
+        "standards": ["Supplier Code of Conduct"],
     },
 ]
 
@@ -2074,6 +2094,25 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
                 "would have nothing to assess. Import the supplier checklist content "
                 "before scheduling against it."
             )
+    else:
+        # ── The mirror of the guard above, which did not exist ─────────────
+        #
+        # A supplier checklist asks whether "the factory" holds a valid licence
+        # and pays minimum wages — put to a SUPPLIER during a social audit. Run
+        # against our own site it produces a report that reads as though we were
+        # screening ourselves as a vendor, and it duplicates ground the internal
+        # HR/EHS audit already covers.
+        #
+        # This became reachable the moment Social Compliance moved to the vendor
+        # subject: before that every own-facility library was OWN_SITE and the
+        # asymmetry cost nothing.
+        _scope = library_subject_scope(industry_code, library.categories or [])
+        if _scope == "VENDOR":
+            raise ValueError(
+                f"'{library.industryName}' is a supplier checklist and cannot be used "
+                "for an audit of our own facility. Choose the Internal or "
+                "QMS/EMS/OHS category, or set the audit subject to Supplier."
+            )
 
     auditees = data.get("auditees") or []
     mode = (config or {}).get("mode", "all")
@@ -2188,6 +2227,64 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
             contact_email=data.get("supplierContactEmail"),
             actor_id=user.id,
         )
+
+        # ── External access links, issued in the same transaction ───────────
+        #
+        # A supplier audit's parties have no platform seats: the supplier manager
+        # stands in for our plant manager, and external co-auditors and auditees
+        # work from a link rather than an account. Their email IS their identity,
+        # so the credential is minted here, with the audit, rather than as a
+        # separate step someone has to remember — an audit whose external parties
+        # cannot reach it is not a scheduled audit.
+        #
+        # One link per (person, role). Issuing is per-recipient tolerant: a
+        # mistyped co-auditor address costs that one link, not the whole audit,
+        # and the result names which links were actually created.
+        from app.services import supplier_portal as _portal
+
+        _recipients: list[dict[str, Any]] = []
+        if data.get("supplierContactEmail"):
+            _recipients.append({
+                "email": data["supplierContactEmail"],
+                "name": data.get("supplierContactName"),
+                "role": "SUPPLIER_MANAGER",
+            })
+        # Externals carry disciplines so a co-auditor's link is scoped to the
+        # part of the audit they were actually brought in to conduct.
+        for _c in data.get("externalCoAuditors") or []:
+            if _c.get("email"):
+                _recipients.append({
+                    "email": _c["email"], "name": _c.get("name"), "role": "CO_AUDITOR",
+                    "disciplineCodes": [d for d in (_c.get("disciplineIds") or []) if d in selected] or sorted(selected),
+                })
+        for _a in data.get("externalAuditees") or []:
+            if _a.get("email"):
+                _recipients.append({
+                    "email": _a["email"], "name": _a.get("name"), "role": "AUDITEE",
+                    "disciplineCodes": [d for d in (_a.get("disciplineIds") or []) if d in selected] or sorted(selected),
+                })
+        if _recipients:
+            issued = await _portal.issue_tokens(
+                db,
+                audit_id=audit.id,
+                recipients=_recipients,
+                vendor_profile_id=vendor_profile_id,
+                actor_id=user.id,
+            )
+            # Returned to the caller ONCE. The raw token is never stored (only a
+            # hash is), so this is the only moment the links can be handed over —
+            # if the response is dropped they must be re-issued, which is the
+            # intended cost of not keeping replayable credentials in the database.
+            audit._issuedPortalLinks = [  # type: ignore[attr-defined]
+                {
+                    "email": t.token.supplierContactEmail,
+                    "name": t.token.supplierContactName,
+                    "role": t.token.role,
+                    "portalPath": t.portalPath,
+                    "expiresAt": _iso(t.token.expiresAt),
+                }
+                for t in issued
+            ]
 
     rows: list[AuditCheckpointResponse] = []
     materialized_disciplines: list[str] = []
