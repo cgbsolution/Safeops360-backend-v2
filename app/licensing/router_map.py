@@ -23,6 +23,10 @@ ROUTER_MODULE: dict[str, str | None] = {
     "dashboard": None,
     "devices": None,
     "licensing": None,
+    # Spans seven differently-licensed modules — gating happens per route
+    # inside the router, not here. See app/routers/analytics_strip.py.
+    "analytics_strip": None,
+    "masters": None,
     # ── Operational Safety ──
     "observations": "OBSERVATION",
     # SLA matrix + deroster review are part of the Observation module and gate
@@ -69,6 +73,7 @@ ROUTER_MODULE: dict[str, str | None] = {
     "inspection_findings": "INSPECTION",
     # ── Performance ──
     "manhours": "MANHOURS",
+    "manhours_submissions": "MANHOURS",
     "anomalies": "ANOMALIES",
     # ── AI Assistance ──
     "agents": "AI_ASSIST",

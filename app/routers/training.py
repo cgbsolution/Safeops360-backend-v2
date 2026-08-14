@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,7 +16,9 @@ from app.models.training import (
     TrainingProgramQuestion,
     TrainingRecord,
 )
+from app.models.plant import Plant
 from app.models.user import User
+from app.services.register_view import status_counts
 from app.schemas.training import (
     ProgramApprovalDecision,
     ProgramRetire,
@@ -39,6 +41,25 @@ router = APIRouter(prefix="/api/training", tags=["training"])
 # ═══════════════════════════════════════════════════════════════════════
 #  TRAINING PROGRAM MASTER (production-depth)
 # ═══════════════════════════════════════════════════════════════════════
+
+
+@router.get("/analytics")
+async def get_training_analytics(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The competency dashboard, in one call.
+
+    Read-only aggregate over training data the caller can already reach through
+    the module; gated by TRAINING.READ rather than a narrower scope because
+    every figure here is a rollup, not a record.
+    """
+    check = await can(db, user.id, "TRAINING.READ", PermissionContext())
+    if not check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+    from app.services.training_analytics import training_analytics
+
+    return await training_analytics(db, datetime.now(timezone.utc))
 
 
 @router.get("/programs")
@@ -79,20 +100,93 @@ async def list_programs(
             )
         )
 
+    # Approval-state tallies for the register chips, plus the statutory-coverage
+    # figure the page headlines. Both describe the same filtered set the rows
+    # come from, so a chip can never disagree with the list under it.
+    counts = await status_counts(db, stmt, TrainingProgram.approvalStatus)
+    statutory_approved = int(
+        (
+            await db.execute(
+                select(func.count()).select_from(
+                    stmt.where(TrainingProgram.isStatutory.is_(True))
+                    .where(TrainingProgram.approvalStatus == "APPROVED")
+                    .subquery()
+                )
+            )
+        ).scalar_one()
+    )
+
     rows = (await db.execute(stmt.order_by(TrainingProgram.name))).scalars().all()
-    return {"items": [TrainingProgramOut.model_validate(r) for r in rows], "total": len(rows)}
+    return {
+        "items": [TrainingProgramOut.model_validate(r) for r in rows],
+        "total": len(rows),
+        "approvalCounts": counts,
+        "statutoryApproved": statutory_approved,
+    }
 
 
-@router.get("/programs/{program_id}", response_model=TrainingProgramOut)
+@router.get("/programs/{program_id}")
 async def get_program(
     program_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> TrainingProgramOut:
+) -> dict[str, Any]:
+    """A programme with the relations its detail page renders: owning plant,
+    owner, approver, and the ordered question + material lists.
+
+    The questions and materials are also reachable on their own sub-routes for
+    callers that want them alone; nesting them here keeps the detail page to a
+    single request instead of three.
+    """
     program = await db.get(TrainingProgram, program_id)
     if program is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Program not found")
-    return TrainingProgramOut.model_validate(program)
+
+    out = TrainingProgramOut.model_validate(program).model_dump()
+
+    plant = await db.get(Plant, program.plantId) if program.plantId else None
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+
+    people_ids = {
+        pid for pid in (program.ownerId, program.approvedById) if pid
+    }
+    people = dict(
+        (
+            await db.execute(select(User.id, User.name).where(User.id.in_(people_ids)))
+        ).all()
+    ) if people_ids else {}
+    out["owner"] = (
+        {"id": program.ownerId, "name": people.get(program.ownerId)}
+        if program.ownerId
+        else None
+    )
+    out["approvedBy"] = (
+        {"id": program.approvedById, "name": people.get(program.approvedById)}
+        if program.approvedById
+        else None
+    )
+
+    questions = (
+        await db.execute(
+            select(TrainingProgramQuestion)
+            .where(TrainingProgramQuestion.programId == program_id)
+            .order_by(TrainingProgramQuestion.sequence)
+        )
+    ).scalars().all()
+    materials = (
+        await db.execute(
+            select(TrainingProgramMaterial)
+            .where(TrainingProgramMaterial.programId == program_id)
+            .order_by(TrainingProgramMaterial.sequence)
+        )
+    ).scalars().all()
+    out["questions"] = [
+        TrainingProgramQuestionOut.model_validate(q).model_dump() for q in questions
+    ]
+    out["materials"] = [
+        TrainingProgramMaterialOut.model_validate(m).model_dump() for m in materials
+    ]
+    return out
 
 
 @router.get("/programs/{program_id}/questions")
@@ -555,7 +649,6 @@ async def delete_program_material(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-from app.models.plant import Plant  # noqa: E402
 from app.models.training import (  # noqa: E402
     TrainingAssessment,
     TrainingAssessmentResponse,
@@ -603,25 +696,223 @@ async def list_schedules(
         stmt = stmt.where(TrainingSchedule.programId == program_id)
     if status_filter:
         stmt = stmt.where(TrainingSchedule.status == status_filter)
+    # Scope-only SELECT — the tab counts describe the whole register, not the
+    # 200 rows this page returns.
+    counts = await status_counts(db, stmt, TrainingSchedule.status)
+
     rows = (
         # Newest-created first — platform-wide register convention.
         await db.execute(
             stmt.order_by(TrainingSchedule.createdAt.desc(), TrainingSchedule.id.desc()).limit(200)
         )
     ).scalars().all()
-    return {"items": [TrainingScheduleOut.model_validate(r) for r in rows], "total": len(rows)}
+
+    # The register table shows programme + plant names, which live on other
+    # tables; joining them here keeps the page to one call.
+    prog_rows = (
+        await db.execute(
+            select(
+                TrainingProgram.id,
+                TrainingProgram.name,
+                TrainingProgram.programName,
+                TrainingProgram.isStatutory,
+                TrainingProgram.category,
+            ).where(TrainingProgram.id.in_({r.programId for r in rows}))
+        )
+    ).all() if rows else []
+    programs_by_id = {
+        pid: {"name": pname or name, "isStatutory": stat, "category": cat}
+        for pid, name, pname, stat, cat in prog_rows
+    }
+    plant_names = dict(
+        (
+            await db.execute(
+                select(Plant.id, Plant.name).where(
+                    Plant.id.in_({r.plantId for r in rows if r.plantId})
+                )
+            )
+        ).all()
+    ) if rows else {}
+
+    trainer_names = dict(
+        (
+            await db.execute(
+                select(User.id, User.name).where(
+                    User.id.in_({r.trainerId for r in rows if r.trainerId})
+                )
+            )
+        ).all()
+    ) if rows else {}
+
+    # Registration / session tallies per schedule — the "12 / 20 enrolled" and
+    # session-count columns. Two grouped counts rather than a query per row.
+    schedule_ids = [r.id for r in rows]
+    reg_counts = dict(
+        (
+            await db.execute(
+                select(TrainingRegistration.scheduleId, func.count())
+                .where(TrainingRegistration.scheduleId.in_(schedule_ids))
+                .group_by(TrainingRegistration.scheduleId)
+            )
+        ).all()
+    ) if schedule_ids else {}
+    session_counts = dict(
+        (
+            await db.execute(
+                select(TrainingSession.scheduleId, func.count())
+                .where(TrainingSession.scheduleId.in_(schedule_ids))
+                .group_by(TrainingSession.scheduleId)
+            )
+        ).all()
+    ) if schedule_ids else {}
+
+    items = []
+    for r in rows:
+        item = TrainingScheduleOut.model_validate(r).model_dump()
+        prog = programs_by_id.get(r.programId) or {}
+        item["programName"] = prog.get("name")
+        item["programIsStatutory"] = prog.get("isStatutory", False)
+        item["programCategory"] = prog.get("category")
+        item["plantName"] = plant_names.get(r.plantId) if r.plantId else None
+        item["trainerName"] = trainer_names.get(r.trainerId) if r.trainerId else None
+        item["registrationCount"] = int(reg_counts.get(r.id, 0))
+        item["sessionCount"] = int(session_counts.get(r.id, 0))
+        items.append(item)
+    return {"items": items, "total": len(items), "statusCounts": counts}
 
 
-@router.get("/schedules/{schedule_id}", response_model=TrainingScheduleOut)
+@router.get("/schedules/{schedule_id}")
 async def get_schedule(
     schedule_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> TrainingScheduleOut:
+) -> dict[str, Any]:
+    """A schedule with everything its delivery page runs on: the programme,
+    plant, trainer and creator, the ordered sessions, and the nominee roster.
+
+    Sessions and registrations also have their own sub-routes; nesting them
+    here is what lets the page render in one request rather than four.
+    """
     schedule = await db.get(TrainingSchedule, schedule_id)
     if schedule is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Schedule not found")
-    return TrainingScheduleOut.model_validate(schedule)
+
+    out = TrainingScheduleOut.model_validate(schedule).model_dump()
+
+    program = await db.get(TrainingProgram, schedule.programId)
+    out["program"] = (
+        TrainingProgramOut.model_validate(program).model_dump() if program else None
+    )
+    plant = await db.get(Plant, schedule.plantId) if schedule.plantId else None
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+
+    people_ids = {pid for pid in (schedule.trainerId, schedule.createdById) if pid}
+    people = dict(
+        (await db.execute(select(User.id, User.name).where(User.id.in_(people_ids)))).all()
+    ) if people_ids else {}
+    out["trainer"] = (
+        {"id": schedule.trainerId, "name": people.get(schedule.trainerId)}
+        if schedule.trainerId
+        else None
+    )
+    out["createdBy"] = (
+        {"id": schedule.createdById, "name": people.get(schedule.createdById)}
+        if schedule.createdById
+        else None
+    )
+
+    sessions = (
+        await db.execute(
+            select(TrainingSession)
+            .where(TrainingSession.scheduleId == schedule_id)
+            .order_by(TrainingSession.sequence)
+        )
+    ).scalars().all()
+    out["sessions"] = [TrainingSessionOut.model_validate(x).model_dump() for x in sessions]
+
+    reg_rows = (
+        await db.execute(
+            select(TrainingRegistration, User.name, User.designation)
+            .outerjoin(User, User.id == TrainingRegistration.userId)
+            .where(TrainingRegistration.scheduleId == schedule_id)
+            .order_by(TrainingRegistration.registeredAt)
+        )
+    ).all()
+    out["registrations"] = [
+        {
+            **TrainingRegistrationOut.model_validate(r).model_dump(),
+            "user": {"id": r.userId, "name": name, "designation": desig},
+        }
+        for r, name, desig in reg_rows
+    ]
+    return out
+
+
+@router.get("/registrations/{registration_id}")
+async def get_registration(
+    registration_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One registration with the learner, the schedule's programme (including
+    its ordered question bank), and every assessment attempt — what the
+    assessment screen needs to render or mark a paper.
+
+    Readable by the learner themselves or a privileged assessor; anyone else
+    gets a 403 rather than a filtered view, because there is nothing on this
+    screen a third party has a reason to see.
+    """
+    reg = await db.get(TrainingRegistration, registration_id)
+    if reg is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Registration not found")
+
+    role_codes = await get_user_role_codes(db, user.id)
+    is_assessor = any(
+        r in {"TRAINER", "LD_MANAGER", "HSE_MANAGER", "ADMIN", "CORPORATE_HSE"}
+        for r in role_codes
+    )
+    if reg.userId != user.id and not is_assessor:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
+
+    out = TrainingRegistrationOut.model_validate(reg).model_dump()
+
+    learner = await db.get(User, reg.userId)
+    out["user"] = {"id": learner.id, "name": learner.name} if learner else None
+
+    schedule = await db.get(TrainingSchedule, reg.scheduleId)
+    schedule_out = (
+        TrainingScheduleOut.model_validate(schedule).model_dump() if schedule else None
+    )
+    if schedule_out is not None:
+        program = await db.get(TrainingProgram, schedule.programId)
+        program_out = (
+            TrainingProgramOut.model_validate(program).model_dump() if program else None
+        )
+        if program_out is not None:
+            questions = (
+                await db.execute(
+                    select(TrainingProgramQuestion)
+                    .where(TrainingProgramQuestion.programId == program.id)
+                    .order_by(TrainingProgramQuestion.sequence)
+                )
+            ).scalars().all()
+            program_out["questions"] = [
+                TrainingProgramQuestionOut.model_validate(q).model_dump() for q in questions
+            ]
+        schedule_out["program"] = program_out
+    out["schedule"] = schedule_out
+
+    attempts = (
+        await db.execute(
+            select(TrainingAssessment)
+            .where(TrainingAssessment.registrationId == registration_id)
+            .order_by(TrainingAssessment.attemptNumber)
+        )
+    ).scalars().all()
+    out["assessments"] = [
+        TrainingAssessmentOut.model_validate(a).model_dump() for a in attempts
+    ]
+    return out
 
 
 @router.get("/schedules/{schedule_id}/sessions")
@@ -1554,16 +1845,59 @@ async def list_certificates(
     if status_filter:
         stmt = stmt.where(TrainingCertificate.status == status_filter)
 
+    counts = await status_counts(db, stmt, TrainingCertificate.status)
+
     rows = (
         # Newest-created first — platform-wide register convention.
         await db.execute(
             stmt.order_by(TrainingCertificate.createdAt.desc(), TrainingCertificate.id.desc()).limit(500)
         )
     ).scalars().all()
-    return {
-        "items": [TrainingCertificateOut.model_validate(c) for c in rows],
-        "total": len(rows),
+
+    prog_rows = (
+        await db.execute(
+            select(
+                TrainingProgram.id,
+                TrainingProgram.name,
+                TrainingProgram.programName,
+                TrainingProgram.code,
+                TrainingProgram.programCode,
+                TrainingProgram.isStatutory,
+                TrainingProgram.statutoryReference,
+            ).where(TrainingProgram.id.in_({c.programId for c in rows}))
+        )
+    ).all() if rows else []
+    programs_by_id = {
+        pid: {
+            "name": pname or name,
+            "code": pcode or code,
+            "isStatutory": stat,
+            "statutoryReference": ref,
+        }
+        for pid, name, pname, code, pcode, stat, ref in prog_rows
     }
+    holder_rows = (
+        await db.execute(
+            select(User.id, User.name, User.designation).where(
+                User.id.in_({c.userId for c in rows})
+            )
+        )
+    ).all() if rows else []
+    holders_by_id = {uid: {"name": n, "designation": d} for uid, n, d in holder_rows}
+
+    items = []
+    for c in rows:
+        item = TrainingCertificateOut.model_validate(c).model_dump()
+        prog = programs_by_id.get(c.programId) or {}
+        holder = holders_by_id.get(c.userId) or {}
+        item["programName"] = prog.get("name")
+        item["programCode"] = prog.get("code")
+        item["programIsStatutory"] = prog.get("isStatutory", False)
+        item["statutoryReference"] = prog.get("statutoryReference")
+        item["holderName"] = holder.get("name")
+        item["holderDesignation"] = holder.get("designation")
+        items.append(item)
+    return {"items": items, "total": len(items), "statusCounts": counts}
 
 
 @router.get("/certificates/me")
@@ -1571,23 +1905,60 @@ async def list_my_certificates(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Worker self-service — own certificates only."""
+    """Worker self-service — own certificates only.
+
+    Ordered by status then expiry so anything lapsed or close to expiring
+    surfaces first; that is the whole point of the screen.
+    """
     rows = (
         await db.execute(
             select(TrainingCertificate)
             .where(TrainingCertificate.userId == user.id)
-            .order_by(TrainingCertificate.issuedAt.desc())
+            .order_by(TrainingCertificate.status.asc(), TrainingCertificate.validTo.asc())
         )
     ).scalars().all()
-    return {"items": [TrainingCertificateOut.model_validate(c) for c in rows]}
+
+    prog_rows = (
+        await db.execute(
+            select(
+                TrainingProgram.id,
+                TrainingProgram.name,
+                TrainingProgram.programName,
+                TrainingProgram.code,
+                TrainingProgram.programCode,
+                TrainingProgram.isStatutory,
+                TrainingProgram.statutoryReference,
+            ).where(TrainingProgram.id.in_({c.programId for c in rows}))
+        )
+    ).all() if rows else []
+    programs_by_id = {
+        pid: {
+            "name": pname or name,
+            "code": pcode or code,
+            "isStatutory": stat,
+            "statutoryReference": ref,
+        }
+        for pid, name, pname, code, pcode, stat, ref in prog_rows
+    }
+
+    items = []
+    for c in rows:
+        item = TrainingCertificateOut.model_validate(c).model_dump()
+        prog = programs_by_id.get(c.programId) or {}
+        item["programName"] = prog.get("name")
+        item["programCode"] = prog.get("code")
+        item["programIsStatutory"] = prog.get("isStatutory", False)
+        item["statutoryReference"] = prog.get("statutoryReference")
+        items.append(item)
+    return {"items": items}
 
 
-@router.get("/certificates/{certificate_id}", response_model=TrainingCertificateOut)
+@router.get("/certificates/{certificate_id}")
 async def get_certificate(
     certificate_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> TrainingCertificateOut:
+) -> dict[str, Any]:
     cert = await db.get(TrainingCertificate, certificate_id)
     if cert is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Certificate not found")
@@ -1599,7 +1970,61 @@ async def get_certificate(
     )
     if cert.userId != user.id and not is_priv:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Access denied")
-    return TrainingCertificateOut.model_validate(cert)
+
+    # Nest what the certificate page prints: the programme, the holder, and the
+    # people behind each state change (issued / revoked / effectiveness review).
+    out = TrainingCertificateOut.model_validate(cert).model_dump()
+
+    program = await db.get(TrainingProgram, cert.programId)
+    out["program"] = (
+        TrainingProgramOut.model_validate(program).model_dump() if program else None
+    )
+
+    people_ids = {
+        pid
+        for pid in (
+            cert.userId,
+            cert.issuedById,
+            cert.revokedById,
+            cert.effectivenessReviewedById,
+        )
+        if pid
+    }
+    people = {
+        uid: {"id": uid, "name": name, "designation": desig, "plantId": plant_id}
+        for uid, name, desig, plant_id in (
+            await db.execute(
+                select(User.id, User.name, User.designation, User.plantId).where(
+                    User.id.in_(people_ids)
+                )
+            )
+        ).all()
+    }
+    out["user"] = people.get(cert.userId)
+    out["issuedBy"] = people.get(cert.issuedById) if cert.issuedById else None
+    out["revokedBy"] = people.get(cert.revokedById) if cert.revokedById else None
+    out["effectivenessReviewedBy"] = (
+        people.get(cert.effectivenessReviewedById)
+        if cert.effectivenessReviewedById
+        else None
+    )
+
+    # The originating schedule, when the certificate came out of a delivery
+    # rather than being recorded directly.
+    out["registration"] = None
+    if cert.registrationId:
+        reg = await db.get(TrainingRegistration, cert.registrationId)
+        if reg is not None:
+            schedule = await db.get(TrainingSchedule, reg.scheduleId)
+            out["registration"] = {
+                "id": reg.id,
+                "schedule": (
+                    {"id": schedule.id, "scheduleNumber": schedule.scheduleNumber}
+                    if schedule
+                    else None
+                ),
+            }
+    return out
 
 
 # ─── Public verification — NO AUTH ───────────────────────────────────
@@ -1827,15 +2252,71 @@ async def list_records(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    """Training records, scoped to what the caller may read.
+
+    TrainingRecord has no plantId of its own — it hangs off the employee — so
+    the plant scope is applied through the employee's plant. This endpoint
+    previously returned every record to any authenticated caller, with no
+    permission check and no scope at all.
+    """
+    check = await can(db, user.id, "TRAINING.READ", PermissionContext())
+    if not check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+
+    stmt = select(TrainingRecord)
+    plants = await get_accessible_plants(db, user.id)
+    if plants is not None:
+        if not plants:
+            return {"items": [], "total": 0}
+        stmt = stmt.where(
+            TrainingRecord.employeeId.in_(
+                select(User.id).where(User.plantId.in_(plants))
+            )
+        )
+    if check.matched_scope == "OWN_RECORDS":
+        # A worker sees the training they took, and anything they delivered.
+        stmt = stmt.where(
+            or_(TrainingRecord.employeeId == user.id, TrainingRecord.trainerId == user.id)
+        )
+
+    # 2000, not 200: the register derives compliance from the LATEST record per
+    # (employee, programme) pair, so truncating the set would silently change
+    # the percentage rather than just shortening the list.
     rows = (
         # Newest-created first — platform-wide register convention.
         await db.execute(
-            select(TrainingRecord)
-            .order_by(TrainingRecord.createdAt.desc(), TrainingRecord.id.desc())
-            .limit(200)
+            stmt.order_by(TrainingRecord.createdAt.desc(), TrainingRecord.id.desc()).limit(2000)
         )
     ).scalars().all()
-    return {"items": [TrainingRecordOut.model_validate(r) for r in rows], "total": len(rows)}
+
+    employees = {
+        uid: {"id": uid, "name": name, "department": dept}
+        for uid, name, dept in (
+            await db.execute(
+                select(User.id, User.name, User.department).where(
+                    User.id.in_({r.employeeId for r in rows})
+                )
+            )
+        ).all()
+    } if rows else {}
+    programs = {
+        p.id: TrainingProgramOut.model_validate(p).model_dump()
+        for p in (
+            await db.execute(
+                select(TrainingProgram).where(
+                    TrainingProgram.id.in_({r.programId for r in rows})
+                )
+            )
+        ).scalars().all()
+    } if rows else {}
+
+    items = []
+    for r in rows:
+        item = TrainingRecordOut.model_validate(r).model_dump()
+        item["employee"] = employees.get(r.employeeId)
+        item["program"] = programs.get(r.programId)
+        items.append(item)
+    return {"items": items, "total": len(items)}
 
 
 @router.post("", response_model=TrainingRecordOut, status_code=status.HTTP_201_CREATED)
@@ -1912,3 +2393,56 @@ async def delete_training_record(
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     await db.delete(record)
     await db.flush()
+
+
+# Declared LAST so every specific GET above (/programs, /schedules,
+# /certificates, /analytics, /competency/check) matches first — FastAPI
+# resolves in declaration order, and this path would otherwise swallow them.
+@router.get("/{record_id}")
+async def get_record(
+    record_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One training record with the employee, programme and trainer nested —
+    what the record's detail page prints."""
+    record = await db.get(TrainingRecord, record_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Training record not found")
+
+    employee = await db.get(User, record.employeeId)
+    check = await can(
+        db,
+        user.id,
+        "TRAINING.READ",
+        PermissionContext(
+            record_id=record.id,
+            plant_id=employee.plantId if employee else None,
+            record={"employeeId": record.employeeId, "trainerId": record.trainerId},
+        ),
+    )
+    if not check.allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, check.reason or "Access denied")
+
+    out = TrainingRecordOut.model_validate(record).model_dump()
+    out["employee"] = (
+        {
+            "id": employee.id,
+            "name": employee.name,
+            "designation": employee.designation,
+            "department": employee.department,
+        }
+        if employee
+        else None
+    )
+    program = await db.get(TrainingProgram, record.programId)
+    out["program"] = (
+        TrainingProgramOut.model_validate(program).model_dump() if program else None
+    )
+    trainer = await db.get(User, record.trainerId) if record.trainerId else None
+    out["trainer"] = (
+        {"id": trainer.id, "name": trainer.name, "designation": trainer.designation}
+        if trainer
+        else None
+    )
+    return out

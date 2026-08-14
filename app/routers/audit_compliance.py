@@ -205,6 +205,10 @@ class AddCheckpointBody(BaseModel):
     evidenceRequiredOnFail: bool = False
     assignedOwnerId: str | None = None
     promoteToTemplate: bool = False
+    # Which report a custom line joins, on a department audit (IMS | ENMS).
+    # Omitted, it inherits the stream the department mostly holds — an ad-hoc
+    # checkpoint with no stream would print in neither report.
+    streamCode: str | None = None
 
 
 class TemplateCustomCheckpointBody(BaseModel):
@@ -314,12 +318,35 @@ class SaveResponseBody(BaseModel):
     auditFindings: str | None = None      # G — alias of textObservation
     riskGrade: str | None = None          # H
 
+    # ── The three-parameter face (TRISTATE checkpoints) ───────────────────
+    # CONFORMANCE | NON_CONFORMANCE | OBSERVATION, or the customer's own labels.
+    # The service rewrites it into `gradeAwarded` + `complianceStatus` before
+    # anything else runs, so it is one control writing the same two columns —
+    # not a second verdict living beside them.
+    conformance: str | None = None
+
 
 class BulkResponseBody(BaseModel):
     value: Literal["pass", "na"]
     checkpointIds: list[str] = []
     disciplineId: str | None = None
     onlyUnanswered: bool = True
+
+
+class ReplicateResponseBody(BaseModel):
+    """Copy one checkpoint's verdict onto the same workbook line in the other
+    departments of this audit.
+
+    `targetDepartments` empty = every other department that holds the line.
+    `overwrite` is required to touch a department that is already graded — the
+    default refuses and reports which, because an auditor may have found Admin
+    genuinely different from HR.
+    """
+
+    checkpointCode: str
+    targetDepartments: list[str] = []
+    includeFindings: bool = True
+    overwrite: bool = False
 
 
 class AuditeeRespondBody(BaseModel):
@@ -357,6 +384,10 @@ class GenerateReportBody(BaseModel):
     """
 
     reportType: str  # INTERIM | FINAL
+    # Which of the two documents a department audit issues — IMS | ENMS.
+    # Omitted (or null) means the whole audit, which is what every
+    # single-stream checklist produces and what every report before this was.
+    stream: str | None = None
 
 
 class UploadUrlBody(BaseModel):
@@ -612,8 +643,13 @@ async def grading_vocabulary() -> dict[str, Any]:
     "Effective" is called would be a needless round-trip on a field device.
     Serving it rather than hard-coding the same five labels in the client is
     what stops the two drifting apart.
+
+    Carries the TRISTATE vocabulary (Conformance / Non-Conformance /
+    Observation) alongside the full one, and the report streams, for the same
+    reason — one register can hold checkpoints of both modes, so the client
+    needs both sets and picks per row.
     """
-    return page_grading.vocabulary()
+    return {**page_grading.vocabulary(), "streams": svc.list_streams()}
 
 
 @router.get("/dashboard/programme")
@@ -803,6 +839,9 @@ async def list_checkpoints(
         None, description="Requirement Type (col I): STATUTORY_REGULATORY|INTERNAL_REQUIREMENT"
     ),
     assignedAuditorId: str | None = Query(None),
+    stream: str | None = Query(
+        None, description="Report stream (department audits): IMS|ENMS"
+    ),
     mine: bool = Query(False, description="only checkpoints assigned to me (auditor)"),
     cursor: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -821,7 +860,7 @@ async def list_checkpoints(
             assessment_status=assessmentStatus, value=value, criticality=criticality,
             q=q, grade=grade, compliance_status=complianceStatus, risk_grade=riskGrade,
             requirement_type=requirementType,
-            assigned_auditor_id=auditor_filter, cursor=cursor, limit=limit,
+            assigned_auditor_id=auditor_filter, stream=stream, cursor=cursor, limit=limit,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
@@ -853,7 +892,14 @@ async def list_reports(
     audit = await _load_or_404(db, audit_id)
     await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
                    record=_reader_record(audit), record_id=audit.id)
-    return {"reports": await svc.list_reports(db, audit_id)}
+    return {
+        "reports": await svc.list_reports(db, audit_id),
+        # Which reports this audit can issue. A department audit answers with
+        # two (IMS + EnMS); everything else answers with one, so the report
+        # screen renders from the data rather than from a flag about the
+        # library it happens to be looking at.
+        "streams": await svc.available_report_streams(db, audit_id),
+    }
 
 
 @router.post("/{audit_id}/reports", status_code=status.HTTP_201_CREATED)
@@ -874,6 +920,7 @@ async def generate_report(
     try:
         return await svc.generate_report(
             db, user=user, audit_id=audit_id, report_type=body.reportType,
+            stream=body.stream,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
@@ -1133,6 +1180,56 @@ async def bulk_save_response(
             db, user=user, audit_id=audit_id, value=body.value,
             checkpoint_ids=body.checkpointIds, discipline_id=body.disciplineId,
             only_unanswered=body.onlyUnanswered,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
+
+
+@router.get("/{audit_id}/responses/replication-targets")
+async def replication_targets(
+    audit_id: str,
+    checkpointCode: str = Query(..., description="The checkpoint to replicate FROM"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Which departments hold the same workbook line, and what state each is in.
+
+    Read before replicating so the confirm dialog can NAME what it is about to
+    overwrite, rather than reporting the damage afterwards.
+    """
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
+                   record=_reader_record(audit), record_id=audit.id)
+    try:
+        return await svc.replication_targets(
+            db, audit_id=audit_id, checkpoint_code=checkpointCode
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e)) from e
+
+
+@router.post("/{audit_id}/responses/replicate")
+async def replicate_response(
+    audit_id: str,
+    body: ReplicateResponseBody,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Copy one checkpoint's verdict onto the same line in other departments.
+
+    Same permission as any other verdict save — it IS a verdict save, on more
+    than one row. Never touches an in-flight finding, and never overwrites an
+    already-graded department unless `overwrite` says so.
+    """
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit),
+                   record_id=audit.id)
+    try:
+        return await svc.replicate_response(
+            db, user=user, audit_id=audit_id, checkpoint_code=body.checkpointCode,
+            target_departments=body.targetDepartments, include_findings=body.includeFindings,
+            overwrite=body.overwrite,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e

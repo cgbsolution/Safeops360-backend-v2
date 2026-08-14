@@ -21,6 +21,7 @@ from app.routers import (
     agents,
     agents_config,
     alerts,
+    analytics_strip,
     anomalies,
     assurance,
     attachments,
@@ -67,6 +68,8 @@ from app.routers import (
     kaizen,
     licensing,
     manhours,
+    manhours_submissions,
+    masters,
     moc,
     near_miss,
     notifications,
@@ -190,6 +193,16 @@ _ROUTERS = {
     # input adapter into the existing incident workflow. Mounted ungated; the
     # webhook is public (Meta/BSP calls it) and self-guards via sender identity.
     "whatsapp": whatsapp,
+    # Module landing-page KPI bands. Spans seven differently-licensed modules,
+    # so it stays ungated at the router level and each route carries its own
+    # require_module guard (see app/routers/analytics_strip.py).
+    "analytics_strip": analytics_strip,
+    # Shared MasterItem lookup for dropdowns across every module. Ungated like
+    # `plants` / `workforce` — reference data, not a module feature.
+    "masters": masters,
+    # IS 3786 monthly exposure return. Gated on MANHOURS like the legacy
+    # flat-table router it supersedes.
+    "manhours_submissions": manhours_submissions,
 }
 
 

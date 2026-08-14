@@ -87,6 +87,16 @@ class MyCountResponse(BaseModel):
     # treatment). Kept OUT of `count`, which older clients read as the pending
     # task total; the sidebar badge adds the two itself.
     unreadNotifications: int = 0
+    # Tasks whose status IS literally OVERDUE/ESCALATED. Narrower than
+    # `overdue`/`tabOverdueEscalated`, which also count anything merely past its
+    # dueAt or flagged URGENT. The web Inbox badge uses this one: summing the
+    # broad definition made the badge read "2 overdue" while nothing had
+    # actually breached.
+    overdueStrict: int = 0
+    # Workflow INSTANCES this user kicked off — what the "Submitted by me" tab
+    # lists. `tabSubmittedByMe` counts the tasks hanging off those instances,
+    # which is a different (usually larger) number.
+    submittedInstances: int = 0
 
 
 class WorkflowTaskOut(BaseModel):

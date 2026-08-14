@@ -11,6 +11,10 @@ geometry to checkpoints (which column is which standard, what "--" means, where
 a section banner stops and data starts) is the part worth being able to re-read
 when Page issue a new revision of either sheet.
 
+PAGE_IMS is segregated by DEPARTMENT (HR / Admin / OHC), each assessed against
+both sheets — see the block above `DEPARTMENTS` for why that is the correct
+reading of the workbook and the discipline split was not.
+
 Needs `xlrd` (the QMS workbook is a real BIFF .xls) and `openpyxl`.
 
 Run from the backend root, pointing at the directory holding both workbooks:
@@ -71,6 +75,18 @@ def clean(v) -> str:
     return re.sub(r"\s+", " ", str(v or "")).strip()
 
 
+def sl_no(v) -> int | None:
+    """The workbook's Sl No, or None when the cell is not one.
+
+    xlrd hands every numeric cell back as a float, so column A reads "1.0" —
+    which is why this is a parse and not a `str.isdigit()` check.
+    """
+    s = clean(v)
+    if not re.fullmatch(r"\d+(\.0+)?", s):
+        return None
+    return int(float(s))
+
+
 def clean_multiline(v) -> str:
     """Like `clean`, but keeps the line breaks.
 
@@ -82,92 +98,226 @@ def clean_multiline(v) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
-# ── PAGE_IMS ─────────────────────────────────────────────────────────────
-# The workbook is ONE sheet with three clause columns (F=QMS, G=EMS,
-# H=OHSMS, header row 8). A checkpoint belongs to a discipline when that
-# discipline's clause cell carries a clause — "--" is the workbook's own
-# marker for "this line does not apply to this standard". EnMS is a separate
-# tab, all of whose rows are EnMS.
-IMS_DISCIPLINES = [
-    ("QMS", "Quality Management System (ISO 9001:2015)", "#0EA5E9", "badge-check", 5),
-    ("EMS", "Environmental Management System (ISO 14001:2015)", "#16A34A", "leaf", 6),
-    ("OHS", "Occupational H&S Management System (ISO 45001:2018)", "#DC2626", "shield", 7),
+# ── PAGE_IMS — segregated by DEPARTMENT, not by discipline ───────────────
+#
+# The first build of this library made the four management-system standards
+# (QMS / EMS / OHSMS / EnMS) the segregation axis, because that is how the
+# workbook's *columns* are laid out. That was the wrong reading. Page conduct
+# ONE audit per DEPARTMENT, and each department is assessed against both sheets:
+#
+#   Tab 1 "QMS, EMS & OHS"  ->  the IMS stream   (ISO 9001 / 14001 / 45001)
+#   Tab 2 "EnMS"            ->  the EnMS stream  (ISO 50001)
+#
+# Both sheets say so in their own header row 4: "Department : HR, Admin and OHC".
+# A discipline-segregated library cannot express that — it produces one QMS
+# bucket covering all three departments at once, so an auditor cannot record
+# that HR's SOP control is effective while Admin's is not.
+#
+# So a CATEGORY here is a department, and the three clause columns become
+# `standard_clauses` ON the checkpoint instead of three separate copies of it.
+# That is the whole restructure; everything below is bookkeeping for it.
+#
+# `DEPT_`-prefixed rather than bare HR / ADMIN / OHC, and not cosmetically: the
+# annual programme resolves a slot's library by which one covers the most
+# planned category codes (`programme/materialise._library_for`). PAGE_INDUSTRIES
+# already owns a category coded `HR`, so a bare `HR` here would make that
+# resolution ambiguous and a slot could silently materialise against the
+# internal-audit checklist instead of this one. The code is internal; the
+# `category_name` is what any screen shows.
+DEPARTMENTS = [
+    ("DEPT_HR", "Human Resources", "#7C3AED", "users", "HR"),
+    ("DEPT_ADMIN", "Administration", "#0EA5E9", "building-2", "ADMIN"),
+    ("DEPT_OHC", "Occupational Health Centre", "#DC2626", "stethoscope", "OHC"),
 ]
-IMS_STANDARD = {
-    "QMS": "ISO 9001:2015",
-    "EMS": "ISO 14001:2015",
-    "OHS": "ISO 45001:2018",
-    "ENMS": "ISO 50001:2018",
-}
+
+# Clause columns on tab 1 (header row 8). A row is assessed against a standard
+# when that standard's clause cell carries a clause; "--" is the workbook's own
+# marker for "this line does not apply to this standard".
+IMS_CLAUSE_COLUMNS = [
+    ("QMS", "ISO 9001:2015", 5),
+    ("EMS", "ISO 14001:2015", 6),
+    ("OHSMS", "ISO 45001:2018", 7),
+]
+ENMS_STANDARD = "ISO 50001:2018"
+
+# Tab 1 rows 41–60 sit under the Sewage / Effluent Treatment Plant banners and
+# are the Admin department's alone; 1–40 are common to all three. The split is
+# the customer's, and it is a NUMBER rather than a keyword match on purpose — a
+# banner rename must not silently move twenty checkpoints between departments.
+IMS_COMMON_MAX_SL = 40
+
+# Tab 2 carries no plant-specific block, so all 22 EnMS rows are assessed in
+# every department.
+ENMS_ADMIN_ONLY_SL: frozenset[int] = frozenset()
+
+# Checkpoints that appear on BOTH sheets — the same requirement asked once
+# against ISO 9001/14001/45001 and again against ISO 50001. The auditor records
+# one finding per stream, so the conduct screen collapses each pair into a
+# single card with an IMS / EnMS toggle, and the two reports each take their own
+# side of it.
+#
+# Curated rather than fuzzy-matched. "Master list of documents" (IMS 16) and
+# "Master list of documents and formats" (EnMS 12) are the same requirement
+# under different wording, which no string comparison gets right; and IMS 19
+# splits across EnMS 15+16, which is not a pair at all and must not be forced
+# into one. A wrong pair silently hides one of the two findings behind a toggle,
+# so this list is the kind of thing that has to be read, not inferred.
+IMS_ENMS_PAIRS: list[tuple[int, int]] = [
+    (1, 1),    # Previous Audit and NC Closure Status
+    (2, 2),    # Departmental Objective (KPI)
+    (3, 3),    # Action Plan If KPI Target not achieved
+    (4, 4),    # Process Module
+    (5, 5),    # Standard Operating Procedure
+    (6, 6),    # Needs and expectations of Interested parties, Risk & Opportunities
+    (7, 7),    # Organogram (Dept. Organization Chart)
+    (15, 11),  # Compliance Obligation / legal and other requirements
+    (16, 12),  # Master list of documents (+ formats, on the EnMS sheet)
+    (18, 14),  # Continual Improvement
+]
+
+
+def _pair_keys() -> tuple[dict[int, str], dict[int, str]]:
+    """Sl No -> pair key, for each stream. The key is shared by the two members
+    so the runtime can join them without knowing the mapping."""
+    ims: dict[int, str] = {}
+    enms: dict[int, str] = {}
+    for i, (ims_sl, enms_sl) in enumerate(IMS_ENMS_PAIRS, start=1):
+        key = f"PAIR-{i:02d}"
+        ims[ims_sl] = key
+        enms[enms_sl] = key
+    return ims, enms
+
+
+def _read_ims_rows(sh) -> list[dict]:
+    """Tab 1 -> one dict per numbered row, carrying every standard it cites."""
+    rows: list[dict] = []
+    section = ""
+    for r in range(8, sh.nrows):  # row 9 (0-indexed 8) onward
+        sl, b = sl_no(sh.cell_value(r, 0)), clean(sh.cell_value(r, 1))
+        # Section banners: one of the two cells carries a heading and the other
+        # is blank. They scope the lines beneath them (STP / ETP), so they are
+        # carried onto the question rather than dropped.
+        if not b or sl is None:
+            head = b or clean(sh.cell_value(r, 0))
+            if head:
+                section = head.rstrip(":")
+            continue
+        clauses = []
+        for code, standard, col in IMS_CLAUSE_COLUMNS:
+            clause = clean(sh.cell_value(r, col))
+            if clause and clause not in {"--", "-", "NA", "N/A"}:
+                clauses.append({"code": code, "standard": standard, "clause": clause})
+        if not clauses:
+            # A numbered row citing no standard at all is not assessable —
+            # dropping it silently would be worse than the row never existing,
+            # so it is reported by `report()` via the count not matching 60.
+            continue
+        m = re.match(r"^(Sewage Treatment Plant \(STP\)|Effluent Treatment Plant \(ETP\))", section)
+        prefix = f"{'STP' if m and 'STP' in m.group(1) else 'ETP'} — " if m else ""
+        rows.append({
+            "sl": sl,
+            "question": prefix + b,
+            "guidance": clean_multiline(sh.cell_value(r, 2)),
+            "clauses": clauses,
+        })
+    return rows
+
+
+def _read_enms_rows(sh) -> list[dict]:
+    """Tab 2 -> one dict per numbered row. Single clause column (F), ISO 50001."""
+    rows: list[dict] = []
+    for r in range(8, sh.nrows):
+        sl, b = sl_no(sh.cell_value(r, 0)), clean(sh.cell_value(r, 1))
+        if not b or sl is None:
+            continue
+        clause = clean(sh.cell_value(r, 5))
+        rows.append({
+            "sl": sl,
+            "question": b,
+            "guidance": clean_multiline(sh.cell_value(r, 2)),
+            "clauses": (
+                [{"code": "EnMS", "standard": ENMS_STANDARD, "clause": clause}]
+                if clause else []
+            ),
+        })
+    return rows
+
+
+def _checkpoint(short: str, stream: str, row: dict, pair_key: str | None) -> dict:
+    """One materialisable checkpoint: a workbook row, in a department, on a stream."""
+    clauses = row["clauses"]
+    crit, req = classify(f"{row['question']} {row['guidance']}")
+    return {
+        # Coded off the workbook's own Sl No rather than a running counter, so a
+        # checkpoint on a report can be traced straight back to a line on the
+        # sheet the customer already keeps. Uses the department's SHORT form —
+        # `PI-DEPT_HR-IMS-001` reads worse than `PI-HR-IMS-001` and the code is
+        # already unique without the disambiguating prefix the category needs.
+        "code": f"PI-{short}-{stream}-{row['sl']:03d}",
+        "question": row["question"],
+        "criticality": crit,
+        "requirement_type": req,
+        "guidance": row["guidance"],
+        # Display strings, for the surfaces that render one line of text.
+        "requirement_reference": " · ".join(
+            f"{c['code']} {c['clause']}" for c in clauses
+        ),
+        "standard": " · ".join(c["standard"] for c in clauses),
+        # The structured form, which is what the standards rollup aggregates on.
+        # An IMS row cites up to three ISO standards at once; collapsing that to
+        # the display string above would report "ISO 9001 · ISO 14001 · ISO
+        # 45001" as a fourth standard and leave the three real ones empty.
+        "standard_clauses": clauses,
+        # Which report this checkpoint belongs to. The two reports are separate
+        # documents, not two views of one.
+        "stream": stream,
+        # Same workbook row, in another department — what "replicate this status
+        # across departments" copies along.
+        "replication_key": f"{stream}-{row['sl']:03d}",
+        # Same requirement on the other sheet, in THIS department. Null unless
+        # the row is one of IMS_ENMS_PAIRS.
+        "pair_key": pair_key,
+    }
 
 
 def build_ims() -> list[dict]:
     wb = xlrd.open_workbook(str(SRC / IMS_WORKBOOK))
-    sh = wb.sheet_by_name("QMS, EMS & OHS")
+    ims_rows = _read_ims_rows(wb.sheet_by_name("QMS, EMS & OHS"))
+    enms_rows = _read_enms_rows(wb.sheet_by_name("EnMS"))
+    ims_pairs, enms_pairs = _pair_keys()
 
-    buckets: dict[str, list[dict]] = {code: [] for code, *_ in IMS_DISCIPLINES}
-    section = ""
-    for r in range(8, sh.nrows):  # row 9 (0-indexed 8) onward
-        a, b = clean(sh.cell_value(r, 0)), clean(sh.cell_value(r, 1))
-        # Section banners: one of the two cells carries a heading and the
-        # other is blank. They scope the lines beneath them (STP / ETP), so
-        # they are carried onto the question rather than dropped.
-        if not b or not re.match(r"^\d+(\.\d+)?$", a):
-            head = b or a
-            if head:
-                section = head.rstrip(":")
-            continue
-        guidance = clean_multiline(sh.cell_value(r, 2))
-        for code, _name, _colour, _icon, col in IMS_DISCIPLINES:
-            clause = clean(sh.cell_value(r, col))
-            if not clause or clause in {"--", "-", "NA", "N/A"}:
+    cats: list[dict] = []
+    for dept, name, colour, icon, short in DEPARTMENTS:
+        checkpoints: list[dict] = []
+        for row in ims_rows:
+            if row["sl"] > IMS_COMMON_MAX_SL and short != "ADMIN":
                 continue
-            prefix = ""
-            m = re.match(r"^(Sewage Treatment Plant \(STP\)|Effluent Treatment Plant \(ETP\))", section)
-            if m:
-                prefix = f"{'STP' if 'STP' in m.group(1) else 'ETP'} — "
-            question = prefix + b
-            crit, req = classify(f"{question} {guidance}")
-            buckets[code].append({
-                "code": f"PI-{code}-{len(buckets[code]) + 1:03d}",
-                "question": question,
-                "criticality": crit,
-                "requirement_type": req,
-                "guidance": guidance,
-                "requirement_reference": f"Clause {clause}",
-                "standard": IMS_STANDARD[code],
-            })
-
-    # EnMS tab — every row is an EnMS checkpoint; the single clause column is F.
-    en = wb.sheet_by_name("EnMS")
-    enms: list[dict] = []
-    for r in range(8, en.nrows):
-        a, b = clean(en.cell_value(r, 0)), clean(en.cell_value(r, 1))
-        if not b or not re.match(r"^\d+(\.\d+)?$", a):
-            continue
-        guidance = clean_multiline(en.cell_value(r, 2))
-        clause = clean(en.cell_value(r, 5))
-        crit, req = classify(f"{b} {guidance}")
-        enms.append({
-            "code": f"PI-ENMS-{len(enms) + 1:03d}",
-            "question": b,
-            "criticality": crit,
-            "requirement_type": req,
-            "guidance": guidance,
-            "requirement_reference": f"Clause {clause}" if clause else "",
-            "standard": IMS_STANDARD["ENMS"],
+            checkpoints.append(_checkpoint(short, "IMS", row, ims_pairs.get(row["sl"])))
+        for row in enms_rows:
+            if row["sl"] in ENMS_ADMIN_ONLY_SL and short != "ADMIN":
+                continue
+            checkpoints.append(_checkpoint(short, "ENMS", row, enms_pairs.get(row["sl"])))
+        cats.append({
+            "category_code": dept,
+            "category_name": name,
+            "category_color": colour,
+            "category_icon": icon,
+            # Declared on the category so the runtime classifies this library
+            # without a code change, exactly as PAGE_SOCIAL declares its own
+            # subject scope and audit category.
+            "subject_scope": "OWN_SITE",
+            "audit_category": "MANAGEMENT_SYSTEMS",
+            # A category here is a DEPARTMENT. The scheduling wizard and the
+            # conduct navigator read this to say "Departments in scope" rather
+            # than "Disciplines in scope", which is otherwise a lie on screen.
+            "segregation": "DEPARTMENT",
+            # Conformance / Non-Conformance / Observation — the three parameters
+            # the customer's sheet actually carries, in place of the engine's
+            # seven-value status ladder. See services/page_grading.TRISTATE.
+            "conformance_mode": "TRISTATE",
+            "streams": ["IMS", "ENMS"],
+            "checkpoints": checkpoints,
         })
-
-    cats = [
-        {"category_code": code, "category_name": name, "category_color": colour,
-         "category_icon": icon, "checkpoints": buckets[code]}
-        for code, name, colour, icon, _col in IMS_DISCIPLINES
-    ]
-    cats.append({
-        "category_code": "ENMS",
-        "category_name": "Energy Management System (ISO 50001:2018)",
-        "category_color": "#CA8A04", "category_icon": "zap", "checkpoints": enms,
-    })
     return cats
 
 
@@ -243,11 +393,19 @@ def build_social() -> list[dict]:
 
 def report(label: str, cats: list[dict]) -> None:
     total = sum(len(c["checkpoints"]) for c in cats)
-    print(f"\n{label} — {total} checkpoints / {len(cats)} disciplines")
+    axis = "departments" if cats and cats[0].get("segregation") == "DEPARTMENT" else "disciplines"
+    print(f"\n{label} — {total} checkpoints / {len(cats)} {axis}")
     for c in cats:
-        stat = sum(1 for cp in c["checkpoints"] if cp["requirement_type"] == "STATUTORY_REGULATORY")
-        print(f"  {c['category_code']:<8} {c['category_name'][:52]:<54} "
-              f"{len(c['checkpoints']):>3}  ({stat} statutory)")
+        cps = c["checkpoints"]
+        stat = sum(1 for cp in cps if cp["requirement_type"] == "STATUTORY_REGULATORY")
+        streams = ""
+        if any(cp.get("stream") for cp in cps):
+            ims = sum(1 for cp in cps if cp.get("stream") == "IMS")
+            enms = sum(1 for cp in cps if cp.get("stream") == "ENMS")
+            pairs = len({cp["pair_key"] for cp in cps if cp.get("pair_key")})
+            streams = f"  [IMS {ims} + EnMS {enms}, {pairs} paired]"
+        print(f"  {c['category_code']:<8} {c['category_name'][:40]:<42} "
+              f"{len(cps):>3}  ({stat} statutory){streams}")
 
 
 if __name__ == "__main__":

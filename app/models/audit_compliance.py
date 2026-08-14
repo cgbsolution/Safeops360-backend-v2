@@ -197,6 +197,47 @@ class AuditCheckpointResponse(Base, IdMixin):
     # library checkpoint at materialization and rendered read-only.
     requirementType: Mapped[str | None] = mapped_column(String)
 
+    # ── Department-segregated management-system audits (PAGE_IMS) ─────────
+    #
+    # Page audit HR, Admin and OHC separately, and assess each department
+    # against BOTH source sheets — the IMS one (ISO 9001/14001/45001) and the
+    # EnMS one (ISO 50001). `categoryId` above carries the department; these
+    # four carry everything that axis cannot express. All nullable, because
+    # every other library materialises rows that have none of it.
+    #
+    # `streamCode` — IMS | ENMS. Two reports are issued per audit, one per
+    # stream, so this is what a report is scoped by. It cannot be derived from
+    # the department (both streams live in every department) nor from the
+    # standard (an IMS row cites up to three).
+    streamCode: Mapped[str | None] = mapped_column(String)
+
+    # `replicationKey` — the same workbook line in another department. 40 of the
+    # 60 IMS lines are common to all three, and re-typing an identical verdict
+    # three times is both the rework the customer asked us to remove and a way
+    # for the three copies to end up disagreeing.
+    replicationKey: Mapped[str | None] = mapped_column(String)
+
+    # `pairKey` — the same requirement on the other sheet, within one
+    # department. Ten checkpoints appear on both; the conduct screen shows them
+    # as one card with an IMS / EnMS toggle. Two ROWS rather than one row with
+    # two verdicts, deliberately: the score, the finding routing and the two
+    # reports are all per-stream, and a single row carrying both would have to
+    # fork every one of them.
+    pairKey: Mapped[str | None] = mapped_column(String)
+
+    # `conformanceMode` — FULL (the seven-value status ladder) or TRISTATE
+    # (Conformance / Non-Conformance / Observation, the customer's own column
+    # header). Snapshotted here rather than read live from the library for the
+    # same reason as `requirementType`: an audit must keep being read against
+    # the vocabulary it was conducted under.
+    conformanceMode: Mapped[str | None] = mapped_column(String)
+
+    # The standards this checkpoint is assessed against, structured:
+    # [{code, standard, clause}]. `standard` above is the display join of it.
+    # An IMS line cites ISO 9001, 14001 and 45001 at once, and the standards
+    # rollup has to report those as three standards, not as one string.
+    standardClauses: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
     # Denormalized per-checkpoint rules.
     requiresPhotoOnFail: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     autoTriggerCapaOnFail: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -274,6 +315,13 @@ class AuditCheckpointResponse(Base, IdMixin):
         Index("ix_AuditCheckpointResponse_audit_owner", "auditId", "assignedOwnerId"),
         Index("ix_AuditCheckpointResponse_audit_wfstate", "auditId", "workflowState"),
         Index("ix_AuditCheckpointResponse_audit_grade", "auditId", "gradeAwarded"),
+        # The conduct worklist filters by (audit, department, stream) and the
+        # report generator scans (audit, stream); replication looks up
+        # (audit, replicationKey). Without these each is a seq scan over every
+        # row the audit holds.
+        Index("ix_AuditCheckpointResponse_audit_stream", "auditId", "streamCode"),
+        Index("ix_AuditCheckpointResponse_audit_replkey", "auditId", "replicationKey"),
+        Index("ix_AuditCheckpointResponse_audit_pairkey", "auditId", "pairKey"),
     )
 
 
@@ -312,6 +360,14 @@ class AuditReport(Base, IdMixin):
     siteId: Mapped[str] = mapped_column(String, nullable=False)
     reportType: Mapped[str] = mapped_column(String, nullable=False)  # INTERIM | FINAL
     reportCode: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+
+    # Which stream this report covers — IMS | ENMS — or NULL for the whole
+    # audit, which is what every report before this was and what every
+    # single-stream library still produces. Page issue two separate documents
+    # from one department audit: an IMS internal audit report and an EnMS one,
+    # each against its own standards. Superseding is per (type, stream), so
+    # re-issuing the IMS interim must not mark the EnMS one stale.
+    reportStream: Mapped[str | None] = mapped_column(String)
     generatedById: Mapped[str] = mapped_column(String, nullable=False)
     generatedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)

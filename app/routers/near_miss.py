@@ -34,6 +34,8 @@ from sqlalchemy.orm import selectinload
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
 from app.models.masters import Department, MasterItem
+from app.models.plant import Area, Plant
+from app.services.register_view import status_counts, workflow_bottleneck, workflow_chips
 from app.models.epc import ContractorCompany
 from app.models.near_miss import NearMiss, NearMissStatus
 from app.models.near_miss_children import (
@@ -161,18 +163,47 @@ async def list_near_misses(
     if plants is None:
         pass
     elif not plants:
-        return {"items": [], "total": 0}
+        return {"items": [], "total": 0, "statusCounts": {}, "bottleneck": []}
     else:
         stmt = stmt.where(NearMiss.plantId.in_(plants))
     if read_check.matched_scope == "OWN_RECORDS":
         stmt = stmt.where(or_(NearMiss.reporterId == user.id, NearMiss.actionOwnerId == user.id))
+    # Scope-only SELECT — the basis for the status tab counts, which must
+    # describe the caller's whole accessible register rather than this page.
+    scoped = stmt
+    counts = await status_counts(db, scoped, NearMiss.status)
+
     # Newest-created first — platform-wide register convention.
     rows = (
         await db.execute(
-            stmt.order_by(NearMiss.createdAt.desc(), NearMiss.id.desc()).limit(200)
+            scoped.order_by(NearMiss.createdAt.desc(), NearMiss.id.desc()).limit(200)
         )
     ).scalars().all()
-    return {"items": [NearMissOut.model_validate(r) for r in rows], "total": len(rows)}
+
+    plant_names = dict(
+        (
+            await db.execute(
+                select(Plant.id, Plant.name).where(Plant.id.in_({r.plantId for r in rows}))
+            )
+        ).all()
+    ) if rows else {}
+    chips = await workflow_chips(db, "NEAR_MISS", [r.id for r in rows])
+    bottleneck = await workflow_bottleneck(
+        db, "NEAR_MISS", [r.id for r in rows if r.status != "CLOSED"]
+    )
+
+    items = []
+    for r in rows:
+        item = NearMissOut.model_validate(r).model_dump()
+        item["plantName"] = plant_names.get(r.plantId)
+        item["workflow"] = chips.get(r.id)
+        items.append(item)
+    return {
+        "items": items,
+        "total": len(items),
+        "statusCounts": counts,
+        "bottleneck": bottleneck,
+    }
 
 
 # ─── Masters (used by the form's selectors) ───────────────────────────
@@ -637,12 +668,12 @@ async def delete_near_miss(
 # ─── Get / Update ─────────────────────────────────────────────────────
 
 
-@router.get("/{nm_id}", response_model=NearMissOut)
+@router.get("/{nm_id}")
 async def get_near_miss(
     nm_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> NearMissOut:
+) -> dict[str, Any]:
     nm = await db.get(NearMiss, nm_id)
     if nm is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -653,7 +684,128 @@ async def get_near_miss(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    return NearMissOut.model_validate(nm)
+
+    out: dict[str, Any] = NearMissOut.model_validate(nm).model_dump()
+
+    # ── Display names for every FK the detail view prints ─────────────
+    plant = await db.get(Plant, nm.plantId)
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+    area = await db.get(Area, nm.areaId) if nm.areaId else None
+    out["area"] = {"id": area.id, "name": area.name} if area else None
+
+    people_ids = {
+        pid
+        for pid in (nm.reporterId, nm.suggestedActionOwnerId, nm.actionOwnerId)
+        if pid
+    }
+    people = {
+        uid: {"id": uid, "name": name, "designation": desig}
+        for uid, name, desig in (
+            await db.execute(
+                select(User.id, User.name, User.designation).where(User.id.in_(people_ids))
+            )
+        ).all()
+    } if people_ids else {}
+    out["reporter"] = people.get(nm.reporterId)
+    out["suggestedActionOwner"] = (
+        people.get(nm.suggestedActionOwnerId) if nm.suggestedActionOwnerId else None
+    )
+    out["actionOwner"] = people.get(nm.actionOwnerId) if nm.actionOwnerId else None
+
+    out["department"] = None
+    if nm.departmentId:
+        dept = await db.get(Department, nm.departmentId)
+        out["department"] = {"id": dept.id, "name": dept.name} if dept else None
+
+    out["equipment"] = None
+    if nm.equipmentId:
+        from app.models.equipment import Equipment
+
+        eq = await db.get(Equipment, nm.equipmentId)
+        out["equipment"] = (
+            {"id": eq.id, "code": eq.code, "name": eq.name} if eq else None
+        )
+
+    out["contractorCompany"] = None
+    if nm.contractorCompanyId:
+        from app.models.epc import ContractorCompany
+
+        company = await db.get(ContractorCompany, nm.contractorCompanyId)
+        out["contractorCompany"] = (
+            {"id": company.id, "name": company.name} if company else None
+        )
+
+    # ── Cross-module links ────────────────────────────────────────────
+    out["activePermit"] = None
+    if nm.activePermitId:
+        from app.models.permit import Permit
+
+        permit = await db.get(Permit, nm.activePermitId)
+        out["activePermit"] = (
+            {
+                "id": permit.id,
+                "number": permit.number,
+                "type": permit.type.value if hasattr(permit.type, "value") else permit.type,
+            }
+            if permit
+            else None
+        )
+
+    out["promotedIncident"] = None
+    if nm.promotedIncidentId:
+        from app.models.incident import Incident
+
+        inc = await db.get(Incident, nm.promotedIncidentId)
+        out["promotedIncident"] = (
+            {
+                "id": inc.id,
+                "number": inc.number,
+                "type": inc.type.value if hasattr(inc.type, "value") else inc.type,
+                "status": inc.status.value if hasattr(inc.status, "value") else inc.status,
+            }
+            if inc
+            else None
+        )
+
+    # ── The people child tables ───────────────────────────────────────
+    async def _people_rows(model, fk_col):
+        rows = (
+            await db.execute(
+                select(model, User.id, User.name, User.designation)
+                .outerjoin(User, User.id == fk_col)
+                .where(model.nearMissId == nm.id)
+            )
+        ).all()
+        return [
+            {
+                **{c.name: getattr(r, c.name) for c in r.__table__.columns},
+                "user": {"id": uid, "name": name, "designation": desig},
+            }
+            for r, uid, name, desig in rows
+        ]
+
+    out["personsInvolved"] = await _people_rows(
+        NearMissPersonInvolved, NearMissPersonInvolved.userId
+    )
+    out["personsPotentiallyAffected"] = await _people_rows(
+        NearMissPersonAffected, NearMissPersonAffected.userId
+    )
+
+    witness_rows = (
+        await db.execute(
+            select(NearMissWitness, User.id, User.name, User.designation)
+            .outerjoin(User, User.id == NearMissWitness.witnessId)
+            .where(NearMissWitness.nearMissId == nm.id)
+        )
+    ).all()
+    out["witnesses"] = [
+        {
+            **{c.name: getattr(w, c.name) for c in w.__table__.columns},
+            "witness": {"id": uid, "name": name, "designation": desig},
+        }
+        for w, uid, name, desig in witness_rows
+    ]
+    return out
 
 
 @router.patch("/{nm_id}", response_model=NearMissOut)

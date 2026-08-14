@@ -64,7 +64,7 @@ from app.schemas.auth import (
     VerifyOtpRequest,
     VerifyOtpResponse,
 )
-from app.services.permissions import get_permissions
+from app.services.permissions import _load_user_snapshot, get_permissions
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -179,6 +179,42 @@ async def my_permissions(
 ) -> PermissionsResponse:
     perms = await get_permissions(db, user.id)
     return PermissionsResponse(permissions=perms)
+
+
+@router.get("/access-snapshot")
+async def access_snapshot(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Everything the caller's RBAC decisions depend on, in one call.
+
+    The Next.js layer used to rebuild this itself from Prisma
+    (`UserRole -> Role -> RolePermission -> Permission` plus the user's plant
+    and department), which meant the grant model was read from two places and
+    could drift. This is now the only source: the frontend evaluates scope
+    against THIS payload and never queries the tables.
+
+    Served from the same 5-minute snapshot cache `can()` uses, so the frontend
+    and the backend can never be looking at different grants — and a permission
+    edit that calls `invalidate_user_permissions()` clears both at once.
+    """
+    snap = await _load_user_snapshot(db, user.id)
+    return {
+        "userId": user.id,
+        # One entry per (permission, scope) grant. Additive: any grant that
+        # satisfies the scope allows the action.
+        "grants": [
+            {"permissionCode": r.permission_code, "scope": r.scope, "roleId": r.role_id}
+            for r in snap.rows
+        ],
+        "roleCodes": list(snap.role_codes),
+        "plantId": snap.plant_id,
+        # Primary plant + every PLANT-scoped UserRole, so a multi-plant
+        # assignment (e.g. an HSE Manager over NW and SW) is not flattened to
+        # the primary plant alone.
+        "plantIds": sorted(snap.plant_ids),
+        "department": snap.department,
+    }
 
 
 @router.get("/me", response_model=UserOut)

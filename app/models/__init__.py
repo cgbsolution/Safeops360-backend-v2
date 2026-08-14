@@ -239,6 +239,14 @@ from app.models.incident_intel import (
 )
 from app.models.licensing import FactoryModuleEntitlement, LicenceInstallation
 from app.models.manhours import Manhours
+from app.models.manhours_submission import (
+    ManhoursAttachment,
+    ManhoursComment,
+    ManhoursEmployeeCategory,
+    ManhoursSubmission,
+    ManhoursUnlockEvent,
+    ManhoursVisitorRecord,
+)
 from app.models.masters import Department, MasterItem
 from app.models.epc import (
     ConstructionSite,

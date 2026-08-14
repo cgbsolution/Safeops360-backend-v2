@@ -5,7 +5,7 @@ checklist the disciplines come from:
 
   INTERNAL           -> PAGE_INDUSTRIES  (HR / EHS / Production)  — already seeded
                         by seed_page_industries_library.py
-  MANAGEMENT_SYSTEMS -> PAGE_IMS         (QMS / EMS / OHS / EnMS)  — this script
+  MANAGEMENT_SYSTEMS -> PAGE_IMS         (HR / Admin / OHC)         — this script
   SOCIAL_COMPLIANCE  -> PAGE_SOCIAL      (9 sections of Annexure-2) — this script
 
 Both are seeded here rather than in two scripts because they are one delivery:
@@ -19,10 +19,23 @@ column B (IMS) and column E (social); `guidance` is the workbook's own Audit
 Reference column and `requirement_reference` its clause number, so an auditor
 sees the same instruction they would have read off the sheet.
 
-The audit FORMAT is deliberately identical to the internal audit's: every
-checkpoint is `response_type = page_grading`, so all three categories share one
-conduct screen, one Grade/Compliance/Risk vocabulary and one scoring rollup.
-The category changes which questions are asked, never how they are answered.
+Every checkpoint is `response_type = page_grading`, so all three categories
+share one conduct screen, one scoring rollup and one report shape.
+
+PAGE_IMS is the one category that also differs in HOW it is answered, and both
+differences are declared on its categories rather than coded anywhere:
+
+  • `segregation: DEPARTMENT` — a category here is HR / Admin / OHC, not a
+    management-system standard. Page conduct one audit per department and
+    assess each against both source sheets.
+  • `conformance_mode: TRISTATE` — Conformance / Non-Conformance / Observation,
+    the header of column E on both sheets, in place of the seven-value status
+    ladder. It resolves to the same grade + status underneath.
+
+Each checkpoint also carries `stream` (IMS | ENMS — which of the two reports it
+belongs to), `replication_key` (the same line in another department) and
+`pair_key` (the same requirement on the other sheet). All three are read by the
+runtime; none of them is inferred from the code.
 
 Idempotent: upserts by industryCode. Audits already materialised from either
 library are untouched — they hold their own snapshot rows.
@@ -35,6 +48,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 # Running a FILE puts `scripts/` on sys.path, not the backend root, so `app` is
@@ -54,7 +68,7 @@ VERSION = "2026.1"
 LIBRARIES = [
     {
         "industry_code": "PAGE_IMS",
-        "industry_name": "Page Industries — QMS, EMS & OHS",
+        "industry_name": "Page Industries — QMS, EMS, OHS by department",
         "data": DATA_DIR / "page_ims_checkpoints.json",
         "standard": "ISO 9001:2015 / ISO 14001:2015 / ISO 45001:2018 / ISO 50001:2018",
     },
@@ -138,18 +152,32 @@ def main() -> None:
                 )
                 verb = "Created"
 
+        axis = (
+            "departments"
+            if any((c.get("segregation") or "").upper() == "DEPARTMENT" for c in categories)
+            else "disciplines"
+        )
         print(
             f"{verb} {spec['industry_code']} — {count} checkpoints across "
-            f"{len(categories)} disciplines."
+            f"{len(categories)} {axis}."
         )
         for cat in categories:
+            cps = cat["checkpoints"]
             statutory = sum(
-                1 for cp in cat["checkpoints"]
-                if cp.get("requirement_type") == "STATUTORY_REGULATORY"
+                1 for cp in cps if cp.get("requirement_type") == "STATUTORY_REGULATORY"
             )
+            # The stream split is what the two reports are cut on, so a
+            # department that silently lost one of them has to be visible here
+            # rather than at the moment a report comes out empty.
+            streams = ""
+            if any(cp.get("stream") for cp in cps):
+                by_stream = Counter(cp.get("stream") for cp in cps if cp.get("stream"))
+                pairs = len({cp["pair_key"] for cp in cps if cp.get("pair_key")})
+                streams = ("  [" + ", ".join(f"{k} {v}" for k, v in sorted(by_stream.items()))
+                           + f", {pairs} paired]")
             print(
-                f"  {cat['category_name'][:48]:<50} {len(cat['checkpoints']):>3} checkpoints "
-                f"({statutory} statutory / {len(cat['checkpoints']) - statutory} internal)"
+                f"  {cat['category_name'][:40]:<42} {len(cps):>3} checkpoints "
+                f"({statutory} statutory / {len(cps) - statutory} internal){streams}"
             )
         print()
 

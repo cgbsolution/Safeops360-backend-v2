@@ -33,6 +33,7 @@ rather than loudly broken:
 from __future__ import annotations
 
 import json
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,9 @@ import pytest
 from app.services.audit_compliance import (
     AUDIT_CATEGORIES,
     library_audit_category,
+    library_conformance_mode,
+    library_segregation,
+    library_streams,
     library_subject_scope,
     list_audit_categories,
 )
@@ -52,12 +56,28 @@ DATA = Path(__file__).resolve().parents[1] / "app" / "seed" / "data"
 # section banner counted as a checkpoint) shows up here as a number that moved.
 SEEDED = {
     "INTERNAL": ("page_industries_checkpoints.json", 120, ["HR", "EHS", "PRODUCTION"]),
-    "MANAGEMENT_SYSTEMS": ("page_ims_checkpoints.json", 125, ["QMS", "EMS", "OHS", "ENMS"]),
+    # QMS/EMS/OHS is segregated by DEPARTMENT, and each department is assessed
+    # against BOTH source sheets. 40 IMS lines are common to all three
+    # departments, 20 more (the STP/ETP block) are Admin's alone, and all 22
+    # EnMS lines are common — so 3×(40+22) + 20 = 206.
+    "MANAGEMENT_SYSTEMS": (
+        "page_ims_checkpoints.json", 206, ["DEPT_HR", "DEPT_ADMIN", "DEPT_OHC"],
+    ),
     "SOCIAL_COMPLIANCE": (
         "page_social_compliance_checkpoints.json",
         45,
         ["LAWS", "HOURS", "WAGES", "HS", "FOA", "CHILD", "DISCRIM", "FORCED", "ENV"],
     ),
+}
+
+# What each department holds, per stream. Asserted rather than derived for the
+# same reason the totals are: this split IS the customer's requirement, and a
+# banner rename or an off-by-one in the Sl No range moves checkpoints between
+# departments silently.
+IMS_DEPARTMENTS = {
+    "DEPT_HR": {"IMS": 40, "ENMS": 22},
+    "DEPT_ADMIN": {"IMS": 60, "ENMS": 22},
+    "DEPT_OHC": {"IMS": 40, "ENMS": 22},
 }
 
 
@@ -194,21 +214,120 @@ def test_checkpoint_codes_are_unique_and_questions_non_empty(code: str):
             assert cp["question"].strip(), f"{cp['code']} has no question"
 
 
-def test_ims_disciplines_cite_their_own_standard():
-    """The workbook's three clause columns ARE the discipline split. A row lands
-    in QMS because column F carries a clause, so every QMS checkpoint must cite
-    ISO 9001 and carry a clause reference — a row citing the wrong standard means
-    the columns were read in the wrong order."""
-    expected = {
+# ── 3b. QMS/EMS/OHS is segregated by DEPARTMENT ───────────────────────────
+#
+# The customer conducts one audit per department (HR / Admin / OHC) and assesses
+# each against both sheets. The first build made the four ISO standards the
+# segregation axis, which cannot express "HR's SOP control is effective and
+# Admin's is not" — there was one QMS bucket covering all three at once.
+
+
+def test_ims_is_segregated_by_department_not_by_discipline():
+    cats = _load("page_ims_checkpoints.json")
+    assert [c["category_code"] for c in cats] == list(IMS_DEPARTMENTS)
+    assert [c["category_name"] for c in cats] == [
+        "Human Resources", "Administration", "Occupational Health Centre",
+    ]
+    for c in cats:
+        assert c["segregation"] == "DEPARTMENT"
+        assert c["audit_category"] == "MANAGEMENT_SYSTEMS"
+        assert c["subject_scope"] == "OWN_SITE"
+
+
+def test_each_department_holds_both_streams_in_the_right_proportions():
+    """Tab 1 rows 1–40 are common to all three departments and 41–60 (the
+    STP/ETP block) are Admin's alone; all 22 EnMS rows are common."""
+    for cat in _load("page_ims_checkpoints.json"):
+        got = Counter(cp["stream"] for cp in cat["checkpoints"])
+        assert dict(got) == IMS_DEPARTMENTS[cat["category_code"]], cat["category_code"]
+
+
+def test_the_admin_only_checkpoints_are_the_treatment_plant_block():
+    """The 20 lines Admin holds alone must be exactly the STP/ETP ones. If this
+    drifts, twenty checkpoints move between departments and nothing else fails."""
+    by_dept = {c["category_code"]: c for c in _load("page_ims_checkpoints.json")}
+    hr_keys = {cp["replication_key"] for cp in by_dept["DEPT_HR"]["checkpoints"]}
+    admin_only = [
+        cp for cp in by_dept["DEPT_ADMIN"]["checkpoints"]
+        if cp["replication_key"] not in hr_keys
+    ]
+    assert len(admin_only) == 20
+    for cp in admin_only:
+        assert cp["question"].startswith(("STP — ", "ETP — ")), cp["code"]
+
+
+def test_an_ims_checkpoint_cites_every_standard_it_is_assessed_against():
+    """Tab 1's three clause columns are no longer three disciplines — they are
+    the standards ONE line is assessed against. `standard_clauses` is the
+    structured form the standards rollup and the clause index aggregate on;
+    collapsing it into the display string would report the joined text as a
+    fourth standard and the three real ones as absent."""
+    known = {
         "QMS": "ISO 9001:2015",
         "EMS": "ISO 14001:2015",
-        "OHS": "ISO 45001:2018",
-        "ENMS": "ISO 50001:2018",
+        "OHSMS": "ISO 45001:2018",
+        "EnMS": "ISO 50001:2018",
     }
     for cat in _load("page_ims_checkpoints.json"):
         for cp in cat["checkpoints"]:
-            assert cp["standard"] == expected[cat["category_code"]]
-            assert cp["requirement_reference"].startswith("Clause ")
+            clauses = cp["standard_clauses"]
+            assert clauses, cp["code"]
+            for c in clauses:
+                assert known[c["code"]] == c["standard"], cp["code"]
+                assert c["clause"].strip(), cp["code"]
+            # The display strings must be the join of the structured form, or a
+            # reader would see one thing and the rollup would count another.
+            assert cp["standard"] == " · ".join(c["standard"] for c in clauses)
+            assert cp["requirement_reference"] == " · ".join(
+                f"{c['code']} {c['clause']}" for c in clauses
+            )
+            # An EnMS line cites ISO 50001 and only ISO 50001, and an IMS line
+            # never does — that is what makes the two reports separable.
+            is_enms = cp["stream"] == "ENMS"
+            assert all((c["code"] == "EnMS") is is_enms for c in clauses), cp["code"]
+
+
+def test_a_paired_checkpoint_has_exactly_one_twin_in_its_own_department():
+    """Ten requirements appear on both sheets and are conducted as one card with
+    an IMS / EnMS toggle. A pair key matching three rows (or one) would put a
+    verdict behind a toggle that hides the other half of it."""
+    for cat in _load("page_ims_checkpoints.json"):
+        pairs: dict[str, list[dict]] = defaultdict(list)
+        for cp in cat["checkpoints"]:
+            if cp["pair_key"]:
+                pairs[cp["pair_key"]].append(cp)
+        assert len(pairs) == 10, cat["category_code"]
+        for key, members in pairs.items():
+            assert len(members) == 2, f"{cat['category_code']}/{key}"
+            assert {m["stream"] for m in members} == {"IMS", "ENMS"}
+
+
+def test_a_common_checkpoint_shares_one_replication_key_across_departments():
+    """The replicate action matches on `replication_key` — never on the question
+    text (which carries a department prefix) and never on the checkpoint code
+    (which encodes the department). A key that failed to line up would make
+    "replicate across departments" silently find nothing."""
+    cats = _load("page_ims_checkpoints.json")
+    by_key: dict[str, set[str]] = defaultdict(set)
+    for cat in cats:
+        for cp in cat["checkpoints"]:
+            by_key[cp["replication_key"]].add(cat["category_code"])
+    # 40 IMS + 22 EnMS lines are in all three departments; 20 are Admin's alone.
+    counts = Counter(len(v) for v in by_key.values())
+    assert counts == Counter({3: 62, 1: 20})
+    # And the key is the workbook's own identity: stream + Sl No.
+    for cat in cats:
+        for cp in cat["checkpoints"]:
+            assert cp["replication_key"] == f"{cp['stream']}-{cp['code'].rsplit('-', 1)[1]}"
+
+
+def test_ims_answers_on_the_three_customer_parameters():
+    """Conformance / Non-Conformance / Observation — the header of column E on
+    both sheets. Declared on the category so it is snapshotted onto every
+    materialised row and an audit keeps being read against the vocabulary it was
+    conducted under."""
+    for cat in _load("page_ims_checkpoints.json"):
+        assert cat["conformance_mode"] == "TRISTATE"
 
 
 def test_ims_carries_the_workbooks_audit_reference_as_guidance():
@@ -281,13 +400,45 @@ def test_discipline_codes_do_not_collide_across_categories():
     """The programme resolves a slot's library by which one covers the most
     planned discipline codes (`programme/materialise._library_for`). Two
     categories sharing a code would make that resolution ambiguous, and a slot
-    could materialise against the wrong checklist."""
+    could materialise against the wrong checklist.
+
+    This is why the departments are coded `DEPT_HR` and not `HR`:
+    PAGE_INDUSTRIES already owns an `HR` discipline.
+    """
     seen: dict[str, str] = {}
     for code, (name, _total, _discs) in SEEDED.items():
         for cat in _load(name):
             dup = seen.get(cat["category_code"])
             assert dup is None, f"{cat['category_code']} is in both {dup} and {code}"
             seen[cat["category_code"]] = code
+
+
+# ── 5. The classifiers the two wizards and the conduct screen read ────────
+
+
+def test_the_library_classifiers_agree_with_the_seeded_content():
+    """All three are DERIVED from the content rather than stored, for the same
+    reason as `library_subject_scope`: nothing to backfill and no stored flag
+    that can contradict the checkpoints underneath it."""
+    ims = _load("page_ims_checkpoints.json")
+    assert library_segregation(ims) == "DEPARTMENT"
+    assert library_conformance_mode(ims) == "TRISTATE"
+    assert library_streams(ims) == ["IMS", "ENMS"]
+
+    # And every other library keeps the behaviour it had. A discipline library
+    # reporting DEPARTMENT would relabel the whole scheduling wizard.
+    for name in ("page_industries_checkpoints.json", "page_social_compliance_checkpoints.json"):
+        cats = _load(name)
+        assert library_segregation(cats) == "DISCIPLINE"
+        assert library_conformance_mode(cats) == "FULL"
+        assert library_streams(cats) == []
+
+
+def test_a_mixed_library_is_not_reported_as_tristate():
+    """The wizard's summary must not promise the narrower control for
+    checkpoints that will not offer it."""
+    mixed = [{"conformance_mode": "TRISTATE"}, {"conformance_mode": "FULL"}]
+    assert library_conformance_mode(mixed) == "FULL"
 
 
 def test_every_category_grades_in_the_internal_audit_format():

@@ -19,7 +19,7 @@ from app.models.permit import (
     PermitToolEquipment,
     PermitType,
 )
-from app.models.plant import Plant
+from app.models.plant import Area, Plant
 from app.models.training import TrainingProgram, TrainingRecord
 from app.models.user import User
 from app.models.workflow import Action, WorkflowHistory, WorkflowInstance
@@ -32,6 +32,7 @@ from app.schemas.permit import (
     SuspendRequest,
 )
 from app.services import workflow_engine
+from app.services.register_view import status_counts, workflow_chips
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -71,7 +72,10 @@ async def list_permits(
     if not read_check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, read_check.reason or "Access denied")
     plants = await get_accessible_plants(db, user.id)
-    stmt = select(Permit)
+    # Soft-deleted permits are never part of the register. The list was
+    # missing this filter while the frontend's own count query applied it, so
+    # the tab totals and the rows disagreed on deleted records.
+    stmt = select(Permit).where(Permit.isDeleted.is_(False))
     # Archived permits (retention flag on CLOSED) are hidden from the
     # default register; ?include_archived=true surfaces them.
     if not include_archived:
@@ -79,7 +83,7 @@ async def list_permits(
     if plants is None:
         pass
     elif not plants:
-        return {"items": [], "total": 0}
+        return {"items": [], "total": 0, "statusCounts": {}, "typeCounts": {}}
     else:
         stmt = stmt.where(Permit.plantId.in_(plants))
     if read_check.matched_scope == "OWN_RECORDS":
@@ -93,8 +97,40 @@ async def list_permits(
             | (Permit.receiverId == user.id)
             | (Permit.id.in_(crew_subq))
         )
-    rows = (await db.execute(stmt.order_by(Permit.createdAt.desc()).limit(100))).scalars().all()
-    return {"items": [PermitOut.model_validate(r) for r in rows], "total": len(rows)}
+    # Scope-only SELECT — the basis for the tab counts, which describe the
+    # caller's whole accessible register rather than this page of rows.
+    scoped = stmt
+    status_map = await status_counts(db, scoped, Permit.status)
+    type_map = await status_counts(db, scoped, Permit.type)
+
+    rows = (await db.execute(scoped.order_by(Permit.createdAt.desc()).limit(100))).scalars().all()
+
+    plant_names = dict(
+        (
+            await db.execute(
+                select(Plant.id, Plant.name).where(Plant.id.in_({r.plantId for r in rows}))
+            )
+        ).all()
+    ) if rows else {}
+    area_ids = {r.areaId for r in rows if r.areaId}
+    area_names = dict(
+        (await db.execute(select(Area.id, Area.name).where(Area.id.in_(area_ids)))).all()
+    ) if area_ids else {}
+    chips = await workflow_chips(db, "PTW", [r.id for r in rows])
+
+    items = []
+    for r in rows:
+        item = PermitOut.model_validate(r).model_dump()
+        item["plantName"] = plant_names.get(r.plantId)
+        item["areaName"] = area_names.get(r.areaId) if r.areaId else None
+        item["workflow"] = chips.get(r.id)
+        items.append(item)
+    return {
+        "items": items,
+        "total": len(items),
+        "statusCounts": status_map,
+        "typeCounts": type_map,
+    }
 
 
 @router.post("", response_model=PermitOut, status_code=status.HTTP_201_CREATED)
@@ -400,12 +436,12 @@ async def create_permit(
     return PermitOut.model_validate(permit)
 
 
-@router.get("/{permit_id}", response_model=PermitOut)
+@router.get("/{permit_id}")
 async def get_permit(
     permit_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> PermitOut:
+) -> dict[str, Any]:
     permit = await db.get(Permit, permit_id)
     if permit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Permit not found")
@@ -420,7 +456,158 @@ async def get_permit(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    return PermitOut.model_validate(permit)
+
+    out: dict[str, Any] = PermitOut.model_validate(permit).model_dump()
+
+    def _cols(row) -> dict[str, Any]:
+        return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+    # ── Header identities ─────────────────────────────────────────────
+    plant = await db.get(Plant, permit.plantId)
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+    area = await db.get(Area, permit.areaId) if permit.areaId else None
+    out["area"] = {"id": area.id, "name": area.name} if area else None
+
+    party_ids = {
+        pid
+        for pid in (permit.originatorId, permit.issuerId, permit.receiverId)
+        if pid
+    }
+    parties = {
+        uid: {"id": uid, "name": name, "designation": desig}
+        for uid, name, desig in (
+            await db.execute(
+                select(User.id, User.name, User.designation).where(User.id.in_(party_ids))
+            )
+        ).all()
+    } if party_ids else {}
+    out["originator"] = parties.get(permit.originatorId)
+    out["issuer"] = parties.get(permit.issuerId)
+    out["receiver"] = parties.get(permit.receiverId)
+
+    # ── Child collections, each ordered the way the page reads them ───
+    # One helper query per child + a single name lookup, rather than a join
+    # per row: these tables are small per permit but the name columns repeat.
+    async def _named(model, order_by, *user_cols, limit: int | None = None):
+        stmt = select(model).where(model.permitId == permit.id).order_by(order_by)
+        if limit:
+            stmt = stmt.limit(limit)
+        rows = (await db.execute(stmt)).scalars().all()
+        ids = {getattr(r, c) for r in rows for c in user_cols if getattr(r, c, None)}
+        names = dict(
+            (await db.execute(select(User.id, User.name).where(User.id.in_(ids)))).all()
+        ) if ids else {}
+        return rows, names
+
+    from app.models.permit import (
+        PermitActionEvidence,
+        PermitApproval,
+        PermitExtension,
+        PermitGasTestReading,
+        PermitSuspension,
+    )
+    from app.models.flra import FLRA, FLRACrewSignature
+
+    # Crew — the roster the FLRA and activation gate both key off.
+    crew_rows = (
+        await db.execute(
+            select(PermitCrewMember, User.id, User.name, User.designation)
+            .outerjoin(User, User.id == PermitCrewMember.userId)
+            .where(PermitCrewMember.permitId == permit.id)
+        )
+    ).all()
+    out["workCrew"] = [
+        {**_cols(c), "user": {"id": uid, "name": name, "designation": desig}}
+        for c, uid, name, desig in crew_rows
+    ]
+
+    # FLRAs on this permit, each with its signature rows.
+    flras = (
+        await db.execute(select(FLRA).where(FLRA.permitId == permit.id))
+    ).scalars().all()
+    sigs_by_flra: dict[str, list[dict[str, Any]]] = {}
+    if flras:
+        sig_rows = (
+            await db.execute(
+                select(FLRACrewSignature).where(
+                    FLRACrewSignature.flraId.in_([f.id for f in flras])
+                )
+            )
+        ).scalars().all()
+        for sig in sig_rows:
+            sigs_by_flra.setdefault(sig.flraId, []).append(_cols(sig))
+    out["flras"] = [
+        {**_cols(f), "crewSignatures": sigs_by_flra.get(f.id, [])} for f in flras
+    ]
+
+    ext_rows, ext_names = await _named(
+        PermitExtension, PermitExtension.requestedAt.desc(), "requestedById", "approvedById"
+    )
+    out["extensions"] = [
+        {
+            **_cols(e),
+            "requestedBy": {"name": ext_names.get(e.requestedById)} if e.requestedById else None,
+            "approvedBy": {"name": ext_names.get(e.approvedById)} if e.approvedById else None,
+        }
+        for e in ext_rows
+    ]
+
+    isolations = (
+        await db.execute(
+            select(PermitIsolation).where(PermitIsolation.permitId == permit.id)
+        )
+    ).scalars().all()
+    out["isolations"] = [_cols(i) for i in isolations]
+
+    appr_rows = (
+        await db.execute(
+            select(PermitApproval, User.name, User.designation)
+            .outerjoin(User, User.id == PermitApproval.approverId)
+            .where(PermitApproval.permitId == permit.id)
+            .order_by(PermitApproval.decidedAt.asc())
+        )
+    ).all()
+    out["approvalsLog"] = [
+        {**_cols(a), "approver": {"name": name, "designation": desig}}
+        for a, name, desig in appr_rows
+    ]
+
+    susp_rows, susp_names = await _named(
+        PermitSuspension, PermitSuspension.suspendedAt.asc(), "suspendedById", "resumedById"
+    )
+    out["suspensions"] = [
+        {
+            **_cols(x),
+            "suspendedBy": {"name": susp_names.get(x.suspendedById)} if x.suspendedById else None,
+            "resumedBy": {"name": susp_names.get(x.resumedById)} if x.resumedById else None,
+        }
+        for x in susp_rows
+    ]
+
+    # Gas readings are capped at 50 like the page's own `take` — a confined
+    # space permit can accumulate hundreds and the card only charts the trend.
+    gas_rows, gas_names = await _named(
+        PermitGasTestReading, PermitGasTestReading.recordedAt.asc(), "recordedById", limit=50
+    )
+    out["gasTestReadings"] = [
+        {**_cols(g), "recordedBy": {"name": gas_names.get(g.recordedById)} if g.recordedById else None}
+        for g in gas_rows
+    ]
+
+    ev_rows, ev_names = await _named(
+        PermitActionEvidence, PermitActionEvidence.capturedAt.asc(), "actorId"
+    )
+    out["actionEvidence"] = [
+        {
+            **_cols(e),
+            "actor": {"name": ev_names.get(e.actorId)} if e.actorId else None,
+            # The gallery only needs the count, so photos are returned as bare
+            # ids rather than hydrated rows.
+            "photos": [],
+        }
+        for e in ev_rows
+    ]
+    return out
 
 
 @router.get("/{permit_id}/activation-gate")
@@ -763,11 +950,18 @@ async def resume_permit(
 @router.get("/eligible-for-flra/list")
 async def eligible_for_flra(
     q: str | None = None,
+    permitId: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Permits the caller can attach a fresh FLRA to. Drives the FLRA form's
-    linked-permit picker."""
+    linked-permit picker, and — with `permitId` — the pre-selected permit when
+    the New FLRA page is opened from a permit (`/flra/new?permitId=…`).
+
+    Items carry the nested `plant`, `receiver`, `workCrew` and `flras` the form
+    needs to seed its crew roster. A bare PermitOut omits them, which silently
+    left the roster empty because the form falls back to `?? []`.
+    """
     eligible_statuses = [
         # Closed-loop states: FLRA is prepared between issue and acceptance.
         PermitStatus.APPROVED,
@@ -778,7 +972,14 @@ async def eligible_for_flra(
         PermitStatus.SAFETY_APPROVED,
         PermitStatus.PLANT_HEAD_APPROVED,
     ]
-    stmt = select(Permit).where(Permit.status.in_(eligible_statuses))
+    stmt = select(Permit)
+    if permitId:
+        # Explicit lookup: the caller already chose this permit, so status
+        # eligibility is not re-imposed — the page still needs to render a
+        # permit that has since moved on. Access is enforced below.
+        stmt = stmt.where(Permit.id == permitId)
+    else:
+        stmt = stmt.where(Permit.status.in_(eligible_statuses))
     if q:
         like = f"%{q}%"
         stmt = stmt.where(
@@ -801,4 +1002,70 @@ async def eligible_for_flra(
     rows = (
         await db.execute(stmt.order_by(Permit.createdAt.desc(), Permit.id.desc()).limit(50))
     ).scalars().all()
-    return {"items": [PermitOut.model_validate(r) for r in rows]}
+    if not rows:
+        return {"items": []}
+
+    # ── Enrich with the nested objects the FLRA form reads ──────────────
+    from app.models.permit import PermitCrewMember
+    from app.models.flra import FLRA
+    from app.models.plant import Plant
+
+    permit_ids = [p.id for p in rows]
+
+    plant_rows = (
+        await db.execute(
+            select(Plant.id, Plant.name).where(Plant.id.in_({p.plantId for p in rows}))
+        )
+    ).all()
+    plant_by_id = {pid: {"id": pid, "name": name} for pid, name in plant_rows}
+
+    receiver_ids = {p.receiverId for p in rows if p.receiverId}
+    user_rows = (
+        await db.execute(select(User.id, User.name).where(User.id.in_(receiver_ids)))
+        if receiver_ids
+        else None
+    )
+    user_by_id = {uid: name for uid, name in user_rows.all()} if user_rows else {}
+
+    # Active crew only — a removed member must not reappear on a new FLRA.
+    crew_rows = (
+        await db.execute(
+            select(PermitCrewMember.permitId, PermitCrewMember.userId, User.id, User.name)
+            .join(User, User.id == PermitCrewMember.userId)
+            .where(PermitCrewMember.permitId.in_(permit_ids))
+            .where(PermitCrewMember.removedAt.is_(None))
+        )
+    ).all()
+    crew_by_permit: dict[str, list[dict[str, Any]]] = {}
+    for pid, uid, u_id, u_name in crew_rows:
+        crew_by_permit.setdefault(pid, []).append(
+            {"userId": uid, "user": {"id": u_id, "name": u_name}}
+        )
+
+    # Existing FLRAs — the picker greys out permits that already have one.
+    flra_rows = (
+        await db.execute(
+            select(FLRA.permitId, FLRA.id, FLRA.status)
+            .where(FLRA.permitId.in_(permit_ids))
+            .where(FLRA.status.in_(["IN_PROGRESS", "COMPLETED"]))
+        )
+    ).all()
+    flras_by_permit: dict[str, list[dict[str, Any]]] = {}
+    for pid, fid, fstatus in flra_rows:
+        flras_by_permit.setdefault(pid, []).append(
+            {"id": fid, "status": fstatus.value if hasattr(fstatus, "value") else fstatus}
+        )
+
+    items = []
+    for p in rows:
+        item = PermitOut.model_validate(p).model_dump()
+        item["plant"] = plant_by_id.get(p.plantId)
+        item["receiver"] = (
+            {"id": p.receiverId, "name": user_by_id.get(p.receiverId, "")}
+            if p.receiverId
+            else None
+        )
+        item["workCrew"] = crew_by_permit.get(p.id, [])
+        item["flras"] = flras_by_permit.get(p.id, [])
+        items.append(item)
+    return {"items": items}

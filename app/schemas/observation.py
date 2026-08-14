@@ -135,6 +135,19 @@ class ObservationOut(BaseModel):
     status: ObservationStatus
     createdAt: datetime
     updatedAt: datetime
+
+    # Submit-time auto-detections + cross-module trigger output. Present in the
+    # schema since the beginning but absent from this model until the detail
+    # view needed them for its "Related Items" block.
+    isRepeat: bool = False
+    similarObservationIds: list[str] | None = None
+    activePermitId: str | None = None
+    permitReviewFlagged: bool = False
+    triggeredInspectionId: str | None = None
+    triggeredTbtId: str | None = None
+    triggeredCapaId: str | None = None
+    contributedToIncidentId: str | None = None
+    closureTriggers: list | None = None
     # AI agent outputs persisted by the workflow engine (rule_triage_on_submit
     # + rule_lessons_distribution). Shape: [{ruleId, ruleName, fired, data}].
     # The mobile / web clients render whatever the rules emitted; an empty

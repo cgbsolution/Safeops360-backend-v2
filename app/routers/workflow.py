@@ -712,6 +712,26 @@ async def my_count(
         ).scalar_one()
     )
 
+    overdue_strict = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(WorkflowTask)
+                .where(WorkflowTask.assignedToId == user.id)
+                .where(WorkflowTask.status.in_(("OVERDUE", "ESCALATED")))
+            )
+        ).scalar_one()
+    )
+    submitted_instances = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(WorkflowInstance)
+                .where(WorkflowInstance.initiatedById == user.id)
+            )
+        ).scalar_one()
+    )
+
     return MyCountResponse(
         count=pending,
         pending=pending,
@@ -728,6 +748,8 @@ async def my_count(
         unreadPendingVerification=unread_pv,
         unreadOverdueEscalated=unread_oe,
         unreadNotifications=unread_notifications,
+        overdueStrict=overdue_strict,
+        submittedInstances=submitted_instances,
     )
 
 
@@ -1026,3 +1048,214 @@ async def mark_all_tasks_read(
     )
     await db.flush()
     return {"ok": True, "marked": int(result.rowcount or 0)}
+
+
+# ─── Per-record workflow state (the approval tracker panel) ──────────────────
+
+
+def _party(u: User | None, plant_name: str | None) -> dict[str, Any] | None:
+    """A User rendered as the frontend's PartyRow (see lib/workflow/party.ts).
+    `plant` stays nested so the shape matches what the Prisma `include` produced
+    and the tracker's toParty() keeps working untouched."""
+    if u is None:
+        return None
+    return {
+        "id": u.id,
+        "name": u.name,
+        "designation": u.designation,
+        "role": u.role,
+        "department": u.department,
+        "plant": {"name": plant_name} if plant_name is not None else None,
+    }
+
+
+@router.get("/state/{module}/{record_id}")
+async def get_record_workflow_state(
+    module: str,
+    record_id: str,
+    user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate only
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Everything the approval tracker on a record's detail page renders, in one
+    call: the instance, its definition's ordered steps, the full history with
+    actor identity, and the tasks currently hanging off it.
+
+    Replaces the `prisma.workflowInstance.findUnique({ include: { definition:
+    { steps }, history: { performedBy }, pendingTasks: { assignedTo } } })` that
+    every module detail page ran for itself.
+
+    Returns `{"instance": null}` when the record has no workflow — a valid state
+    for records that bypass the engine, and the reason this is a 200 rather than
+    a 404.
+
+    Tasks are returned UNFILTERED, exactly as the `pendingTasks` relation gave
+    them. Callers that only want live ones filter on status themselves — the
+    detail pages differ here (some show only PENDING/OVERDUE/ESCALATED, some
+    need the completed ones to draw the trail), so narrowing it here would
+    silently change one of them.
+    """
+    instance = (
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.module == module.upper())
+            .where(WorkflowInstance.recordId == record_id)
+        )
+    ).scalar_one_or_none()
+    if instance is None:
+        return {"instance": None}
+
+    definition = await db.get(WorkflowDefinition, instance.definitionId)
+
+    steps = (
+        await db.execute(
+            select(WorkflowStep)
+            .where(WorkflowStep.definitionId == instance.definitionId)
+            .order_by(WorkflowStep.sequence.asc())
+        )
+    ).scalars().all()
+
+    # History and tasks each join User (+ the user's plant) so the panel can
+    # name the actor without a second round-trip per row.
+    history_rows = (
+        await db.execute(
+            select(WorkflowHistory, User, Plant.name)
+            .outerjoin(User, User.id == WorkflowHistory.performedById)
+            .outerjoin(Plant, Plant.id == User.plantId)
+            .where(WorkflowHistory.instanceId == instance.id)
+            .order_by(WorkflowHistory.performedAt.asc())
+        )
+    ).all()
+
+    task_rows = (
+        await db.execute(
+            select(WorkflowTask, User, Plant.name)
+            .outerjoin(User, User.id == WorkflowTask.assignedToId)
+            .outerjoin(Plant, Plant.id == User.plantId)
+            .where(WorkflowTask.instanceId == instance.id)
+            .order_by(WorkflowTask.assignedAt.asc())
+        )
+    ).all()
+
+    def _enum(v: Any) -> Any:
+        return v.value if hasattr(v, "value") else v
+
+    return {
+        "instance": {
+            "id": instance.id,
+            "definitionId": instance.definitionId,
+            "module": instance.module,
+            "recordId": instance.recordId,
+            "recordNumber": instance.recordNumber,
+            "initiatedById": instance.initiatedById,
+            "status": instance.status,
+            "currentStepId": instance.currentStepId,
+            "currentStepName": instance.currentStepName,
+            "initiatedAt": instance.initiatedAt,
+            "completedAt": instance.completedAt,
+            "definition": (
+                None
+                if definition is None
+                else {
+                    "id": definition.id,
+                    "name": definition.name,
+                    "module": definition.module,
+                    "steps": [
+                        {
+                            "id": s.id,
+                            "sequence": s.sequence,
+                            "stepType": _enum(s.stepType),
+                            "name": s.name,
+                            "approverRole": s.approverRole,
+                            "approverField": s.approverField,
+                            "approverUserId": s.approverUserId,
+                            "approverGroupRoles": s.approverGroupRoles,
+                            "slaHours": s.slaHours,
+                            "slaUnit": s.slaUnit,
+                            "escalationRole": s.escalationRole,
+                            "isOptional": s.isOptional,
+                            "conditionExpr": s.conditionExpr,
+                            "notes": s.notes,
+                            "parallelStrategy": s.parallelStrategy,
+                        }
+                        for s in steps
+                    ],
+                }
+            ),
+            "history": [
+                {
+                    "id": h.id,
+                    "stepId": h.stepId,
+                    "stepName": h.stepName,
+                    "action": _enum(h.action),
+                    "performedById": h.performedById,
+                    "performedBy": _party(u, plant_name),
+                    "comments": h.comments,
+                    "attachments": h.attachments,
+                    "fromStatus": h.fromStatus,
+                    "toStatus": h.toStatus,
+                    "performedAt": h.performedAt,
+                }
+                for h, u, plant_name in history_rows
+            ],
+            "pendingTasks": [
+                {
+                    "id": t.id,
+                    "stepId": t.stepId,
+                    "stepName": t.stepName,
+                    "taskType": _enum(t.taskType),
+                    "module": t.module,
+                    "recordId": t.recordId,
+                    "recordNumber": t.recordNumber,
+                    "recordTitle": t.recordTitle,
+                    "assignedToId": t.assignedToId,
+                    "assignedTo": _party(u, plant_name),
+                    "status": t.status,
+                    "assignedAt": t.assignedAt,
+                    "dueAt": t.dueAt,
+                    "completedAt": t.completedAt,
+                    "priority": t.priority,
+                    "readAt": t.readAt,
+                }
+                for t, u, plant_name in task_rows
+            ],
+        }
+    }
+
+
+@router.get("/submitted")
+async def list_submitted_instances(
+    limit: int = 50,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Workflows this user started — the Inbox's "Submitted by me" tab.
+
+    Lists INSTANCES, not tasks. `/tasks?tab=submitted_by_me` returns the tasks
+    hanging off these instances, which is a different question: one submission
+    with three approvers is one row here and three there.
+    """
+    capped = max(1, min(limit, 200))
+    rows = (
+        await db.execute(
+            select(WorkflowInstance)
+            .where(WorkflowInstance.initiatedById == user.id)
+            .order_by(WorkflowInstance.initiatedAt.desc())
+            .limit(capped)
+        )
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": i.id,
+                "module": i.module,
+                "recordId": i.recordId,
+                "recordNumber": i.recordNumber,
+                "status": i.status,
+                "currentStepName": i.currentStepName,
+                "initiatedAt": i.initiatedAt,
+                "completedAt": i.completedAt,
+            }
+            for i in rows
+        ],
+        "total": len(rows),
+    }

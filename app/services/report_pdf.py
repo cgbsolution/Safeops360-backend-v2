@@ -470,11 +470,16 @@ def _insight_summary(pdf: _Report, snap: dict[str, Any]) -> None:
         pdf.set_text_color(0, 0, 0)
     pdf.ln(3)
 
-    # ── Compliance by discipline ──────────────────────────────────────────
+    # ── Compliance by discipline (or by department) ───────────────────────
+    #
+    # The axis is frozen into the snapshot at issue, so this document keeps
+    # naming what its own rows are even after the library is restructured.
+    # Absent reads as "discipline" — every report issued before departments.
+    _axis = "department" if snap.get("scopeAxis") == "DEPARTMENT" else "discipline"
     chart = [c for c in (ins.get("categoryChart") or []) if c.get("total")]
     if chart:
         _room(pdf, 12 + min(len(chart), 3) * 5.6)
-        _sub(pdf, "Compliance by discipline")
+        _sub(pdf, f"Compliance by {_axis}")
         for c in chart[:14]:
             _room(pdf, 9)
             y = pdf.get_y()
@@ -698,6 +703,24 @@ def render_audit_report_pdf(
     pdf.set_font("Helvetica", "B", 16)
     pdf.set_x(10)
     pdf.multi_cell(0, 9, snap.get("title") or "Audit Report", align="C")
+
+    # ── Which management system this document reports on ─────────────────
+    #
+    # A department audit is conducted once and reported TWICE — an IMS document
+    # (ISO 9001/14001/45001) and an EnMS one (ISO 50001). Every number in this
+    # snapshot is scoped to its own stream, so a cover that did not name the
+    # stream would let one half of the pair be read as the whole audit. Absent
+    # on every single-report audit, which is what `reportStream: null` means.
+    if snap.get("reportStreamTitle"):
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(0, 7, _s(snap["reportStreamTitle"]), border=0, ln=1, align="C")
+        if snap.get("reportStreamStandards"):
+            pdf.set_font("Helvetica", "", 10)
+            pdf.cell(0, 6, _s(snap["reportStreamStandards"]), border=0, ln=1, align="C")
+        pdf.set_text_color(0, 0, 0)
+
     pdf.ln(2)
     pdf.set_font("Helvetica", "B", 13)
     badge = RED if rtype.upper() == "INTERIM" else GREEN

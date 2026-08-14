@@ -4,6 +4,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models._base import Base, IdMixin
@@ -179,6 +180,25 @@ class Observation(Base, IdMixin):
     # under ruleId="rule_triage_on_submit" — Prisma's JSON column doesn't
     # need a separate aiTriage field.
     closureTriggers: Mapped[list | None] = mapped_column(JSON)
+
+    # ─── Submit-time auto-detections ──────────────────────────────────────
+    # Set by the API on creation. `isRepeat` drives the repeat-finding rule;
+    # `activePermitId` + `permitReviewFlagged` drive the permit-review rule at
+    # closure. Columns existed in Prisma from the start but were never carried
+    # into this model, so the detail view's "Related Items" block had no way to
+    # read them from the Python side.
+    isRepeat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    similarObservationIds: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    activePermitId: Mapped[str | None] = mapped_column(ForeignKey("Permit.id"))
+    permitReviewFlagged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # ─── Cross-module trigger output (post-closure rules engine) ──────────
+    # Each is the id of a record this observation spawned; the detail view
+    # reverse-links them under "Related Items".
+    triggeredInspectionId: Mapped[str | None] = mapped_column(ForeignKey("Inspection.id"))
+    triggeredTbtId: Mapped[str | None] = mapped_column(ForeignKey("TrainingRecord.id"))
+    triggeredCapaId: Mapped[str | None] = mapped_column(ForeignKey("Incident.id"))
+    contributedToIncidentId: Mapped[str | None] = mapped_column(ForeignKey("Incident.id"))
 
 
 class ObservationTaxonomy(Base, IdMixin):

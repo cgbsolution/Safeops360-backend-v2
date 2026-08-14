@@ -11,24 +11,27 @@ This file is the template for porting the remaining 7 operational modules.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
+from app.models.incident import Incident
+from app.models.permit import Permit
 from app.models.observation import (
     Observation,
     ObservationAttachment,
     ObservationCategory,
     ObservationStatus,
+    ObservationTaxonomy,
 )
 from app.models.observation_severity import OVERRIDE_SOURCE_EDIT
-from app.models.plant import Plant
+from app.models.plant import Area, Plant
 from app.models.user import User
 from app.models.workflow import WorkflowTask
 from app.schemas.observation import (
@@ -38,6 +41,7 @@ from app.schemas.observation import (
     ObservationUpdate,
 )
 from app.services import workflow_engine
+from app.services.register_view import status_counts, workflow_bottleneck, workflow_chips
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -82,13 +86,145 @@ async def _has_uploaded_attachment(db: AsyncSession, user_id: str, observation_i
     return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
+# ─── Register (list-screen) view model ───────────────────────────────
+
+# 180 days of unsafe records feed the "this week's focus" hero. Bounded so a
+# large tenant cannot turn the register into a full-table scan.
+_HERO_WINDOW_DAYS = 180
+_HERO_ROW_CAP = 5000
+
+
+async def _register_payload(db: AsyncSession, scoped, rows) -> dict[str, Any]:
+    """Everything the observations register renders, from one scoped SELECT."""
+    counts = await status_counts(db, scoped, Observation.status)
+
+    plant_names = dict(
+        (
+            await db.execute(
+                select(Plant.id, Plant.name).where(Plant.id.in_({r.plantId for r in rows}))
+            )
+        ).all()
+    ) if rows else {}
+    area_ids = {r.areaId for r in rows if r.areaId}
+    area_names = dict(
+        (
+            await db.execute(select(Area.id, Area.name).where(Area.id.in_(area_ids)))
+        ).all()
+    ) if area_ids else {}
+    chips = await workflow_chips(db, "OBSERVATION", [r.id for r in rows])
+
+    # Open backlog across the whole accessible set — NOT just this page, so the
+    # category and dwell panels agree with the tab counts above them.
+    open_scoped = scoped.where(Observation.status != "CLOSED")
+    open_rows = (
+        await db.execute(
+            open_scoped.with_only_columns(
+                Observation.id, Observation.category, Observation.areaId
+            ).limit(_HERO_ROW_CAP)
+        )
+    ).all()
+
+    # category x distinct-area rollup of the open backlog.
+    cat_agg: dict[str, dict[str, Any]] = {}
+    for _oid, category, area_id in open_rows:
+        key = category.value if hasattr(category, "value") else str(category)
+        entry = cat_agg.setdefault(key, {"count": 0, "areas": set()})
+        entry["count"] += 1
+        if area_id:
+            entry["areas"].add(area_id)
+    category_groups = sorted(
+        (
+            {"category": k, "count": v["count"], "areaCount": len(v["areas"])}
+            for k, v in cat_agg.items()
+        ),
+        key=lambda r: r["count"],
+        reverse=True,
+    )
+
+    bottleneck = await workflow_bottleneck(db, "OBSERVATION", [o[0] for o in open_rows])
+
+    # Hero source rows: at-risk records in the trailing window. Returned as a
+    # projection rather than a finished hero so the page keeps ownership of the
+    # copy and the click-through, which are presentation.
+    window_start = datetime.now(timezone.utc) - timedelta(days=_HERO_WINDOW_DAYS)
+    unsafe = (
+        await db.execute(
+            scoped.with_only_columns(
+                Observation.category,
+                Observation.subCategoryCode,
+                Observation.date,
+                Observation.status,
+                Observation.responsiblePersonId,
+                Observation.plantId,
+                Observation.areaId,
+            )
+            .where(Observation.type.in_(["UNSAFE_ACT", "UNSAFE_CONDITION"]))
+            .where(Observation.date >= window_start)
+            .limit(_HERO_ROW_CAP)
+        )
+    ).all()
+    hero_plant_ids = {u.plantId for u in unsafe}
+    hero_area_ids = {u.areaId for u in unsafe if u.areaId}
+    hero_plants = dict(
+        (
+            await db.execute(select(Plant.id, Plant.name).where(Plant.id.in_(hero_plant_ids)))
+        ).all()
+    ) if hero_plant_ids else {}
+    hero_areas = dict(
+        (
+            await db.execute(select(Area.id, Area.name).where(Area.id.in_(hero_area_ids)))
+        ).all()
+    ) if hero_area_ids else {}
+
+    def _v(x):
+        return x.value if hasattr(x, "value") else x
+
+    items = []
+    for r in rows:
+        item = ObservationOut.model_validate(r).model_dump()
+        item["plantName"] = plant_names.get(r.plantId)
+        item["areaName"] = area_names.get(r.areaId) if r.areaId else None
+        item["workflow"] = chips.get(r.id)
+        items.append(item)
+
+    return {
+        "items": items,
+        "total": len(items),
+        "statusCounts": counts,
+        "categoryGroups": category_groups,
+        "bottleneck": bottleneck,
+        "openCount": len(open_rows),
+        "unsafeRecords": [
+            {
+                "category": _v(u.category),
+                "subCategoryCode": u.subCategoryCode,
+                "date": u.date,
+                "status": _v(u.status),
+                "responsiblePersonId": u.responsiblePersonId,
+                "plantId": u.plantId,
+                "plantName": hero_plants.get(u.plantId),
+                "areaName": hero_areas.get(u.areaId) if u.areaId else None,
+            }
+            for u in unsafe
+        ],
+    }
+
+
 @router.get("", response_model=ObservationListResponse)
 async def list_observations(
     status_filter: str | None = None,
+    register: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> ObservationListResponse:
-    """List observations the caller can see. Plant-scoped server-side."""
+) -> Any:
+    """List observations the caller can see. Plant-scoped server-side.
+
+    `register=true` returns the full list-screen view model instead of the bare
+    item list: display names, status tab counts, the open category x area
+    breakdown, per-step dwell, and the unsafe-record projection the "this
+    week's focus" hero is built from. The web register needed eight separate
+    queries to assemble that; mobile still gets the plain shape by default.
+    """
     read_check = await can(db, user.id, "OBSERVATION.READ", PermissionContext())
     if not read_check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, read_check.reason or "Access denied")
@@ -114,16 +250,34 @@ async def list_observations(
 
     if status_filter:
         try:
-            stmt = stmt.where(Observation.status == ObservationStatus(status_filter))
+            ObservationStatus(status_filter)
         except ValueError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid status: {status_filter}") from e
+
+    # Scope-only SELECT, captured BEFORE the status filter and the page limit:
+    # the tab counts, the category breakdown, the dwell panel and the hero
+    # cluster all describe the caller's whole accessible register, not the
+    # hundred rows this page happens to return.
+    scoped = stmt
 
     # Newest-created first — platform-wide register convention. Ordering by the
     # user-entered event `date` buried a just-submitted record whenever the
     # event itself was backdated.
-    stmt = stmt.order_by(Observation.createdAt.desc(), Observation.id.desc()).limit(100)
-    rows = (await db.execute(stmt)).scalars().all()
-    return ObservationListResponse(items=[ObservationOut.model_validate(r) for r in rows], total=len(rows))
+    page = scoped
+    if status_filter:
+        page = page.where(Observation.status == ObservationStatus(status_filter))
+    rows = (
+        await db.execute(
+            page.order_by(Observation.createdAt.desc(), Observation.id.desc()).limit(100)
+        )
+    ).scalars().all()
+
+    if not register:
+        return ObservationListResponse(
+            items=[ObservationOut.model_validate(r) for r in rows], total=len(rows)
+        )
+
+    return await _register_payload(db, scoped, rows)
 
 
 @router.post("", response_model=ObservationOut, status_code=status.HTTP_201_CREATED)
@@ -397,12 +551,12 @@ async def create_observation(
     return out
 
 
-@router.get("/{observation_id}", response_model=ObservationOut)
+@router.get("/{observation_id}")
 async def get_observation(
     observation_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> ObservationOut:
+) -> dict[str, Any]:
     obs = await db.get(Observation, observation_id)
     if obs is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Observation not found")
@@ -419,15 +573,118 @@ async def get_observation(
     )
     if not result.allowed and not await _is_workflow_actor(db, user.id, observation_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    out = ObservationOut.model_validate(obs)
     # Detail view hydrates the named workers + their reviews; the list route
     # deliberately does not (one child query per row).
     from app.schemas.observation_sla import WorkerInvolvedOut
     from app.services import observation_deroster as deroster_svc
 
-    out.workersInvolved = [
+    validated = ObservationOut.model_validate(obs)
+    validated.workersInvolved = [
         WorkerInvolvedOut(**r) for r in await deroster_svc.load_workers_involved(db, obs.id)
     ]
+    out: dict[str, Any] = validated.model_dump()
+
+    # ── Display names + cross-module links the detail view renders ─────
+    plant = await db.get(Plant, obs.plantId)
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+    area = await db.get(Area, obs.areaId) if obs.areaId else None
+    out["area"] = {"id": area.id, "name": area.name} if area else None
+
+    people_ids = {
+        pid for pid in (obs.observerId, obs.responsiblePersonId) if pid
+    }
+    people = {
+        uid: {"id": uid, "name": name, "designation": desig}
+        for uid, name, desig in (
+            await db.execute(
+                select(User.id, User.name, User.designation).where(User.id.in_(people_ids))
+            )
+        ).all()
+    }
+    out["observer"] = people.get(obs.observerId)
+    out["responsiblePerson"] = (
+        people.get(obs.responsiblePersonId) if obs.responsiblePersonId else None
+    )
+
+    out["contractorCompany"] = None
+    if obs.contractorCompanyId:
+        from app.models.epc import ContractorCompany
+
+        company = await db.get(ContractorCompany, obs.contractorCompanyId)
+        out["contractorCompany"] = (
+            {"id": company.id, "name": company.name} if company else None
+        )
+
+    # The STOP taxonomy row behind categoryCode/subCategoryCode. Null on safe
+    # observations and on legacy at-risk rows the migration couldn't map.
+    out["stopTaxonomy"] = None
+    if obs.categoryCode and obs.subCategoryCode and obs.taxonomyAxis:
+        tax = (
+            await db.execute(
+                select(
+                    ObservationTaxonomy.categoryLabel,
+                    ObservationTaxonomy.subCategoryLabel,
+                    ObservationTaxonomy.stopReferenceCode,
+                )
+                .where(ObservationTaxonomy.categoryCode == obs.categoryCode)
+                .where(ObservationTaxonomy.subCategoryCode == obs.subCategoryCode)
+                .where(ObservationTaxonomy.observationType == obs.taxonomyAxis)
+            )
+        ).first()
+        if tax is not None:
+            out["stopTaxonomy"] = {
+                "categoryLabel": tax[0],
+                "subCategoryLabel": tax[1],
+                "stopReferenceCode": tax[2],
+            }
+
+    # Every value targetDate has held — the provenance trail the sidebar shows.
+    from app.models.observation_sla import ObservationTargetDateHistory
+
+    history = (
+        await db.execute(
+            select(ObservationTargetDateHistory)
+            .where(ObservationTargetDateHistory.observationId == obs.id)
+            .order_by(ObservationTargetDateHistory.changedAt.asc())
+        )
+    ).scalars().all()
+    out["targetDateHistory"] = [
+        {c.name: getattr(h, c.name) for c in h.__table__.columns} for h in history
+    ]
+
+    # ── "Related Items": the records this observation is linked to ─────
+    async def _ref(model, record_id: str | None) -> dict[str, Any] | None:
+        if not record_id:
+            return None
+        row = await db.get(model, record_id)
+        if row is None:
+            return None
+        return {"id": row.id, "number": getattr(row, "number", None)}
+
+    from app.models.equipment import Inspection
+
+    out["activePermit"] = await _ref(Permit, obs.activePermitId)
+    out["triggeredInspection"] = await _ref(Inspection, obs.triggeredInspectionId)
+    out["contributedToIncident"] = await _ref(Incident, obs.contributedToIncidentId)
+
+    # Coaching tasks spawned by the closure rules. The table is Prisma-only
+    # (no SQLAlchemy model yet), so it is read as plain SQL rather than being
+    # silently dropped from the payload.
+    try:
+        coaching = (
+            await db.execute(
+                text(
+                    'SELECT id, number, type, status FROM "CoachingTask" '
+                    'WHERE "fromObservationId" = :oid ORDER BY "createdAt"'
+                ),
+                {"oid": obs.id},
+            )
+        ).all()
+        out["coachingTasks"] = [
+            {"id": c[0], "number": c[1], "type": c[2], "status": c[3]} for c in coaching
+        ]
+    except Exception:  # noqa: BLE001 — table absent on older deployments
+        out["coachingTasks"] = []
     return out
 
 

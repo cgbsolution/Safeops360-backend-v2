@@ -1,8 +1,8 @@
 """Plants + Areas master-data router. Mounts at /api/plants.
 
-Created to give the mobile app's CAPA / HIRA / PTW create forms a stable
-endpoint for the plant picker. The web version reads plants directly from
-Prisma, but the mobile app needs a REST surface.
+The plant picker behind every create form (Observation, Near-Miss, Incident,
+PTW, FLRA, CAPA, HIRA) reads from here — web and mobile both, now that the web
+side no longer queries Prisma.
 
 Filtered to the plants the caller can act in — `get_accessible_plants(None)`
 means ADMIN sees everything, others see only their permitted scope.
@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
@@ -30,9 +31,17 @@ router = APIRouter(prefix="/api/plants", tags=["plants"])
 
 @router.get("")
 async def list_plants(
+    includeAreas: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    """The caller's accessible plants, name-ordered.
+
+    `includeAreas=true` nests each plant's areas. The create forms need plant +
+    area together to drive their two linked dropdowns; without it they would
+    have to follow up with one /{id}/areas call per plant, which is the N+1 the
+    Prisma version avoided with `include: { areas: true }`.
+    """
     plants = await get_accessible_plants(db, user.id)
     stmt = select(Plant)
     if plants is not None:
@@ -40,9 +49,13 @@ async def list_plants(
             return []
         stmt = stmt.where(Plant.id.in_(plants))
     stmt = stmt.order_by(Plant.name)
+    if includeAreas:
+        stmt = stmt.options(selectinload(Plant.areas))
     rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
+
+    out: list[dict[str, Any]] = []
+    for p in rows:
+        item: dict[str, Any] = {
             "id": p.id,
             "code": p.code,
             "name": p.name,
@@ -50,8 +63,13 @@ async def list_plants(
             "state": p.state,
             "unitType": p.unitType,
         }
-        for p in rows
-    ]
+        if includeAreas:
+            item["areas"] = [
+                {"id": a.id, "name": a.name, "plantId": a.plantId}
+                for a in sorted(p.areas, key=lambda a: a.name or "")
+            ]
+        out.append(item)
+    return out
 
 
 async def _assert_plant_accessible(db: AsyncSession, user: User, plant_id: str) -> None:
@@ -137,9 +155,13 @@ async def put_cost_config(
 @router.get("/{plant_id}/areas")
 async def list_plant_areas(
     plant_id: str,
-    user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, str]]:
+    # Being signed in is not enough: without this, any authenticated user could
+    # enumerate the area layout of a plant they have no grant on, just by
+    # guessing plant ids. Every other read on this router is scope-checked.
+    await _assert_plant_accessible(db, user, plant_id)
     rows = (
         await db.execute(
             select(Area).where(Area.plantId == plant_id).order_by(Area.name)

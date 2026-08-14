@@ -21,7 +21,7 @@ from app.models.flra import (
     FLRATeamMember,
 )
 from app.models.permit import Permit, PermitStatus
-from app.models.plant import Plant
+from app.models.plant import Area, Plant
 from app.models.training import TrainingProgram, TrainingRecord
 from app.models.user import User
 from app.models.workflow import Action, WorkflowHistory, WorkflowInstance
@@ -88,7 +88,16 @@ async def list_flras(
     if not read_check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, read_check.reason or "Access denied")
     plants = await get_accessible_plants(db, user.id)
-    stmt = select(FLRA)
+    # FLRA has no plant/leader/permit relationships declared, so the display
+    # names the register table renders are joined explicitly here. Doing it in
+    # one query keeps the list a single round-trip — the web page used to pull
+    # them via Prisma `select: { plant: { name }, leader: { name } }`.
+    stmt = (
+        select(FLRA, Plant.name, User.name, Permit.number)
+        .join(Plant, Plant.id == FLRA.plantId)
+        .join(User, User.id == FLRA.leaderId)
+        .outerjoin(Permit, Permit.id == FLRA.permitId)
+    )
     if plants is None:
         pass
     elif not plants:
@@ -98,8 +107,15 @@ async def list_flras(
     # Newest-created first — platform-wide register convention.
     rows = (
         await db.execute(stmt.order_by(FLRA.createdAt.desc(), FLRA.id.desc()).limit(100))
-    ).scalars().all()
-    return {"items": [FLRAOut.model_validate(r) for r in rows], "total": len(rows)}
+    ).all()
+    items = []
+    for flra, plant_name, leader_name, permit_number in rows:
+        item = FLRAOut.model_validate(flra).model_dump()
+        item["plantName"] = plant_name
+        item["leaderName"] = leader_name
+        item["permitNumber"] = permit_number
+        items.append(item)
+    return {"items": items, "total": len(items)}
 
 
 @router.post("", response_model=FLRAOut, status_code=status.HTTP_201_CREATED)
@@ -283,12 +299,12 @@ async def create_flra(
     return FLRAOut.model_validate(flra)
 
 
-@router.get("/{flra_id}", response_model=FLRAOut)
+@router.get("/{flra_id}")
 async def get_flra(
     flra_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> FLRAOut:
+) -> dict[str, Any]:
     flra = await db.get(FLRA, flra_id)
     if flra is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -301,7 +317,138 @@ async def get_flra(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    return FLRAOut.model_validate(flra)
+
+    out = FLRAOut.model_validate(flra).model_dump()
+
+    # ── People on the record ──────────────────────────────────────────
+    plant = await db.get(Plant, flra.plantId)
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+
+    leader = await db.get(User, flra.leaderId)
+    out["leader"] = (
+        {"id": leader.id, "name": leader.name, "designation": leader.designation}
+        if leader
+        else None
+    )
+    tbt_by = await db.get(User, flra.toolboxTalkById) if flra.toolboxTalkById else None
+    out["toolboxTalkBy"] = (
+        {"id": tbt_by.id, "name": tbt_by.name} if tbt_by else None
+    )
+
+    # ── The permit this FLRA gates, if any ────────────────────────────
+    out["permit"] = None
+    if flra.permitId:
+        permit = await db.get(Permit, flra.permitId)
+        if permit is not None:
+            permit_plant = await db.get(Plant, permit.plantId)
+            area = await db.get(Area, permit.areaId) if permit.areaId else None
+            out["permit"] = {
+                "id": permit.id,
+                "number": permit.number,
+                "type": permit.type.value if hasattr(permit.type, "value") else permit.type,
+                "status": permit.status.value if hasattr(permit.status, "value") else permit.status,
+                "plant": {"id": permit_plant.id, "name": permit_plant.name} if permit_plant else None,
+                "area": {"id": area.id, "name": area.name} if area else None,
+            }
+
+    # ── Crew, team, steps, declarations ───────────────────────────────
+    # Signature order is by signedAt so the page can show who signed when;
+    # unsigned rows sort last because signedAt is null.
+    crew_rows = (
+        await db.execute(
+            select(FLRACrewSignature, User.name, User.designation)
+            .outerjoin(User, User.id == FLRACrewSignature.userId)
+            .where(FLRACrewSignature.flraId == flra_id)
+            .order_by(FLRACrewSignature.signedAt.asc())
+        )
+    ).all()
+    out["crewSignatures"] = [
+        {
+            "id": c.id,
+            "userId": c.userId,
+            "signed": c.signed,
+            "signedAt": c.signedAt,
+            "refusedReason": getattr(c, "refusedReason", None),
+            "user": {"id": c.userId, "name": name, "designation": desig},
+        }
+        for c, name, desig in crew_rows
+    ]
+
+    team_rows = (
+        await db.execute(
+            select(FLRATeamMember, User.name, User.designation)
+            .outerjoin(User, User.id == FLRATeamMember.userId)
+            .where(FLRATeamMember.flraId == flra_id)
+        )
+    ).all()
+    out["teamMembers"] = [
+        {
+            "id": t.id,
+            "userId": t.userId,
+            "user": {"id": t.userId, "name": name, "designation": desig},
+        }
+        for t, name, desig in team_rows
+    ]
+
+    steps = (
+        await db.execute(
+            select(FLRAJobStep)
+            .where(FLRAJobStep.flraId == flra_id)
+            .order_by(FLRAJobStep.sequence)
+        )
+    ).scalars().all()
+    hazards_by_step: dict[str, list[dict[str, Any]]] = {}
+    if steps:
+        haz_rows = (
+            await db.execute(
+                select(FLRAStepHazard).where(
+                    FLRAStepHazard.jobStepId.in_([x.id for x in steps])
+                )
+            )
+        ).scalars().all()
+        for h in haz_rows:
+            hazards_by_step.setdefault(h.jobStepId, []).append(
+                {c.name: getattr(h, c.name) for c in h.__table__.columns}
+            )
+    out["jobSteps"] = [
+        {
+            **{c.name: getattr(x, c.name) for c in x.__table__.columns},
+            "hazards": hazards_by_step.get(x.id, []),
+        }
+        for x in steps
+    ]
+
+    fit_rows = (
+        await db.execute(
+            select(FLRAFitnessDeclaration, User.name)
+            .outerjoin(User, User.id == FLRAFitnessDeclaration.userId)
+            .where(FLRAFitnessDeclaration.flraId == flra_id)
+        )
+    ).all()
+    out["fitnessDeclarations"] = [
+        {
+            **{c.name: getattr(d, c.name) for c in d.__table__.columns},
+            "user": {"id": d.userId, "name": name},
+        }
+        for d, name in fit_rows
+    ]
+
+    # ── Re-do chain, both directions ──────────────────────────────────
+    out["supersededBy"] = None
+    if flra.supersededById:
+        newer = await db.get(FLRA, flra.supersededById)
+        out["supersededBy"] = {"id": newer.id, "number": newer.number} if newer else None
+    older = (
+        await db.execute(
+            select(FLRA.id, FLRA.number, FLRA.supersededReason).where(
+                FLRA.supersededById == flra_id
+            )
+        )
+    ).all()
+    out["supersedes"] = [
+        {"id": i, "number": n, "supersededReason": reason} for i, n, reason in older
+    ]
+    return out
 
 
 @router.patch("/{flra_id}", response_model=FLRAOut)

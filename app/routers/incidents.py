@@ -69,6 +69,7 @@ from app.services import (
     workflow_engine,
 )
 from app.services.audit_log import record_event
+from app.services.register_view import status_counts, workflow_chips
 from app.services.permissions import (
     PermissionContext,
     can,
@@ -101,29 +102,68 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 
 @router.get("")
 async def list_incidents(
+    status_filter: str | None = None,
+    type_filter: str | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    """The incident register: rows, plant names, status tab counts and the
+    workflow chip per row — everything the list screen renders, in one call.
+
+    `statusCounts` is deliberately computed over the caller's WHOLE accessible
+    set, before the status/type filters and the 100-row page are applied. Tab
+    counts that shrank as you filtered would be describing the page rather than
+    the register.
+    """
     read_check = await can(db, user.id, "INCIDENT.READ", PermissionContext())
     if not read_check.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, read_check.reason or "Access denied")
     plants = await get_accessible_plants(db, user.id)
-    stmt = select(Incident)
+    stmt = select(Incident).where(Incident.isDeleted.is_(False))
     if plants is None:
         pass
     elif not plants:
-        return {"items": [], "total": 0}
+        return {"items": [], "total": 0, "statusCounts": {}}
     else:
         stmt = stmt.where(Incident.plantId.in_(plants))
     if read_check.matched_scope == "OWN_RECORDS":
         stmt = stmt.where(Incident.reporterId == user.id)
+
+    # Scope-only SELECT — the basis for the tab counts.
+    scoped = stmt
+    counts = await status_counts(db, scoped, Incident.status)
+
+    page = scoped
+    if status_filter:
+        page = page.where(Incident.status == status_filter)
+    if type_filter:
+        page = page.where(Incident.type == type_filter)
+
     # Newest-created first — platform-wide register convention.
     rows = (
         await db.execute(
-            stmt.order_by(Incident.createdAt.desc(), Incident.id.desc()).limit(100)
+            page.order_by(Incident.createdAt.desc(), Incident.id.desc()).limit(100)
         )
     ).scalars().all()
-    return {"items": [IncidentOut.model_validate(r) for r in rows], "total": len(rows)}
+
+    plant_names = dict(
+        (
+            await db.execute(
+                select(Plant.id, Plant.name).where(
+                    Plant.id.in_({r.plantId for r in rows})
+                )
+            )
+        ).all()
+    ) if rows else {}
+    chips = await workflow_chips(db, "INCIDENT", [r.id for r in rows])
+
+    items = []
+    for r in rows:
+        item = IncidentOut.model_validate(r).model_dump()
+        item["plantName"] = plant_names.get(r.plantId)
+        item["workflow"] = chips.get(r.id)
+        items.append(item)
+    return {"items": items, "total": len(items), "statusCounts": counts}
 
 
 # ─── Phase 1 helpers ─────────────────────────────────────────────────
@@ -472,12 +512,12 @@ async def create_incident(
     return IncidentOut.model_validate(incident)
 
 
-@router.get("/{incident_id}", response_model=IncidentOut)
+@router.get("/{incident_id}")
 async def get_incident(
     incident_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-) -> IncidentOut:
+) -> dict[str, Any]:
     incident = await db.get(Incident, incident_id)
     if incident is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
@@ -488,7 +528,194 @@ async def get_incident(
     )
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
-    return IncidentOut.model_validate(incident)
+    # Soft-deleted incidents are gone as far as any reader is concerned.
+    if incident.isDeleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+
+    out: dict[str, Any] = IncidentOut.model_validate(incident).model_dump()
+
+    def _cols(row) -> dict[str, Any]:
+        return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+
+    # -- Header identities --------------------------------------------
+    from app.models.plant import Area
+
+    plant = await db.get(Plant, incident.plantId)
+    out["plant"] = {"id": plant.id, "name": plant.name} if plant else None
+    area = await db.get(Area, incident.areaId) if incident.areaId else None
+    out["area"] = {"id": area.id, "name": area.name} if area else None
+
+    reporter = await db.get(User, incident.reporterId) if incident.reporterId else None
+    out["reporter"] = (
+        {
+            "id": reporter.id,
+            "name": reporter.name,
+            "designation": reporter.designation,
+            "department": reporter.department,
+        }
+        if reporter
+        else None
+    )
+
+    out["department"] = None
+    if incident.departmentId:
+        from app.models.masters import Department
+
+        dept = await db.get(Department, incident.departmentId)
+        out["department"] = {"id": dept.id, "name": dept.name} if dept else None
+
+    out["fromNearMiss"] = None
+    if incident.sourceNearMissId:
+        from app.models.near_miss import NearMiss
+
+        nm = await db.get(NearMiss, incident.sourceNearMissId)
+        out["fromNearMiss"] = {"id": nm.id, "number": nm.number} if nm else None
+
+    # -- Child collections --------------------------------------------
+    async def _rows(model, order_by=None):
+        stmt = select(model).where(model.incidentId == incident.id)
+        if order_by is not None:
+            stmt = stmt.order_by(order_by)
+        return (await db.execute(stmt)).scalars().all()
+
+    team_rows = (
+        await db.execute(
+            select(IncidentInvestigationMember, User.id, User.name, User.designation)
+            .outerjoin(User, User.id == IncidentInvestigationMember.userId)
+            .where(IncidentInvestigationMember.incidentId == incident.id)
+        )
+    ).all()
+    out["investigationTeam"] = [
+        {**_cols(t), "user": {"id": uid, "name": name, "designation": desig}}
+        for t, uid, name, desig in team_rows
+    ]
+
+    person_rows = (
+        await db.execute(
+            select(IncidentPerson, User.name, User.designation)
+            .outerjoin(User, User.id == IncidentPerson.userId)
+            .where(IncidentPerson.incidentId == incident.id)
+        )
+    ).all()
+    company_ids = {
+        getattr(p, "contractorCompanyId", None)
+        for p, _n, _d in person_rows
+        if getattr(p, "contractorCompanyId", None)
+    }
+    companies = {}
+    if company_ids:
+        from app.models.epc import ContractorCompany
+
+        companies = dict(
+            (
+                await db.execute(
+                    select(ContractorCompany.id, ContractorCompany.name).where(
+                        ContractorCompany.id.in_(company_ids)
+                    )
+                )
+            ).all()
+        )
+    out["personsInvolved"] = [
+        {
+            **_cols(p),
+            "user": {"name": name, "designation": desig} if name else None,
+            "contractorCompany": (
+                {"name": companies.get(getattr(p, "contractorCompanyId", None))}
+                if getattr(p, "contractorCompanyId", None)
+                else None
+            ),
+        }
+        for p, name, desig in person_rows
+    ]
+
+    out["witnessStatements"] = [
+        _cols(x)
+        for x in await _rows(IncidentWitnessStatement, IncidentWitnessStatement.takenAt.asc())
+    ]
+    out["timelineEvents"] = [
+        _cols(x) for x in await _rows(IncidentTimelineEvent, IncidentTimelineEvent.sequence.asc())
+    ]
+    out["evidenceItems"] = [
+        _cols(x) for x in await _rows(IncidentEvidence, IncidentEvidence.collectedAt.desc())
+    ]
+    out["documentsReviewed"] = [_cols(x) for x in await _rows(IncidentDocumentReview)]
+
+    equip_rows = (
+        await db.execute(
+            select(IncidentEquipment).where(IncidentEquipment.incidentId == incident.id)
+        )
+    ).scalars().all()
+    equipment_ids = {e.equipmentId for e in equip_rows if getattr(e, "equipmentId", None)}
+    equipment = {}
+    if equipment_ids:
+        from app.models.equipment import Equipment
+
+        equipment = {
+            eid: {"code": code, "name": name}
+            for eid, code, name in (
+                await db.execute(
+                    select(Equipment.id, Equipment.code, Equipment.name).where(
+                        Equipment.id.in_(equipment_ids)
+                    )
+                )
+            ).all()
+        }
+    out["equipmentInvolved"] = [
+        {**_cols(e), "equipment": equipment.get(getattr(e, "equipmentId", None))}
+        for e in equip_rows
+    ]
+
+    capa_rows = (
+        await db.execute(
+            select(IncidentCapa, User.name)
+            .outerjoin(User, User.id == IncidentCapa.ownerId)
+            .where(IncidentCapa.incidentId == incident.id)
+            .order_by(IncidentCapa.createdAt.asc())
+        )
+    ).all()
+    out["capas"] = [
+        {**_cols(c), "owner": {"name": name} if name else None} for c, name in capa_rows
+    ]
+
+    recl_rows = (
+        await db.execute(
+            select(IncidentReclassification, User.name)
+            .outerjoin(User, User.id == IncidentReclassification.reclassifiedById)
+            .where(IncidentReclassification.incidentId == incident.id)
+            .order_by(IncidentReclassification.reclassifiedAt.asc())
+        )
+    ).all()
+    out["reclassifications"] = [
+        {**_cols(r), "reclassifiedBy": {"name": name} if name else None}
+        for r, name in recl_rows
+    ]
+
+    comment_rows = (
+        await db.execute(
+            select(IncidentComment, User.name, User.designation)
+            .outerjoin(User, User.id == IncidentComment.authorId)
+            .where(IncidentComment.incidentId == incident.id)
+            .order_by(IncidentComment.createdAt.asc())
+        )
+    ).all()
+    out["comments"] = [
+        {**_cols(c), "author": {"name": name, "designation": desig}}
+        for c, name, desig in comment_rows
+    ]
+
+    # The banner that nags for scene photos counts only live INITIAL_PHOTO rows.
+    out["initialPhotoCount"] = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(IncidentAttachment)
+                .where(IncidentAttachment.incidentId == incident.id)
+                .where(IncidentAttachment.category == "INITIAL_PHOTO")
+                .where(IncidentAttachment.deletedAt.is_(None))
+            )
+        ).scalar_one()
+    )
+    return out
 
 
 @router.patch("/{incident_id}", response_model=IncidentOut)

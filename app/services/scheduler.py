@@ -324,6 +324,22 @@ async def _job_chemical_threshold_sweep(db) -> dict:
     return {"sitesEvaluated": len(pairs), "rulesBreached": breached}
 
 
+async def _job_workflow_overdue_sweep(db) -> dict:
+    """Workflow task SLA: PENDING -> OVERDUE, then OVERDUE -> ESCALATED with a
+    parallel task for the step's escalation role. Used to run only when someone
+    opened /inbox, so an approval could sit past its SLA indefinitely on a quiet
+    day."""
+    from app.services.workflow_sweeps import sweep_overdue
+    return await sweep_overdue(db)
+
+
+async def _job_inspection_status_sweep(db) -> dict:
+    """Inspection scheduling states: SCHEDULED/DUE -> OVERDUE once past, and
+    SCHEDULED -> DUE inside the 3-day window."""
+    from app.services.workflow_sweeps import sweep_inspection_status
+    return await sweep_inspection_status(db)
+
+
 JOBS: dict[str, Job] = {j.id: j for j in [
     Job("kri_module_feeds", "KRI module feeds", 1 * HOUR, _job_kri_feeds),
     Job("treatment_pre_due_reminders", "Risk treatment pre-due reminders", 1 * DAY, _job_treatment_reminders),
@@ -343,6 +359,8 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("audit_trail_integrity", "Audit-trail hash-chain integrity check", 7 * DAY, _job_audit_integrity),
     Job("capture_voice_pipeline", "Field-capture voice transcription + translation", HOUR // 4, _job_capture_voice),
     Job("alerts_impact_resolver", "Daily Brief — impact-rule event resolver", 60, _job_alerts_resolver),
+    Job("workflow_overdue_sweep", "Workflow task SLA — overdue + escalation", 15 * 60, _job_workflow_overdue_sweep),
+    Job("inspection_status_sweep", "Inspection scheduling status recompute", 1 * HOUR, _job_inspection_status_sweep),
     Job("ptw_expiry_scan", "PTW T-24h expiring events + expiry flip", 1 * HOUR, _job_ptw_expiry_scan),
     Job("capa_overdue_scan", "CAPA overdue events (daily scan)", 1 * DAY, _job_capa_overdue_scan),
     Job("alert_digest", "Daily Brief 06:00 site-local email digest", 15 * 60, _job_alert_digest),

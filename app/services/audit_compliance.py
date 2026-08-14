@@ -19,6 +19,7 @@ import re
 import secrets
 import sys
 import traceback
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -148,6 +149,33 @@ def _apply_page_grading(
     `value` in the same payload, because the grade is what the auditor actually
     chose on screen and the value is derived from it.
     """
+    # ── The narrowed vocabulary, resolved before anything else ────────────
+    #
+    # A TRISTATE checkpoint is answered with one of Conformance /
+    # Non-Conformance / Observation. It is rewritten here into the grade +
+    # status the rest of this function already speaks, so the score, the
+    # routing, the CAPA rules and both reports need no branch of their own —
+    # the three parameters are a narrower FACE on the same verdict, exactly as
+    # the Page grade is a richer face on the engine's bucket.
+    #
+    # Done by mutating `payload` rather than by forking the logic below, so
+    # there is only ever one place that decides what a saved verdict means.
+    if "conformance" in payload:
+        raw = payload.get("conformance")
+        if raw in (None, ""):
+            payload = {**payload, "gradeAwarded": None, "complianceStatus": None}
+        else:
+            tri = page_grading.normalise_tristate(raw)
+            if tri is None:
+                raise ValueError(
+                    f"Unknown conformance '{raw}' — expected one of "
+                    + ", ".join(page_grading.TRISTATE_VERDICTS)
+                )
+            g, s = page_grading.TRISTATE_TO_GRADE_STATUS[tri]
+            # An explicit grade/status alongside a conformance token would make
+            # the row's meaning depend on which the server read first.
+            payload = {**payload, "gradeAwarded": g, "complianceStatus": s}
+
     grade_sent = "gradeAwarded" in payload
     value_sent = "value" in payload
 
@@ -187,7 +215,11 @@ def _apply_page_grading(
         if payload.get("riskGrade") not in (None, "") and risk is None:
             raise ValueError(f"Unknown risk grade '{payload.get('riskGrade')}'")
         resp.riskGrade = risk
-    if not page_grading.requires_risk_grade(grade):
+    # Cleared on the GRADE, not on whether the mode demands one: a
+    # Non-Conformance re-graded to Conformance must not keep reporting High
+    # risk, but a risk grade an auditor set on a tristate finding is theirs and
+    # is kept.
+    if not page_grading.carries_risk_grade(grade):
         resp.riskGrade = None
 
     # Score allotted (column D) is never the auditor's choice — it is 3 for a
@@ -241,6 +273,17 @@ def _response_to_dict(r: AuditCheckpointResponse, *, include_interactions: bool 
         "responseType": r.responseType,
         "sequence": r.sequence,
         "orderIndex": r.orderIndex,
+        # Department-segregated management-system audits. Null on every other
+        # library, which is how the client tells a department audit from a
+        # discipline one without being told which library it is looking at.
+        "streamCode": r.streamCode,
+        "replicationKey": r.replicationKey,
+        "pairKey": r.pairKey,
+        "conformanceMode": page_grading.normalise_conformance_mode(r.conformanceMode),
+        # The three-parameter face of the stored status, so a TRISTATE card can
+        # render its selection without re-deriving the mapping client-side.
+        "conformance": page_grading.tristate_for_status(r.complianceStatus),
+        "standardClauses": r.standardClauses or [],
         # Page Industries grading (checklist columns C–F, H, I).
         "requirementType": r.requirementType,
         "gradeAwarded": r.gradeAwarded,
@@ -465,6 +508,53 @@ def attachment_storage_path(
     return f"audit-compliance/{audit_id or 'unassigned'}/{seg}/{short}-{safe}"
 
 
+# ── Report streams ───────────────────────────────────────────────────
+#
+# A department audit is conducted once and reported twice. Page's own workbook
+# is two sheets — the IMS one (ISO 9001 / 14001 / 45001) and the EnMS one
+# (ISO 50001) — and their management review reads them as two documents against
+# two different certification scopes. So the stream is a property of the
+# CHECKPOINT (which sheet the line came off), and a report is a filter on it.
+#
+# Ordered as the workbook's tabs are, which is the order the reports are issued
+# and the order the conduct screen offers them in.
+STREAMS: tuple[str, ...] = ("IMS", "ENMS")
+
+STREAM_META: dict[str, dict[str, str]] = {
+    "IMS": {
+        "code": "IMS",
+        "label": "IMS",
+        "longLabel": "Integrated Management System",
+        "reportTitle": "Internal Audit Report — IMS",
+        "standards": "ISO 9001:2015, ISO 14001:2015 & ISO 45001:2018",
+        "color": "#7C3AED",
+    },
+    "ENMS": {
+        "code": "ENMS",
+        "label": "EnMS",
+        "longLabel": "Energy Management System",
+        "reportTitle": "Internal Audit Report — EnMS",
+        "standards": "ISO 50001:2018",
+        "color": "#CA8A04",
+    },
+}
+
+
+def normalise_stream(value: Any) -> str | None:
+    """Accept a stream code in any casing. Unknown / empty -> None.
+
+    None means "the whole audit", which is what every report was before streams
+    existed and what every single-stream library still produces — so it must
+    stay a legal value rather than an error.
+    """
+    s = str(value or "").strip().upper()
+    return s if s in STREAMS else None
+
+
+def list_streams() -> list[dict[str, str]]:
+    return [dict(STREAM_META[s]) for s in STREAMS]
+
+
 # ── Audit categories ─────────────────────────────────────────────────
 #
 # The scheduler's first choice. A category names the KIND of audit being run,
@@ -550,6 +640,54 @@ def library_audit_category(industry_code: str, categories: list[dict[str, Any]])
     return _CATEGORY_BY_INDUSTRY.get(industry_code)
 
 
+def library_segregation(categories: list[dict[str, Any]]) -> str:
+    """What a category of this library IS — a discipline or a department.
+
+    Derived from the content, like `library_subject_scope` and
+    `library_audit_category` and for the same reason: no column to backfill and
+    no stored flag that can contradict the checkpoints underneath it.
+
+    This is not cosmetic. The scheduling wizard, the programme wizard and the
+    conduct navigator all label this axis, and "Disciplines in scope" over a
+    list reading HR / Admin / OHC is simply a false statement on screen.
+    """
+    for c in categories or []:
+        if (c.get("segregation") or "").upper() == "DEPARTMENT":
+            return "DEPARTMENT"
+    return "DISCIPLINE"
+
+
+def library_conformance_mode(categories: list[dict[str, Any]]) -> str:
+    """FULL (seven-value status ladder) or TRISTATE (Conformance /
+    Non-Conformance / Observation). A library declares one; a mixed library
+    reports FULL, because the wizard's summary must not promise the narrower
+    control for checkpoints that will not offer it."""
+    modes = {
+        page_grading.normalise_conformance_mode(c.get("conformance_mode"))
+        for c in categories or []
+    }
+    return (
+        page_grading.CONFORMANCE_TRISTATE
+        if modes == {page_grading.CONFORMANCE_TRISTATE}
+        else page_grading.CONFORMANCE_FULL
+    )
+
+
+def library_streams(categories: list[dict[str, Any]]) -> list[str]:
+    """Which report streams this library's checkpoints belong to, in STREAMS
+    order. Empty for every library that is reported as one document."""
+    found: set[str] = set()
+    for c in categories or []:
+        for s in c.get("streams") or []:
+            if normalise_stream(s):
+                found.add(normalise_stream(s))
+        for cp in c.get("checkpoints") or []:
+            s = normalise_stream(cp.get("stream"))
+            if s:
+                found.add(s)
+    return [s for s in STREAMS if s in found]
+
+
 def list_audit_categories() -> list[dict[str, Any]]:
     """The category menu, for the scheduling wizard."""
     return [dict(c) for c in AUDIT_CATEGORIES]
@@ -581,6 +719,15 @@ async def list_libraries(db: AsyncSession) -> list[dict[str, Any]]:
                 # the supplier checklists. The wizard's category selector groups
                 # on this, and the disciplines it offers are this library's.
                 "auditCategory": library_audit_category(lib.industryCode, cats),
+                # DISCIPLINE | DEPARTMENT — what a "category" of this library is.
+                # The wizard labels its scope selector from this; without it a
+                # department library renders under "Disciplines in scope".
+                "segregation": library_segregation(cats),
+                # FULL | TRISTATE — which conformance control its checkpoints
+                # will offer during conduct.
+                "conformanceMode": library_conformance_mode(cats),
+                # The report streams it produces, empty when it is one document.
+                "streams": [dict(STREAM_META[s]) for s in library_streams(cats)],
                 # A library can be correctly scoped and still have no content —
                 # the buyer regimes ship as structure with zero checkpoints
                 # because the criteria are licensed. Selectable requires BOTH.
@@ -852,6 +999,45 @@ async def add_library_checkpoint(
             data.get("requirement_type")
         ),
     }
+
+    # ── A streamed library has no unstreamed checkpoints ──────────────────
+    #
+    # On a department library every line belongs to the IMS sheet or the EnMS
+    # one, and a report is a filter on that. A checkpoint authored here without
+    # a stream would materialise into every future audit and appear in NEITHER
+    # report — present in the register, absent from both documents, which is the
+    # hardest kind of gap to notice. So the stream is required as soon as the
+    # discipline has one, and an unknown token is rejected rather than dropped.
+    _dcat_streams = [
+        s for s in (cat.get("streams") or [])
+        if isinstance(s, str) and s.strip().upper() in STREAMS
+    ] or sorted({
+        (c.get("stream") or "").upper()
+        for c in (cat.get("checkpoints") or [])
+        if (c.get("stream") or "").upper() in STREAMS
+    })
+    if _dcat_streams:
+        raw = (data.get("stream") or "").strip().upper()
+        if not raw:
+            raise ValueError(
+                f"'{cat.get('category_name') or discipline_code}' is audited against "
+                f"{len(_dcat_streams)} separate reports — say which one this checkpoint "
+                f"belongs to ({', '.join(STREAM_META[s]['label'] for s in _dcat_streams)})."
+            )
+        if raw not in _dcat_streams:
+            raise ValueError(
+                f"Unknown stream '{data.get('stream')}' — expected one of "
+                + ", ".join(_dcat_streams)
+            )
+        cp["stream"] = raw
+        # No replication or pair key. A hand-authored line has no counterpart on
+        # the other sheet and no Sl No shared with another department, and
+        # inventing one would make the replicate action copy a verdict onto a
+        # checkpoint that is not the same question.
+        cp["replication_key"] = None
+        cp["pair_key"] = None
+        cp["standard_clauses"] = data.get("standard_clauses") or []
+
     cat["checkpoints"].append(cp)
     total = _recount(lib, cats)
     await db.flush()
@@ -1191,8 +1377,18 @@ def _is_terminal(r: AuditCheckpointResponse) -> bool:
     return False
 
 
-def _finalizability(audit: ComplianceAudit) -> dict[str, Any]:
-    """Whether every checkpoint is terminal; lists blockers otherwise."""
+def _finalizability(audit: ComplianceAudit, *, stream: str | None = None) -> dict[str, Any]:
+    """Whether every checkpoint is terminal; lists blockers otherwise.
+
+    `stream` narrows it to one report's checkpoints. A department audit issues
+    an IMS report and an EnMS report as separate documents, and the IMS one is
+    complete when every IMS checkpoint is resolved — holding it back because an
+    EnMS finding is still with its auditee would make the two documents
+    hostage to each other for no reason a reader could discover.
+    """
+    scoped = [
+        r for r in audit.responses if stream is None or r.streamCode == stream
+    ]
     blockers = [
         {
             "checkpointCode": r.checkpointCode,
@@ -1200,10 +1396,10 @@ def _finalizability(audit: ComplianceAudit) -> dict[str, Any]:
             "workflowState": r.workflowState,
             "assessmentStatus": r.assessmentStatus,
         }
-        for r in sorted(audit.responses, key=lambda x: (x.categoryId, x.sequence))
+        for r in sorted(scoped, key=lambda x: (x.categoryId, x.sequence))
         if not _is_terminal(r)
     ]
-    total = len(audit.responses)
+    total = len(scoped)
     # An audit can only be finalized after it has been submitted (the conduct →
     # submit → resolve → finalize lifecycle); an all-pass in-progress audit is
     # not yet finalizable — it must be submitted first.
@@ -1445,7 +1641,8 @@ async def list_checkpoints(
     value: str | None = None, criticality: str | None = None, q: str | None = None,
     grade: str | None = None, compliance_status: str | None = None,
     risk_grade: str | None = None, requirement_type: str | None = None,
-    assigned_auditor_id: str | None = None, cursor: str | None = None, limit: int = 50,
+    assigned_auditor_id: str | None = None, stream: str | None = None,
+    cursor: str | None = None, limit: int = 50,
 ) -> dict[str, Any]:
     """Paginated, filterable checkpoint slice for an audit. Cursor =
     "{sequence}:{id}", ordered by (sequence, id) for stable paging. Never loads
@@ -1467,6 +1664,13 @@ async def list_checkpoints(
         conds.append(R.assessmentStatus == mapped)
     if criticality:
         conds.append(R.criticality == criticality)
+    if stream:
+        code = stream.strip().upper()
+        if code not in STREAMS:
+            raise ValueError(
+                f"Invalid stream filter '{stream}' — expected one of {', '.join(STREAMS)}"
+            )
+        conds.append(R.streamCode == code)
     # Page grading filters. Each raises rather than silently returning
     # everything on an unknown token — a filter that quietly does nothing is
     # how an auditor concludes a discipline is clean when it isn't.
@@ -1611,6 +1815,242 @@ async def bulk_save_response(
     return {"ok": True, "updated": len(rows), "answered": answered, "value": value}
 
 
+# The verdict, and only the verdict. `replicate_response` copies these five
+# columns and nothing else — evidence, ownership, the iteration thread and any
+# CAPA belong to the department they were raised in, and a photograph of HR's
+# training register is not evidence about Admin's.
+_REPLICATED_COLUMNS = (
+    "gradeAwarded", "complianceStatus", "riskGrade", "scoreAllotted", "scoreObtained",
+)
+
+
+async def replicate_response(
+    db: AsyncSession, *, user: User, audit_id: str, checkpoint_code: str,
+    target_departments: list[str] | None = None, include_findings: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Copy one checkpoint's verdict onto the SAME workbook line in the other
+    departments of this audit.
+
+    40 of the 60 IMS lines and all 22 EnMS lines are common to HR, Admin and
+    OHC, so a department audit asks the same question three times. Answering it
+    three times by hand is both the rework the customer asked us to remove and
+    the way the three copies end up disagreeing about a single shared record.
+
+    Matching is on `replicationKey` — the workbook's own Sl No plus the stream —
+    never on the question text, which differs by department prefix, and never on
+    the checkpoint code, which encodes the department it belongs to.
+
+    Two things this deliberately will NOT do:
+
+      • Touch a row that is already graded, unless `overwrite` is asked for. The
+        auditor may have found Admin genuinely different from HR, and silently
+        overwriting that is worse than making them click twice.
+      • Touch a row whose finding is already in flight with its auditee
+        (AWAITING_AUDITEE and onwards). Re-grading underneath a live iteration
+        would rewrite the question the auditee is currently answering.
+    """
+    audit = await _load_audit(db, audit_id)
+    if audit is None:
+        raise ValueError("Audit not found")
+    if audit.status in ("closed", "cancelled"):
+        raise ValueError(f"Audit is {audit.status}; checkpoint responses are locked")
+
+    R = AuditCheckpointResponse
+    source = (
+        await db.execute(
+            select(R).where(R.auditId == audit_id, R.checkpointCode == checkpoint_code)
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        raise ValueError(f"Checkpoint {checkpoint_code} not found on this audit")
+    if not source.replicationKey:
+        raise ValueError(
+            f"{checkpoint_code} is specific to {source.categoryName} — it has no "
+            "counterpart in another department to replicate to."
+        )
+    if source.assessmentStatus == "NOT_ASSESSED":
+        raise ValueError("Grade this checkpoint before replicating it.")
+
+    conds = [
+        R.auditId == audit_id,
+        R.replicationKey == source.replicationKey,
+        R.id != source.id,
+        # Never reach into a live iteration — see the docstring.
+        R.workflowState.in_(["OPEN", "PASSED"]),
+    ]
+    if target_departments:
+        conds.append(R.categoryId.in_(list(target_departments)))
+    candidates = (await db.execute(select(R).where(*conds))).scalars().all()
+
+    now = _utcnow()
+    updated: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for target in candidates:
+        if target.assessmentStatus != "NOT_ASSESSED" and not overwrite:
+            skipped.append({
+                "checkpointCode": target.checkpointCode,
+                "department": target.categoryName,
+                "reason": "already graded",
+            })
+            continue
+        for col in _REPLICATED_COLUMNS:
+            setattr(target, col, getattr(source, col))
+        merged = dict(target.auditorResponse or {})
+        merged["value"] = (source.auditorResponse or {}).get("value")
+        # The auditor's comment travels with the verdict by default: a
+        # Non-Conformance replicated without the sentence explaining it is a
+        # finding nobody can act on, and `submit_audit` would reject the audit
+        # for exactly that. It is optional because a comment naming a specific
+        # HR record does not belong on the Admin row.
+        if include_findings:
+            merged["text_observation"] = (source.auditorResponse or {}).get("text_observation")
+            target.observation = source.observation
+        merged["responded_at"] = now.isoformat()
+        merged["is_saved"] = True
+        # Replication is an act, and the record has to say so — otherwise a
+        # reviewer reading three identical findings cannot tell three
+        # observations from one observation copied twice.
+        merged["replicated_from"] = source.checkpointCode
+        target.auditorResponse = merged
+        target.assessmentStatus = source.assessmentStatus
+        target.overallStatus = source.overallStatus
+        target.answeredAt = now
+        target.workflowState = "PASSED" if source.assessmentStatus in ("PASS", "NA") else "OPEN"
+        await _log_interaction(
+            db, instance=target, audit_id=audit.id, actor_id=user.id,
+            actor_role=_actor_role_for(user, audit), action="ASSESSED",
+            resulting_state=target.workflowState, round=0,
+            comment=(
+                f"Replicated from {source.checkpointCode} ({source.categoryName}) — "
+                "same checkpoint, another department."
+            ),
+            at=now,
+        )
+        updated.append(target.checkpointCode)
+
+    if audit.status == "scheduled" and updated:
+        audit.status = "in_progress"
+        if audit.actualStartAt is None:
+            audit.actualStartAt = now
+    await db.flush()
+
+    answered = (
+        await db.execute(
+            select(func.count(R.id)).where(R.auditId == audit_id)
+            .where(R.overallStatus.notlike("not_answered"))
+        )
+    ).scalar_one() or 0
+    audit.answeredCheckpoints = answered
+    await db.flush()
+    return {
+        "ok": True,
+        "sourceCheckpointCode": source.checkpointCode,
+        "replicationKey": source.replicationKey,
+        "updated": len(updated),
+        "updatedCheckpointCodes": updated,
+        "skipped": skipped,
+        "answered": answered,
+    }
+
+
+async def replication_targets(
+    db: AsyncSession, *, audit_id: str, checkpoint_code: str
+) -> dict[str, Any]:
+    """Which departments this checkpoint could be replicated to, and what state
+    each is in — so the confirm dialog names what it is about to overwrite
+    instead of reporting the damage afterwards."""
+    R = AuditCheckpointResponse
+    source = (
+        await db.execute(
+            select(R).where(R.auditId == audit_id, R.checkpointCode == checkpoint_code)
+        )
+    ).scalar_one_or_none()
+    if source is None:
+        raise ValueError(f"Checkpoint {checkpoint_code} not found on this audit")
+    if not source.replicationKey:
+        return {"checkpointCode": checkpoint_code, "replicationKey": None, "targets": []}
+    rows = (
+        await db.execute(
+            select(R).where(
+                R.auditId == audit_id,
+                R.replicationKey == source.replicationKey,
+                R.id != source.id,
+            ).order_by(R.categoryName)
+        )
+    ).scalars().all()
+    return {
+        "checkpointCode": source.checkpointCode,
+        "replicationKey": source.replicationKey,
+        "targets": [
+            {
+                "checkpointCode": r.checkpointCode,
+                "departmentId": r.categoryId,
+                "departmentName": r.categoryName,
+                "assessmentStatus": r.assessmentStatus,
+                "conformance": page_grading.tristate_for_status(r.complianceStatus),
+                "gradeAwarded": r.gradeAwarded,
+                # An in-flight finding is not replaceable at all; a graded row
+                # is replaceable but only on an explicit overwrite.
+                "locked": r.workflowState not in ("OPEN", "PASSED"),
+                "wouldOverwrite": r.assessmentStatus != "NOT_ASSESSED",
+            }
+            for r in rows
+        ],
+    }
+
+
+async def stream_rollup(db: AsyncSession, audit_id: str) -> list[dict[str, Any]]:
+    """Per-stream counts and points, via ONE grouped query.
+
+    The department rollup drives the navigator; this drives the two reports and
+    the "IMS 41/62 · EnMS 12/22" line the conduct header shows. Returns [] for
+    an audit whose checkpoints carry no stream, which is every audit outside the
+    department-segregated libraries — the caller then renders nothing rather
+    than an empty stream called "null".
+    """
+    R = AuditCheckpointResponse
+    A = R.assessmentStatus
+    rows = (
+        await db.execute(
+            select(
+                R.streamCode,
+                func.count(R.id).label("total"),
+                func.count(R.id).filter(A != "NOT_ASSESSED").label("answered"),
+                func.count(R.id).filter(A == "PASS").label("passed"),
+                func.count(R.id).filter(A == "PARTIAL").label("partial"),
+                func.count(R.id).filter(A == "FAIL").label("failed"),
+                func.count(R.id).filter(A == "NA").label("na"),
+                func.count(R.id).filter(
+                    and_(A == "FAIL", R.criticality == "critical")
+                ).label("criticalFailed"),
+                func.coalesce(func.sum(R.scoreAllotted), 0).label("scoreAllotted"),
+                func.coalesce(func.sum(R.scoreObtained), 0).label("scoreObtained"),
+            )
+            .where(R.auditId == audit_id, R.streamCode.isnot(None))
+            .group_by(R.streamCode)
+        )
+    ).all()
+    by_code = {r.streamCode: r for r in rows}
+    out = []
+    for code in STREAMS:
+        r = by_code.get(code)
+        if r is None:
+            continue
+        out.append({
+            **STREAM_META[code],
+            "total": r.total, "answered": r.answered, "passed": r.passed,
+            "partial": r.partial, "failed": r.failed, "na": r.na,
+            "criticalFailed": r.criticalFailed,
+            "scoreAllotted": int(r.scoreAllotted or 0),
+            "scoreObtained": int(r.scoreObtained or 0),
+            "scorePct": page_grading.compute_points_score(
+                obtained=int(r.scoreObtained or 0), allotted=int(r.scoreAllotted or 0)
+            ),
+        })
+    return out
+
+
 async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     """Slim detail payload (1500-checkpoint safe). Returns the audit header +
     discipline rollup + a BOUNDED review set (findings / in-flight rows with
@@ -1647,6 +2087,9 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     d["progress"] = _progress_from_rollup(rollup)
     d["finalizability"] = await _finalizability_db(db, audit)
     d["allocationSummary"] = await _allocation_summary(db, audit_id)
+    # Empty for every audit outside the department-segregated libraries, which
+    # is what tells the client there is one report here rather than two.
+    d["streamRollup"] = await stream_rollup(db, audit_id)
 
     # Bounded review set: adverse / in-flight rows (the only ones the detail page
     # acts on) WITH their interaction threads. Pass/NA/OPEN rows are reached via
@@ -1960,6 +2403,50 @@ def _route_auditor_for_category(category_code: str, co_auditors: list | None, le
             if category_code in (c.get("disciplineIds") or []) and c.get("userId"):
                 return c["userId"]
     return lead_id
+
+
+def _snapshot_fields(cat: dict[str, Any], cp: dict[str, Any]) -> dict[str, Any]:
+    """The library checkpoint's DEFINITION, frozen onto a response row.
+
+    Everything here is snapshotted rather than read live so a later library edit
+    cannot retroactively restate what an audit was assessed against — the same
+    rule `requirementType` was introduced under, now applied to the whole
+    definition.
+
+    Extracted because `create_audit` and `add_disciplines` materialise rows from
+    the same library with the same semantics, and they had two byte-identical
+    copies of this block. Adding the department/stream fields to one and not the
+    other would have meant a discipline added mid-audit silently landed in
+    neither report.
+
+    `conformance_mode` is read from the CATEGORY first: the vocabulary is a
+    property of the checklist, not of an individual line. A checkpoint may still
+    override it, which is what lets an ad-hoc line be added to a tristate
+    department without forcing the whole department onto the seven-value ladder.
+    """
+    return {
+        "checkpointQuestion": cp.get("question", ""),
+        "guidance": cp.get("guidance", ""),
+        "requirementReference": cp.get("requirement_reference", ""),
+        "standard": cp.get("standard", ""),
+        "criticality": cp.get("criticality", "major"),
+        "responseType": cp.get("response_type", "pass_partial_fail"),
+        "requirementType": page_grading.normalise_requirement_type(
+            cp.get("requirement_type")
+        ),
+        # ── Department-segregated management-system audits (PAGE_IMS) ─────
+        "streamCode": (cp.get("stream") or None),
+        "replicationKey": (cp.get("replication_key") or None),
+        "pairKey": (cp.get("pair_key") or None),
+        "conformanceMode": page_grading.normalise_conformance_mode(
+            cp.get("conformance_mode") or cat.get("conformance_mode")
+        ),
+        "standardClauses": cp.get("standard_clauses") or [],
+        "requiresPhotoOnFail": bool(cp.get("requires_photo_on_fail", False)),
+        "autoTriggerCapaOnFail": bool(cp.get("auto_trigger_capa_on_fail", False)),
+        "capaSeverity": cp.get("capa_severity_if_triggered"),
+        "linkedSafeopsModule": cp.get("linked_safeops_module"),
+    }
 
 
 # Titles that carry no information about the engagement. WP-01 soft-deleted the
@@ -2312,27 +2799,12 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
                     auditId=audit.id,
                     plantId=audit.plantId,
                     checkpointCode=code,
-                    checkpointQuestion=cp.get("question", ""),
-                    guidance=cp.get("guidance", ""),
-                    requirementReference=cp.get("requirement_reference", ""),
-                    standard=cp.get("standard", ""),
                     categoryId=cat_code,
                     categoryName=cat.get("category_name", ""),
                     categoryColor=cat.get("category_color", ""),
-                    criticality=cp.get("criticality", "major"),
-                    responseType=cp.get("response_type", "pass_partial_fail"),
-                    # Column I — master data, snapshotted with the rest of the
-                    # checkpoint definition so a later library edit cannot
-                    # retroactively restate what an audit was assessed against.
-                    requirementType=page_grading.normalise_requirement_type(
-                        cp.get("requirement_type")
-                    ),
+                    **_snapshot_fields(cat, cp),
                     sequence=seq,
                     orderIndex=order_in_disc,
-                    requiresPhotoOnFail=bool(cp.get("requires_photo_on_fail", False)),
-                    autoTriggerCapaOnFail=bool(cp.get("auto_trigger_capa_on_fail", False)),
-                    capaSeverity=cp.get("capa_severity_if_triggered"),
-                    linkedSafeopsModule=cp.get("linked_safeops_module"),
                     routedToUserId=owner,
                     assignedOwnerId=owner,
                     assignedAuditorId=auditor,
@@ -2506,27 +2978,12 @@ async def add_disciplines(
                     auditId=audit.id,
                     plantId=audit.plantId,
                     checkpointCode=code,
-                    checkpointQuestion=cp.get("question", ""),
-                    guidance=cp.get("guidance", ""),
-                    requirementReference=cp.get("requirement_reference", ""),
-                    standard=cp.get("standard", ""),
                     categoryId=cat_code,
                     categoryName=cat.get("category_name", ""),
                     categoryColor=cat.get("category_color", ""),
-                    criticality=cp.get("criticality", "major"),
-                    responseType=cp.get("response_type", "pass_partial_fail"),
-                    # Column I — master data, snapshotted with the rest of the
-                    # checkpoint definition so a later library edit cannot
-                    # retroactively restate what an audit was assessed against.
-                    requirementType=page_grading.normalise_requirement_type(
-                        cp.get("requirement_type")
-                    ),
+                    **_snapshot_fields(cat, cp),
                     sequence=seq,
                     orderIndex=order_in_disc,
-                    requiresPhotoOnFail=bool(cp.get("requires_photo_on_fail", False)),
-                    autoTriggerCapaOnFail=bool(cp.get("auto_trigger_capa_on_fail", False)),
-                    capaSeverity=cp.get("capa_severity_if_triggered"),
-                    linkedSafeopsModule=cp.get("linked_safeops_module"),
                     routedToUserId=owner,
                     assignedOwnerId=owner,
                     assignedAuditorId=auditor,
@@ -2568,6 +3025,7 @@ def _new_checkpoint_row(
     auto_capa: bool = False, capa_severity: str | None = None, linked_module: str | None = None,
     sequence: int, order_index: int, owner: str | None = None, auditor: str | None = None,
     is_adhoc: bool = False, added_by: str | None = None,
+    stream_code: str | None = None, conformance_mode: str | None = None,
 ) -> AuditCheckpointResponse:
     return AuditCheckpointResponse(
         auditId=audit.id, plantId=audit.plantId,
@@ -2575,6 +3033,17 @@ def _new_checkpoint_row(
         requirementReference=requirement_reference or "", standard=standard or "",
         categoryId=cat_code, categoryName=cat_name, categoryColor=cat_color or "",
         criticality=criticality or "major", responseType=response_type or "pass_partial_fail",
+        # A custom line added to a department audit belongs to one of the two
+        # streams and is answered in that department's vocabulary. Both are
+        # INHERITED from the sibling rows rather than asked for: an ad-hoc
+        # checkpoint with no stream would appear in neither report, and one on
+        # the seven-value ladder inside a tristate department would show the
+        # auditor a control none of the other cards have.
+        streamCode=stream_code,
+        # No replication or pair key: an ad-hoc line exists on this audit only,
+        # so it has no counterpart in another department or on the other sheet.
+        replicationKey=None, pairKey=None,
+        conformanceMode=page_grading.normalise_conformance_mode(conformance_mode),
         sequence=sequence, orderIndex=order_index,
         requiresPhotoOnFail=bool(requires_photo), autoTriggerCapaOnFail=bool(auto_capa),
         capaSeverity=capa_severity, linkedSafeopsModule=linked_module,
@@ -2658,12 +3127,16 @@ async def add_adhoc_checkpoint(
     if len(question) < 4:
         raise ValueError("question must be at least 4 characters")
 
-    # Resolve the discipline's display name/colour from existing rows, else the library.
+    # Resolve the discipline's display name/colour from existing rows, else the
+    # library. Its conformance vocabulary comes from the same place, for the
+    # same reason: a card offering three buttons among a department that answers
+    # on seven (or the reverse) is a control the auditor has no way to read.
     name: str | None = None
     color = ""
+    conformance_mode: str | None = None
     for r in audit.responses:
         if r.categoryId == disc_code:
-            name, color = r.categoryName, r.categoryColor
+            name, color, conformance_mode = r.categoryName, r.categoryColor, r.conformanceMode
             break
     if name is None:
         library = (
@@ -2678,6 +3151,22 @@ async def add_adhoc_checkpoint(
         if libcat is None:
             raise ValueError(f"Unknown discipline '{disc_code}'")
         name, color = libcat.get("category_name", ""), libcat.get("category_color", "")
+        conformance_mode = libcat.get("conformance_mode")
+
+    # Which stream a custom line joins. Offered as an explicit choice because in
+    # a department audit "add a checkpoint" is genuinely ambiguous — it could
+    # belong to either report — and defaulted to the stream the department
+    # mostly holds so a caller that does not know about streams still lands
+    # somewhere a report will print it.
+    stream_code = (payload.get("streamCode") or payload.get("stream") or "").upper() or None
+    dept_streams = [r.streamCode for r in audit.responses if r.categoryId == disc_code and r.streamCode]
+    if stream_code is not None and stream_code not in set(dept_streams):
+        raise ValueError(
+            f"Unknown stream '{stream_code}' for {name} — expected one of "
+            + (", ".join(sorted(set(dept_streams))) or "none (this checklist has no streams)")
+        )
+    if stream_code is None and dept_streams:
+        stream_code = Counter(dept_streams).most_common(1)[0][0]
 
     existing_codes = {r.checkpointCode for r in audit.responses}
     n_adhoc = (audit.adHocCount or 0) + 1
@@ -2699,6 +3188,7 @@ async def add_adhoc_checkpoint(
         standard=payload.get("standardClauseRef") or payload.get("standard", ""),
         requires_photo=bool(payload.get("evidenceRequiredOnFail")),
         sequence=seq, order_index=order_index, owner=owner, auditor=auditor, is_adhoc=True, added_by=user.id,
+        stream_code=stream_code, conformance_mode=conformance_mode,
     )
     db.add(row)
     await db.flush()
@@ -3335,7 +3825,7 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
                         raise ValueError("Audit findings are required before routing a finding.")
                     if resp.requiresPhotoOnFail and not (resp.auditorEvidenceIds or []):
                         raise ValueError("An evidence photo is required for this checkpoint before routing the finding.")
-                    if not resp.riskGrade:
+                    if page_grading.requires_risk_grade(resp.gradeAwarded, resp.conformanceMode) and not resp.riskGrade:
                         raise ValueError("A risk grade is required before routing a finding.")
                     owner = resp.assignedOwnerId or resp.routedToUserId or audit.plantManagerUserId or audit.leadAuditorUserId
                     resp.routedToUserId = owner
@@ -3412,8 +3902,11 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
                 missing.append(f"{r.checkpointCode} (evidence photo)")
             # A finding with no assessed risk cannot be prioritised by the
             # auditee or the plant head, and it is the one column of the
-            # workbook that nothing else can supply.
-            elif not r.riskGrade:
+            # workbook that nothing else can supply — on the internal-audit
+            # form. The IMS/EnMS department form has no risk column at all, so
+            # `requires_risk_grade` returns False for those rows and the gate
+            # does not apply; see services/page_grading.
+            elif page_grading.requires_risk_grade(r.gradeAwarded, r.conformanceMode) and not r.riskGrade:
                 missing.append(f"{r.checkpointCode} (risk grade)")
     if missing:
         head = ", ".join(missing[:8])
@@ -4137,21 +4630,36 @@ def _standards_rollup(responses: list[AuditCheckpointResponse]) -> list[dict[str
     """
     agg: dict[str, dict[str, int]] = {}
     for r in responses:
-        std = (r.standard or "").strip()
-        if not std:
-            continue
+        # One IMS checkpoint is assessed against ISO 9001, 14001 and 45001 at
+        # once, so it counts toward EACH of them. `standard` is the display join
+        # of those three; aggregating on that string would invent a fourth
+        # standard named "ISO 9001:2015 · ISO 14001:2015 · ISO 45001:2018" and
+        # report the three real ones as absent — on the one report a
+        # certification body reads per standard.
+        #
+        # Note this makes the totals here sum to MORE than the checkpoint count
+        # on a multi-standard audit, which is correct: a line assessed against
+        # three standards is three standards' worth of evidence.
+        stds = [
+            (c.get("standard") or "").strip()
+            for c in (r.standardClauses or [])
+            if (c.get("standard") or "").strip()
+        ] or [(r.standard or "").strip()]
         val = _norm_value((r.auditorResponse or {}).get("value")) if r.auditorResponse else None
-        a = agg.setdefault(
-            std,
-            {"total": 0, "pass": 0, "partial": 0, "fail": 0, "na": 0,
-             "scoreObtained": 0, "scoreAllotted": 0},
-        )
-        a["total"] += 1
-        if r.scoreAllotted:
-            a["scoreAllotted"] += r.scoreAllotted
-            a["scoreObtained"] += r.scoreObtained or 0
-        if val in ("pass", "partial", "fail", "na"):
-            a[val] += 1
+        for std in stds:
+            if not std:
+                continue
+            a = agg.setdefault(
+                std,
+                {"total": 0, "pass": 0, "partial": 0, "fail": 0, "na": 0,
+                 "scoreObtained": 0, "scoreAllotted": 0},
+            )
+            a["total"] += 1
+            if r.scoreAllotted:
+                a["scoreAllotted"] += r.scoreAllotted
+                a["scoreObtained"] += r.scoreObtained or 0
+            if val in ("pass", "partial", "fail", "na"):
+                a[val] += 1
     out = []
     for std, a in sorted(agg.items()):
         a["scorePct"] = page_grading.compute_points_score(
@@ -4163,10 +4671,26 @@ def _standards_rollup(responses: list[AuditCheckpointResponse]) -> list[dict[str
 
 def _build_report_snapshot(
     audit: ComplianceAudit, report_type: str,
-    *, rules: scoring_rules.ScoringRules | None = None,
+    *, rules: scoring_rules.ScoringRules | None = None, stream: str | None = None,
 ) -> dict[str, Any]:
-    score = _compute_score(audit, audit.responses)
-    responses = sorted(audit.responses, key=lambda x: (x.categoryId, x.sequence))
+    """Freeze one report.
+
+    `stream` scopes the whole snapshot to one of the two sheets a department
+    audit is conducted against — every count, every score, every finding and
+    every clause in it. NOT a view filter applied afterwards: the headline
+    percentage on the IMS report has to be the IMS points over the IMS
+    allotment, and a report that computed the audit-wide number and then printed
+    an IMS-only register underneath it would be internally inconsistent in the
+    one place that matters most.
+
+    `stream=None` is the whole audit, which is what every other library
+    produces and what every report generated before streams existed was.
+    """
+    responses = sorted(
+        (r for r in audit.responses if stream is None or r.streamCode == stream),
+        key=lambda x: (x.categoryId, x.sequence),
+    )
+    score = _compute_score(audit, responses)
     total = len(responses)
     assessed = sum(1 for r in responses if r.assessmentStatus != "NOT_ASSESSED")
 
@@ -4297,8 +4821,30 @@ def _build_report_snapshot(
             "pct": None if (d_assess == 0 or not c["score_allotted"]) else c["score_pct"],
         })
 
+    # Departments, not disciplines, when the library says so. `discipline_rag`
+    # keeps its key (API consumers read it) but the LABEL the report prints has
+    # to name what the rows actually are — "3 disciplines" over HR / Admin / OHC
+    # is wrong on the cover of a document a certification body reads.
+    scope_axis = (
+        "DEPARTMENT"
+        if responses and any(r.streamCode for r in responses)
+        else "DISCIPLINE"
+    )
+    axis_word = "department" if scope_axis == "DEPARTMENT" else "discipline"
+    n_scope = len(discipline_rag)
+
     snapshot: dict[str, Any] = {
         "reportType": report_type,
+        # Which of the two documents this is. Null on every report that covers
+        # a whole audit, which is how a reader (and the PDF renderer) tells a
+        # single-report audit from one half of a pair.
+        "reportStream": stream,
+        "reportStreamLabel": (STREAM_META[stream]["label"] if stream else None),
+        "reportStreamTitle": (STREAM_META[stream]["reportTitle"] if stream else None),
+        "reportStreamStandards": (STREAM_META[stream]["standards"] if stream else None),
+        # DISCIPLINE | DEPARTMENT — what `disciplineRag` and `categoryScores`
+        # are broken down by on THIS report.
+        "scopeAxis": scope_axis,
         "auditCode": audit.auditNumber, "title": audit.title, "siteId": audit.plantId,
         "industryCode": audit.industryCode, "auditType": audit.auditType,
         "leadAuditorId": audit.leadAuditorUserId, "plantManagerId": audit.plantManagerUserId,
@@ -4309,11 +4855,11 @@ def _build_report_snapshot(
         # length, so a full-scope audit printed "0 discipline(s)". The truth is
         # in the materialised rows, so derive from them and give the UI a label
         # it cannot misread.
-        "disciplinesInScopeCount": len(discipline_rag),
+        "disciplinesInScopeCount": n_scope,
         "disciplinesInScopeLabel": (
-            f"All {len(discipline_rag)} disciplines"
+            f"All {n_scope} {axis_word}s"
             if not (audit.selectedDisciplineIds or [])
-            else f"{len(discipline_rag)} discipline" + ("s" if len(discipline_rag) != 1 else "")
+            else f"{n_scope} {axis_word}" + ("s" if n_scope != 1 else "")
         ),
         "plannedDate": _iso(audit.scheduledDate), "submittedAt": _iso(audit.submittedAt), "closedAt": _iso(audit.closedAt),
         "overallScorePct": overall_pct, "overallResult": overall_result,
@@ -4376,7 +4922,7 @@ def _build_report_snapshot(
         # (the audit is read-only post-close, so the register is stable).
         snapshot["hasFullRegister"] = True
         snapshot["standardsRollup"] = _standards_rollup(responses)
-        snapshot["finalizability"] = _finalizability(audit)
+        snapshot["finalizability"] = _finalizability(audit, stream=stream)
 
     # ── Section 1 insight layer ───────────────────────────────────────────
     # Computed HERE, inside the snapshot that `generate_report` hashes, so the
@@ -4462,24 +5008,31 @@ def _clause_index(responses: list[AuditCheckpointResponse]) -> list[dict[str, An
     """
     idx: dict[tuple[str, str], dict[str, Any]] = {}
     for r in responses:
-        std = (r.standard or "").strip()
-        clause = (r.requirementReference or "").strip()
-        if not std and not clause:
-            continue
-        key = (std, clause)
-        e = idx.setdefault(
-            key,
-            {"standard": std or "—", "clause": clause or "—", "total": 0,
-             "pass": 0, "fail": 0, "partial": 0, "na": 0, "notAssessed": 0,
-             "checkpointCodes": []},
-        )
-        e["total"] += 1
-        e[
-            {"PASS": "pass", "FAIL": "fail", "PARTIAL": "partial",
-             "NA": "na", "NOT_ASSESSED": "notAssessed"}.get(r.assessmentStatus, "notAssessed")
-        ] += 1
-        if len(e["checkpointCodes"]) < 12:
-            e["checkpointCodes"].append(r.checkpointCode)
+        # Expanded per standard for the same reason as `_standards_rollup`: an
+        # assessor navigating the index looks up "ISO 45001 §6.1.2", and a row
+        # filed under all three standards joined into one string is a row they
+        # cannot find under any of them.
+        pairs = [
+            ((c.get("standard") or "").strip(), (c.get("clause") or "").strip())
+            for c in (r.standardClauses or [])
+        ] or [((r.standard or "").strip(), (r.requirementReference or "").strip())]
+        for std, clause in pairs:
+            if not std and not clause:
+                continue
+            key = (std, clause)
+            e = idx.setdefault(
+                key,
+                {"standard": std or "—", "clause": clause or "—", "total": 0,
+                 "pass": 0, "fail": 0, "partial": 0, "na": 0, "notAssessed": 0,
+                 "checkpointCodes": []},
+            )
+            e["total"] += 1
+            e[
+                {"PASS": "pass", "FAIL": "fail", "PARTIAL": "partial",
+                 "NA": "na", "NOT_ASSESSED": "notAssessed"}.get(r.assessmentStatus, "notAssessed")
+            ] += 1
+            if len(e["checkpointCodes"]) < 12:
+                e["checkpointCodes"].append(r.checkpointCode)
     out = list(idx.values())
     # Worst first — an assessor opens the index to find problems, not to read A-Z.
     out.sort(key=lambda e: (-e["fail"], -e["partial"], e["standard"], e["clause"]))
@@ -4511,11 +5064,30 @@ def _report_to_dict(rep: AuditReport) -> dict[str, Any]:
         "reportCode": rep.reportCode, "generatedById": rep.generatedById, "generatedAt": _iso(rep.generatedAt),
         "snapshot": rep.snapshot, "signOffs": rep.signOffs, "pdfAttachmentId": rep.pdfAttachmentId,
         "isSuperseded": rep.isSuperseded, "snapshotHashFull": rep.snapshotHashFull,
+        "reportStream": rep.reportStream,
+        "reportStreamLabel": (
+            STREAM_META[rep.reportStream]["label"] if rep.reportStream in STREAM_META else None
+        ),
     }
+
+
+async def available_report_streams(db: AsyncSession, audit_id: str) -> list[dict[str, Any]]:
+    """Which reports this audit can issue, one entry per stream.
+
+    EMPTY means one report covering the whole audit — the caller renders its
+    single pair of buttons rather than a synthetic "stream" with a null code,
+    which nothing could sensibly post back.
+
+    Derived from the audit's own materialised rows, not from its library: an
+    audit scoped to departments that happen to hold no EnMS checkpoint must not
+    offer an EnMS report with nothing in it.
+    """
+    return await stream_rollup(db, audit_id)
 
 
 async def generate_report(
     db: AsyncSession, *, user: User, audit_id: str, report_type: str,
+    stream: str | None = None,
 ) -> dict[str, Any]:
     """Generate an immutable Interim or Final report. Interim accumulates (the
     latest supersedes prior interims for display, all retained). Final requires
@@ -4541,14 +5113,37 @@ async def generate_report(
     if audit is None:
         raise ValueError("Audit not found")
 
+    # ── Which of the two documents is being issued ────────────────────────
+    #
+    # A raw token that is not a stream is REJECTED rather than silently falling
+    # back to the whole audit: "generate the EMS report" answered with an
+    # audit-wide document that looks right and covers the wrong checkpoints is
+    # the worst failure this endpoint has available to it.
+    if stream not in (None, ""):
+        code = normalise_stream(stream)
+        if code is None:
+            raise ValueError(
+                f"Unknown report stream '{stream}' — expected one of {', '.join(STREAMS)}"
+            )
+        stream = code
+        if not any(r.streamCode == code for r in audit.responses):
+            raise ValueError(
+                f"This audit has no {STREAM_META[code]['label']} checkpoints, so there is "
+                f"nothing to report against {STREAM_META[code]['standards']}."
+            )
+    else:
+        stream = None
+
     if report_type == "INTERIM":
         if audit.status in ("scheduled", "cancelled"):
             raise ValueError("Nothing to report yet — start conducting the audit first")
     else:
-        fin = _finalizability(audit)
+        fin = _finalizability(audit, stream=stream)
         if not fin["finalizable"]:
+            _what = f"{STREAM_META[stream]['label']} " if stream else ""
             raise ValueError(
-                f"{fin['blockerCount']} checkpoint(s) still in review — a final report needs every checkpoint terminal"
+                f"{fin['blockerCount']} {_what}checkpoint(s) still in review — a final "
+                "report needs every checkpoint terminal"
             )
 
     # Per-audit-type scoring config (WP-16). `CamsAuditType.scoringRules` is the
@@ -4561,7 +5156,7 @@ async def generate_report(
     ).scalar_one_or_none()
     _rules = scoring_rules.rules_from(_at.scoringRules if _at else None)
 
-    snapshot = _build_report_snapshot(audit, report_type, rules=_rules)
+    snapshot = _build_report_snapshot(audit, report_type, rules=_rules, stream=stream)
     # Freeze friendly plant + actor names into the immutable snapshot so the
     # (external-facing) report shows names, not raw ids — and resolves
     # cross-plant actors the live /users picker can't.
@@ -4667,10 +5262,16 @@ async def generate_report(
     # WP-12: revision history — every prior issue of this audit's reports, so a
     # reader can see this is (say) the third issue and what preceded it. Built
     # here rather than in _build_report_snapshot because it needs the DB.
+    # Scoped to THIS stream: "revision 3" on the IMS report must count the
+    # earlier IMS issues, not the EnMS ones interleaved with them.
     _prior_all = (
         await db.execute(
             select(AuditReport)
-            .where(AuditReport.auditId == audit_id)
+            .where(
+                AuditReport.auditId == audit_id,
+                AuditReport.reportStream.is_(None) if stream is None
+                else AuditReport.reportStream == stream,
+            )
             .order_by(AuditReport.generatedAt)
         )
     ).scalars().all()
@@ -4748,12 +5349,20 @@ async def generate_report(
     _full = assurance.canonical_hash(snapshot, full=True)
     snapshot["snapshotHash"] = _full[:16]
 
-    # Supersede prior reports of the same type for display (all retained).
+    # Supersede prior reports of the same type AND STREAM for display (all
+    # retained). Per stream, because the IMS and EnMS reports are two separate
+    # documents: re-issuing the IMS interim after a re-grade must not mark the
+    # EnMS one stale, which would take a current document off the screen and
+    # replace it with nothing.
+    _stream_match = (
+        AuditReport.reportStream.is_(None) if stream is None
+        else AuditReport.reportStream == stream
+    )
     prior = (
         await db.execute(
             select(AuditReport).where(
                 AuditReport.auditId == audit_id, AuditReport.reportType == report_type,
-                AuditReport.isSuperseded.is_(False),
+                _stream_match, AuditReport.isSuperseded.is_(False),
             )
         )
     ).scalars().all()
@@ -4763,19 +5372,25 @@ async def generate_report(
     base_n = (
         await db.execute(
             select(func.count(AuditReport.id)).where(
-                AuditReport.auditId == audit_id, AuditReport.reportType == report_type
+                AuditReport.auditId == audit_id, AuditReport.reportType == report_type,
+                _stream_match,
             )
         )
     ).scalar_one() or 0
     prefix = "I" if report_type == "INTERIM" else "F"
+    # The stream is part of the code, so the two documents are distinguishable
+    # on a filename, in an email subject and in the register — not only by
+    # opening them.
+    stream_part = f"-{STREAM_META[stream]['label'].upper()}" if stream else ""
 
     # reportCode is derived from a count; under concurrent generation two
     # requests can pick the same number and collide on the unique constraint.
     # Insert inside a SAVEPOINT and retry with the next number on collision.
     for attempt in range(8):
-        code = f"RPT-{audit.auditNumber}-{prefix}{base_n + 1 + attempt:02d}"
+        code = f"RPT-{audit.auditNumber}{stream_part}-{prefix}{base_n + 1 + attempt:02d}"
         rep = AuditReport(
             auditId=audit.id, siteId=audit.plantId, reportType=report_type, reportCode=code,
+            reportStream=stream,
             generatedById=user.id, snapshot=snapshot, signOffs=sign_offs or None, isSuperseded=False,
             snapshotHashFull=_full,
         )
@@ -4818,6 +5433,11 @@ async def list_report_register(
         return None
     R = AuditCheckpointResponse
     conds = [R.auditId == rep.auditId]
+    # The register belongs to the REPORT, so it is scoped by the report's own
+    # stream and not by anything the caller passes. An IMS report whose register
+    # listed EnMS checkpoints would contradict every count on its own cover.
+    if rep.reportStream:
+        conds.append(R.streamCode == rep.reportStream)
     if discipline_id:
         conds.append(R.categoryId == discipline_id)
     total = (await db.execute(select(func.count(R.id)).where(*conds))).scalar_one() or 0
