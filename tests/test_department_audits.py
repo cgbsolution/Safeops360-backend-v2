@@ -158,6 +158,56 @@ def test_clearing_a_tristate_verdict_clears_the_grade_and_status():
     assert resp.scoreAllotted is None
 
 
+def test_a_conformance_post_writes_every_column_the_row_is_read_back_from():
+    """The regression behind "I graded two checkpoints, went back, and they were
+    blank".
+
+    A save that recorded the JSON blob but not the grading COLUMNS looks
+    identical to a successful one — the card even keeps its "saved" tick — and
+    the work is only discovered missing on the next visit. This pins that one
+    `{conformance: …}` post populates every field the card and the rollup read
+    the row back from.
+    """
+    resp = _row("PI-HR-IMS-001", clauses=IMS_CLAUSES)
+    merged: dict = {}
+    _apply_page_grading(resp, {"conformance": "CONFORMANCE"}, merged)
+
+    # What the conduct card re-renders from.
+    assert resp.gradeAwarded == pg.GRADE_EFFECTIVE
+    assert resp.complianceStatus == pg.STATUS_COMPLIED
+    assert pg.tristate_for_status(resp.complianceStatus) == "CONFORMANCE"
+    # What the department navigator and the two reports aggregate.
+    assert (resp.scoreObtained, resp.scoreAllotted) == (3, 3)
+    # What `save_response` derives `assessmentStatus` and `overallStatus` from —
+    # a null here is what leaves a row NOT_ASSESSED and the department at 0%.
+    assert merged["value"] == "pass"
+
+
+def test_marking_not_applicable_clears_a_status_that_would_contradict_it():
+    """N/A says the checkpoint was never assessed. A row left reading "Complied"
+    while scoring as N/A is a contradiction the workbook has no row for — and on
+    a tristate card it lights up Conformance and Not-applicable at once."""
+    resp = _row("PI-HR-IMS-002", clauses=IMS_CLAUSES,
+                grade=pg.GRADE_EFFECTIVE, status=pg.STATUS_COMPLIED, score=3, allotted=3)
+    _apply_page_grading(resp, {"gradeAwarded": "NA"}, {})
+    assert resp.gradeAwarded == pg.GRADE_NA
+    assert resp.complianceStatus == pg.STATUS_NA
+    # …and it leaves the score denominator, which is the point of marking it.
+    assert resp.scoreAllotted is None
+    assert resp.scoreObtained is None
+
+
+def test_a_repeat_status_is_not_clobbered_by_an_ordinary_re_grade():
+    """The exemption above is N/A ONLY. Re-grading must still never silently
+    downgrade a Repeated Non Compliance, which is where the workbook's -1 comes
+    from."""
+    resp = _row("PI-HR-IMS-003", clauses=IMS_CLAUSES,
+                grade=pg.GRADE_MAJOR_IMPROVEMENT, status=pg.STATUS_REPEATED_NON_COMPLIANCE)
+    _apply_page_grading(resp, {"gradeAwarded": "SOME_IMPROVEMENT_NEEDED"}, {})
+    assert resp.complianceStatus == pg.STATUS_REPEATED_NON_COMPLIANCE
+    assert resp.scoreObtained == -1
+
+
 def test_tristate_never_reaches_the_statuses_it_dropped():
     """The deliberate cost of matching the customer's form, asserted so it is a
     decision on the record rather than an accident: N/A, MAS (N/A) and the two

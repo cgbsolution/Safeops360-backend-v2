@@ -208,6 +208,16 @@ def _apply_page_grading(
     elif resp.complianceStatus is None:
         resp.complianceStatus = page_grading.suggest_status(grade)
 
+    # N/A is the one re-grade that MUST overwrite a status the auditor chose.
+    # Marking a checkpoint not applicable says it was never assessed, so a row
+    # left reading "Complied" (or worse, "Repeated Non Compliance") while
+    # scoring as N/A is a contradiction the workbook has no row for — and on a
+    # tristate card it lights up two mutually exclusive controls at once.
+    # Enforced here as well as in the client because a rule that lives only in
+    # the UI is not a rule.
+    if grade == page_grading.GRADE_NA and resp.complianceStatus not in page_grading.NOT_APPLICABLE_STATUSES:
+        resp.complianceStatus = page_grading.STATUS_NA
+
     # Risk grade (column H). Cleared when the checkpoint stops being a finding,
     # so a re-graded-to-Effective checkpoint cannot keep reporting High risk.
     if "riskGrade" in payload:
@@ -2090,6 +2100,28 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     # Empty for every audit outside the department-segregated libraries, which
     # is what tells the client there is one report here rather than two.
     d["streamRollup"] = await stream_rollup(db, audit_id)
+
+    # Which conformance vocabulary this audit's checkpoints were materialised
+    # with. Read from the ROWS, not from the library: the rows are what the
+    # auditor will actually answer, and the library may have been re-authored
+    # since. A mixed audit reports FULL — the filter row and the bulk actions
+    # must offer the vocabulary that every card can answer in, not one that
+    # only some can.
+    _modes = {
+        page_grading.normalise_conformance_mode(m)
+        for m in (
+            await db.execute(
+                select(AuditCheckpointResponse.conformanceMode)
+                .where(AuditCheckpointResponse.auditId == audit_id)
+                .distinct()
+            )
+        ).scalars().all()
+    }
+    d["conformanceMode"] = (
+        page_grading.CONFORMANCE_TRISTATE
+        if _modes == {page_grading.CONFORMANCE_TRISTATE}
+        else page_grading.CONFORMANCE_FULL
+    )
 
     # Bounded review set: adverse / in-flight rows (the only ones the detail page
     # acts on) WITH their interaction threads. Pass/NA/OPEN rows are reached via
