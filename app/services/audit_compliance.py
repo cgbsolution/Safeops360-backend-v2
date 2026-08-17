@@ -2123,6 +2123,27 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
         else page_grading.CONFORMANCE_FULL
     )
 
+    # How many departments each shared workbook line actually reaches, as ONE
+    # grouped query for the whole audit (≈82 keys over 206 rows) rather than a
+    # per-row subquery the conduct worklist would pay 200 times a page.
+    #
+    # The conduct card needs this to decide whether to offer "apply to the other
+    # departments" at all. 40 of the 60 IMS lines and all 22 EnMS ones are asked
+    # in all three departments; the 20 STP/ETP lines are Admin's alone and have
+    # no counterpart anywhere. Offering the action on those put a button on 20
+    # cards whose only possible outcome was "nothing to replicate to" — a
+    # control that cannot do anything is worse than an absent one.
+    _repl = (
+        await db.execute(
+            select(R.replicationKey, func.count(func.distinct(R.categoryId)))
+            .where(R.auditId == audit_id, R.replicationKey.isnot(None))
+            .group_by(R.replicationKey)
+        )
+    ).all()
+    # Keyed by replicationKey → the number of DEPARTMENTS holding it, so the
+    # client subtracts its own and knows exactly how many it can reach.
+    d["replicationCounts"] = {k: n for k, n in _repl if n > 1}
+
     # Bounded review set: adverse / in-flight rows (the only ones the detail page
     # acts on) WITH their interaction threads. Pass/NA/OPEN rows are reached via
     # the conduct worklist. Capped — beyond the cap the worklist is the path.

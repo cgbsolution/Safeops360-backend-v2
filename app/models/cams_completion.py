@@ -29,6 +29,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,6 +87,40 @@ class AuditFinding(Base, IdMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, default="OPEN")
     capaId: Mapped[str | None] = mapped_column(String, index=True)
 
+    # ── PIL/MR/F04-R1 Internal Audit Non Conformance Report ───────────────
+    #
+    # Page issue one numbered NC report per non-conformity, and the paper form
+    # is the contract: an auditee who has filled PIL/MR/F04 for fifteen years
+    # must recognise the screen. These columns are the parts of that form which
+    # belong to the NC itself rather than to its RCA or its CAPA.
+    #
+    # `ncrNumber` is the form's own "NCR Number : 01" — a short per-audit
+    # sequence, NOT `findingCode`. The two differ on purpose: `findingCode`
+    # (AFN-<audit>-001) covers every adverse checkpoint including observations,
+    # while an NCR number is issued only to a non-conformity and is what the
+    # closure meeting, the MR's register and the next audit's "Previous Audit
+    # and NC Closure Status" checkpoint all refer to.
+    ncrNumber: Mapped[str | None] = mapped_column(String)
+
+    # The governed RootCauseAnalysis carrying the form's Why-Why ladder.
+    # Mirrored `rcaStatus` so the NC register renders without joining every
+    # RCA — the register is the screen the MR lives on during closure review.
+    rcaId: Mapped[str | None] = mapped_column(String, index=True)
+    rcaStatus: Mapped[str | None] = mapped_column(String)
+
+    # Form row 14, auditor half: "Organization Representative".
+    orgRepresentativeId: Mapped[str | None] = mapped_column(String)
+
+    # Form rows 26-30 — the closure block. Verification of EFFECTIVENESS lives
+    # on the Capa (which already models it, and whose INEFFECTIVE result loops
+    # the actions back); what lives here is the NC report's own two-signature
+    # closure, which the Capa has no shape for.
+    verificationDetails: Mapped[str | None] = mapped_column(Text)
+    auditorSignedById: Mapped[str | None] = mapped_column(String)
+    auditorSignedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    mrSignedById: Mapped[str | None] = mapped_column(String)
+    mrSignedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     # Cross-engine repeat chain: this may point at an AuditFinding OR a
     # CamsFinding id, which is what makes a chain able to span both engines for
     # the first time.
@@ -105,6 +140,13 @@ class AuditFinding(Base, IdMixin):
         Index("ix_AuditFinding_audit_status", "auditId", "status"),
         Index("ix_AuditFinding_site_severity", "siteId", "severity"),
         Index("ix_AuditFinding_due", "dueDate", "status"),
+        # The NC register scans (audit, ncrNumber) and the bulk trigger has to
+        # find which NCs already carry an RCA. Partial — every finding from
+        # every other library has a NULL ncrNumber and costs nothing here.
+        Index(
+            "ix_AuditFinding_audit_ncr", "auditId", "ncrNumber",
+            postgresql_where=text('"ncrNumber" IS NOT NULL'),
+        ),
     )
 
 

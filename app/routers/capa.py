@@ -71,6 +71,7 @@ from app.services.permissions import (
     can,
     get_accessible_plants_for,
 )
+from app.services import nc_rca_capa
 from app.services.capa_spawn import next_capa_number
 from app.services.user_directory import resolve_user_directory
 
@@ -928,6 +929,18 @@ async def submit_rca(
     await require_permission_with_context(
         "CAPA.UPDATE", user, db, plant_id=capa.plantId, record_id=capa.id
     )
+    # This endpoint takes a free-text RCA summary and advances the CAPA to
+    # ACTIONS_PLANNED. For a CAPA bound to a governed RootCauseAnalysis that is
+    # a way round the whole gate — the PIL Why-Why ladder, its minimum depth and
+    # its approval would all be skipped by posting a one-line summary here.
+    # Those CAPAs are released by approving their RCA, and only that way.
+    if capa.rcaRecordId:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"This CAPA's root cause is governed by {capa.rcaMethodology or 'an'} "
+            f"analysis record. Complete and approve the RCA instead — approval "
+            f"releases the CAPA for action planning.",
+        )
 
     capa.rcaMethodology = payload.rcaMethodology
     capa.rcaMethodologyRationale = payload.rcaMethodologyRationale
@@ -990,6 +1003,13 @@ async def add_action(
     )
     if payload.actionType not in ("IMMEDIATE_CONTAINMENT", "CORRECTIVE", "PREVENTIVE"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid actionType")
+    # A CAPA whose root cause is still being analysed cannot be actioned. Fires
+    # only for a CAPA that is both UNDER_RCA and bound to a governed RCA record
+    # — today that pair means a PIL/MR/F04-R1 non-conformity and nothing else.
+    try:
+        nc_rca_capa.assert_actions_unlocked(capa)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
     # Sequence the new action after existing same-type actions
     last_sort = (

@@ -48,10 +48,17 @@ async def spawn_capa(
     ref_id: str, ref_url: str | None = None, ref_summary: str | None = None,
     metadata: dict | None = None, severity: str = "MODERATE", priority: str = "HIGH",
     detected_method: str, owner_id: str | None, actor_id: str | None,
-    due_days: int = 90,
+    due_days: int = 90, state: str = "ACTIONS_PLANNED",
 ) -> Capa | None:
     """Create one CAPA on the universal engine. Returns the Capa (caller commits).
-    Raises ValueError if the source type isn't seeded."""
+    Raises ValueError if the source type isn't seeded.
+
+    `state` defaults to ACTIONS_PLANNED — an auto-spawned CAPA normally arrives
+    ready to be worked. A caller that gates action planning behind something
+    else passes its own starting state instead (UNDER_RCA, for a PIL NC report
+    whose Why-Why analysis has to be approved first); doing it here rather than
+    mutating the row afterwards keeps `stateChangedAt` honest.
+    """
     st = (await db.execute(select(CapaSourceType).where(CapaSourceType.code == source_code))).scalar_one_or_none()
     if st is None:
         raise ValueError(f"{source_code} CAPA source type not seeded.")
@@ -70,7 +77,7 @@ async def spawn_capa(
         title=title[:200], plantId=plant.id, sourceCategoryId=st.categoryId, sourceTypeId=st.id, sourceTypeCode=source_code,
         sourceReferenceId=ref_id, sourceReferenceUrl=ref_url, sourceReferenceSummary=ref_summary, sourceMetadata=metadata or {},
         problemDescription=problem, detectionMethod=detected_method, detectedAt=_now(), detectedByUserId=actor_id,
-        primaryCategory=cat.name if cat else source_code, severity=severity, priority=priority, state="ACTIONS_PLANNED",
+        primaryCategory=cat.name if cat else source_code, severity=severity, priority=priority, state=state,
         stateChangedAt=_now(), closureTargetDate=_now() + timedelta(days=due_days), raisedByUserId=actor_id,
         primaryOwnerUserId=owner_id, createdByUserId=actor_id,
     )

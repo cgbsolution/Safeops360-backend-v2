@@ -21,6 +21,7 @@ from app.core.deps import get_current_user
 from app.models.user import User
 from app.services import audit_assignment as assignment
 from app.services import audit_compliance as svc
+from app.services import nc_rca_capa
 from app.services import page_grading
 from app.services.permissions import (
     PermissionContext,
@@ -1398,3 +1399,145 @@ async def audit_report_pdf(report_id: str, user: User = Depends(get_current_user
         io.BytesIO(pdf_bytes), media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{rep.reportCode}.pdf"'},
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PIL/MR/F04-R1 — Internal Audit Non Conformance Report
+#
+# Page issue one numbered NC report per non-conformity, and revision R1 made a
+# Why-Why root cause analysis mandatory before any action may be planned. The
+# mechanics live in `services.nc_rca_capa`; this is the HTTP surface.
+#
+# Permission split follows the form's own colour key: the auditee half (the
+# analysis and the actions) is worked through the RCA and CAPA modules with
+# their own permissions, and everything here — triggering, verifying, signing —
+# is an auditor/MR action gated on AUDIT_COMPLIANCE.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class NcTriggerRequest(BaseModel):
+    # Omit to cover every open non-conformity in the audit — the common case,
+    # and what the "Trigger for all NCs" button sends. A list narrows it to
+    # named findings, for re-running after one failed.
+    findingIds: list[str] | None = None
+
+
+class NcVerifyRequest(BaseModel):
+    verificationDetails: str = Field(min_length=10)
+    result: Literal["EFFECTIVE", "PARTIALLY_EFFECTIVE", "INEFFECTIVE", "INCONCLUSIVE"] = "EFFECTIVE"
+
+
+async def _load_nc_or_404(db: AsyncSession, finding_id: str):
+    from app.models.cams_completion import AuditFinding
+
+    finding = await db.get(AuditFinding, finding_id)
+    if finding is None or finding.isDeleted:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Non-conformity not found")
+    return finding
+
+
+@router.post("/{audit_id}/nc-reports/trigger")
+async def trigger_nc_reports(
+    audit_id: str,
+    body: NcTriggerRequest | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Raise an RCA + CAPA for every non-conformity in this audit.
+
+    Idempotent — NCs that already carry a report are skipped and named back, so
+    the button is safe to press twice and safe to press again after a reopen.
+    """
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    result = await nc_rca_capa.trigger_for_audit(
+        db, audit, actor_id=user.id,
+        finding_ids=(body.findingIds if body else None),
+    )
+    await db.commit()
+    return result
+
+
+@router.get("/{audit_id}/nc-register")
+async def nc_register(
+    audit_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Every NC in the audit with its RCA, CAPA and closure state — the screen
+    the Management Representative works a closure review from."""
+    audit = await _load_or_404(db, audit_id)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
+                   record_id=audit.id)
+    return await nc_rca_capa.nc_register(db, audit)
+
+
+@router.get("/nc-reports/{finding_id}")
+async def get_nc_report(
+    finding_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One non-conformity rendered as PIL/MR/F04-R1 — every box, in form order."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
+                   record_id=audit.id)
+    return await nc_rca_capa.nc_report(db, finding)
+
+
+@router.post("/nc-reports/{finding_id}/verify")
+async def verify_nc_report(
+    finding_id: str,
+    body: NcVerifyRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditor records "Verification Details for effective closure" (form row 26).
+
+    INEFFECTIVE reopens rather than closes: the CAPA returns to ACTIONS_PLANNED
+    and the NC keeps its NCR number. A re-check that found the nonconformity
+    still there is not a closure.
+    """
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    # The auditor verifies, not the auditee who did the work — EXECUTE is the
+    # auditor-side permission on this module, and `_auditor_record` is what
+    # lets an OWN_RECORDS-scoped co-auditor through.
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    try:
+        result = await nc_rca_capa.verify_nc(
+            db, finding, verification_details=body.verificationDetails,
+            result=body.result, actor_id=user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return result
+
+
+@router.post("/nc-reports/{finding_id}/mr-sign")
+async def mr_sign_nc_report(
+    finding_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """M.R. signature — the last box on the form, and what closes the NC."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    # CLOSE, not EXECUTE: accepting a non-conformity as closed on behalf of the
+    # management system is the Management Representative's authority, and the
+    # two signatures on the form are only meaningfully separate if the
+    # permissions behind them are.
+    await _require(db, user, "AUDIT_COMPLIANCE.CLOSE", plant_id=audit.plantId,
+                   record={"plantManagerUserId": audit.plantManagerUserId,
+                           "leadAuditorUserId": audit.leadAuditorUserId},
+                   record_id=audit.id)
+    try:
+        result = await nc_rca_capa.mr_sign_off(db, finding, actor_id=user.id)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return result

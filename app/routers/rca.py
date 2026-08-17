@@ -36,7 +36,7 @@ from app.models.rca import (
 )
 from app.models.user import User
 from app.schemas import rca as S
-from app.services import rca_analytics, rca_core, rca_taxonomy
+from app.services import nc_rca_capa, rca_analytics, rca_core, rca_taxonomy
 from app.services.access_scope import build_query_scope
 from app.services.capa_spawn import spawn_capa
 from app.services.permissions import PermissionContext, can, get_user_role_codes
@@ -58,6 +58,19 @@ _DOMAIN_SCOPED_ROLES = {
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _is_nc_report(rca: RootCauseAnalysis) -> bool:
+    """Is this RCA a PIL/MR/F04-R1 Internal Audit NC Report?
+
+    Detected from the payload's own `pilNcReport` block rather than from the
+    methodology (FIVE_WHY is used by incidents too) or from originType (EVENT
+    covers incidents and near-misses). The block is written at origination and
+    is what makes the form's rules — minimum ladder depth, mandatory root cause
+    — apply to this record and not to an ordinary 5-Why.
+    """
+    payload = rca.analysisPayload or {}
+    return isinstance(payload, dict) and bool(payload.get("pilNcReport"))
 
 
 async def _require(db: AsyncSession, user: User, code: str, *, plant_id: str | None = None,
@@ -424,8 +437,17 @@ async def submit_rca(rca_id: str, user: User = Depends(get_current_user), db: As
     rca = await _load_full(db, rca_id)
     if rca.status in ("APPROVED", "SUPERSEDED"):
         raise HTTPException(400, f"Cannot submit an RCA in status {rca.status}")
+    # An NC report's ladder is checked HERE rather than at approval: the auditee
+    # who has to fix it is the one submitting, and telling them at approval time
+    # means the message reaches the auditor instead.
+    if _is_nc_report(rca):
+        problems = nc_rca_capa.validate_why_payload(rca.analysisPayload)
+        if problems:
+            raise HTTPException(422, {"message": f"{nc_rca_capa.PIL_FORM_NO} is incomplete.",
+                                      "problems": problems})
     rca.status = "PEER_REVIEW"
     rca.updatedBy = user.id
+    await nc_rca_capa.sync_finding_rca_status(db, rca)
     await db.flush()
     return await _detail(db, await _load_full(db, rca.id))
 
@@ -435,6 +457,11 @@ async def approve_rca(rca_id: str, body: S.ApproveIn, user: User = Depends(get_c
                       db: AsyncSession = Depends(get_db)):
     await _require(db, user, "RCA.APPROVE")
     rca = await _load_full(db, rca_id)
+    if _is_nc_report(rca):
+        problems = nc_rca_capa.validate_why_payload(rca.analysisPayload)
+        if problems:
+            raise HTTPException(422, {"message": f"{nc_rca_capa.PIL_FORM_NO} is incomplete.",
+                                      "problems": problems})
     rca.status = "APPROVED"
     rca.approverId = user.id
     rca.approvedAt = _now()
@@ -451,6 +478,11 @@ async def approve_rca(rca_id: str, body: S.ApproveIn, user: User = Depends(get_c
         actor_id=user.id,
         payload={"from": "PEER_REVIEW", "to": "APPROVED", "title": rca.title},
     )
+    # Approval is what releases the CAPA: causes cross into CapaRootCause and
+    # the CAPA leaves UNDER_RCA so Correction and Preventive Action can be
+    # planned. No-ops for an RCA with no CAPA bound to it.
+    await nc_rca_capa.release_capa_from_rca(db, rca, actor_id=user.id)
+    await nc_rca_capa.sync_finding_rca_status(db, rca)
     await db.flush()
     return await _detail(db, await _load_full(db, rca.id))
 

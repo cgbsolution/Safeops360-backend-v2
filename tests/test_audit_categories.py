@@ -321,6 +321,34 @@ def test_a_common_checkpoint_shares_one_replication_key_across_departments():
             assert cp["replication_key"] == f"{cp['stream']}-{cp['code'].rsplit('-', 1)[1]}"
 
 
+def test_replication_is_available_in_every_department_not_just_admin():
+    """Reported from the field as "this is only in the Admin department".
+
+    The action is offered per CHECKPOINT, so it exists wherever a checkpoint has
+    a counterpart — and every HR and OHC line has two. What is genuinely
+    Admin-only is the STP/ETP block, which has no counterpart anywhere and must
+    therefore NOT offer it: a button whose only outcome is "nothing to replicate
+    to" is worse than an absent one.
+    """
+    cats = _load("page_ims_checkpoints.json")
+    reach: dict[str, set[str]] = defaultdict(set)
+    for cat in cats:
+        for cp in cat["checkpoints"]:
+            reach[cp["replication_key"]].add(cat["category_code"])
+
+    for cat in cats:
+        # `- 1` is the card's own department: what the button offers to reach.
+        siblings = Counter(
+            len(reach[cp["replication_key"]]) - 1 for cp in cat["checkpoints"]
+        )
+        if cat["category_code"] == "DEPT_ADMIN":
+            # 62 shared lines reach HR and OHC; the 20 STP/ETP lines reach none.
+            assert siblings == Counter({2: 62, 0: 20})
+        else:
+            # Nothing in HR or OHC is theirs alone.
+            assert siblings == Counter({2: 62}), cat["category_code"]
+
+
 def test_ims_answers_on_the_three_customer_parameters():
     """Conformance / Non-Conformance / Observation — the header of column E on
     both sheets. Declared on the category so it is snapshotted onto every
