@@ -2123,6 +2123,15 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
         else page_grading.CONFORMANCE_FULL
     )
 
+    # Bound BEFORE first use, not beside the query that happens to be last to
+    # need it. `R` is assigned inside this function, which makes it local to the
+    # WHOLE function — so when the replication block below was inserted above
+    # the original `R = AuditCheckpointResponse`, every read of `R` in it became
+    # a read of an unbound local and `get_audit` raised
+    # `UnboundLocalError: cannot access local variable 'R'` on EVERY audit.
+    # The detail page turned that 500 into a bare "404 page could not be found".
+    R = AuditCheckpointResponse
+
     # How many departments each shared workbook line actually reaches, as ONE
     # grouped query for the whole audit (≈82 keys over 206 rows) rather than a
     # per-row subquery the conduct worklist would pay 200 times a page.
@@ -2147,7 +2156,6 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     # Bounded review set: adverse / in-flight rows (the only ones the detail page
     # acts on) WITH their interaction threads. Pass/NA/OPEN rows are reached via
     # the conduct worklist. Capped — beyond the cap the worklist is the path.
-    R = AuditCheckpointResponse
     findings = (
         await db.execute(
             select(R).where(R.auditId == audit_id, _review_clause())
