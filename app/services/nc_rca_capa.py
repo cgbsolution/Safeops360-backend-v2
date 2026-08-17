@@ -472,51 +472,87 @@ async def trigger_for_audit(
         db.add(rca)
         await db.flush()
 
-        try:
-            capa = await spawn_capa(
-                db,
-                source_code="AUDIT_INTERNAL",
-                plant_id=audit.plantId,
-                title=title[:200],
-                problem=(finding.description or response.observation or finding.title or "")[:2000],
-                ref_id=finding.id,
-                # The audit, not a per-NC page: the NC register lives on the
-                # audit and there is no standalone NC form route to link to.
-                ref_url=f"/cams/audits/{audit.id}",
-                ref_summary=f"{audit.auditNumber} · NCR {ncr_number} · {finding.findingCode}",
-                metadata={
-                    "formNo": PIL_FORM_NO,
-                    "ncrNumber": ncr_number,
-                    "auditNumber": audit.auditNumber,
-                    "findingCode": finding.findingCode,
-                    "checkpointCode": response.checkpointCode,
-                    "department": response.categoryName,
-                    "streamCode": response.streamCode,
-                    "clauseRef": clause,
-                    "grade": response.gradeAwarded,
-                    "standardClauses": response.standardClauses or [],
-                },
-                severity=_capa_severity(finding.severity),
-                priority="HIGH" if finding.severity in ("CRITICAL_NC", "MAJOR_NC") else "MODERATE",
-                detected_method="INTERNAL_AUDIT",
-                owner_id=owner,
-                actor_id=actor_id,
-                due_days=_days_until(finding.dueDate),
-                # The gate. Actions cannot be planned from here — see
-                # `assert_actions_unlocked`.
-                state="UNDER_RCA",
-            )
-        except ValueError as exc:
-            # Roll the RCA back with it: an RCA whose CAPA never existed is a
-            # form the auditee can fill in that leads nowhere.
-            await db.delete(rca)
-            await db.flush()
-            failures.append({
-                "findingId": finding.id,
+        # A checkpoint marked `autoTriggerCapaOnFail` (every `critical` one, by
+        # default — 31 of the 206 IMS lines) already had a CAPA spawned for it
+        # by `submit_audit`. ADOPT it rather than raise a second: two CAPAs
+        # against one non-conformity means two owners, two due dates and two
+        # closure decisions for one problem, and the NC register would show a
+        # CAPA number that is not the one the auditee is actually working.
+        existing_capa = (
+            await db.get(Capa, response.capaId) if response.capaId else None
+        )
+        if existing_capa is not None and not existing_capa.isDeleted:
+            capa = existing_capa
+            # Pull it back behind the gate: it was spawned ACTIONS_PLANNED
+            # because nothing then required an analysis first. Only if no work
+            # has started — re-locking a CAPA someone has already planned
+            # actions on would strand that work behind a form.
+            if capa.state in ("DRAFT", "SUBMITTED", "ACTIONS_PLANNED"):
+                has_actions = bool(
+                    (
+                        await db.execute(
+                            select(CapaAction.id).where(CapaAction.capaId == capa.id).limit(1)
+                        )
+                    ).scalars().first()
+                )
+                if not has_actions:
+                    capa.state = "UNDER_RCA"
+                    capa.stateChangedAt = _now()
+                    capa.stateChangedByUserId = actor_id
+            capa.sourceMetadata = {
+                **(capa.sourceMetadata or {}),
+                "formNo": PIL_FORM_NO,
+                "ncrNumber": ncr_number,
                 "findingCode": finding.findingCode,
-                "reason": str(exc),
-            })
-            continue
+                "adoptedFromAutoSpawn": True,
+            }
+            await db.flush()
+        else:
+            try:
+                capa = await spawn_capa(
+                    db,
+                    source_code="AUDIT_INTERNAL",
+                    plant_id=audit.plantId,
+                    title=title[:200],
+                    problem=(finding.description or response.observation or finding.title or "")[:2000],
+                    ref_id=finding.id,
+                    # The audit, not a per-NC page: the NC register lives on the
+                    # audit and there is no standalone NC form route to link to.
+                    ref_url=f"/cams/audits/{audit.id}",
+                    ref_summary=f"{audit.auditNumber} · NCR {ncr_number} · {finding.findingCode}",
+                    metadata={
+                        "formNo": PIL_FORM_NO,
+                        "ncrNumber": ncr_number,
+                        "auditNumber": audit.auditNumber,
+                        "findingCode": finding.findingCode,
+                        "checkpointCode": response.checkpointCode,
+                        "department": response.categoryName,
+                        "streamCode": response.streamCode,
+                        "clauseRef": clause,
+                        "grade": response.gradeAwarded,
+                        "standardClauses": response.standardClauses or [],
+                    },
+                    severity=_capa_severity(finding.severity),
+                    priority="HIGH" if finding.severity in ("CRITICAL_NC", "MAJOR_NC") else "MODERATE",
+                    detected_method="INTERNAL_AUDIT",
+                    owner_id=owner,
+                    actor_id=actor_id,
+                    due_days=_days_until(finding.dueDate),
+                    # The gate. Actions cannot be planned from here — see
+                    # `assert_actions_unlocked`.
+                    state="UNDER_RCA",
+                )
+            except ValueError as exc:
+                # Roll the RCA back with it: an RCA whose CAPA never existed is
+                # a form the auditee can fill in that leads nowhere.
+                await db.delete(rca)
+                await db.flush()
+                failures.append({
+                    "findingId": finding.id,
+                    "findingCode": finding.findingCode,
+                    "reason": str(exc),
+                })
+                continue
 
         capa.rcaMethodology = PIL_METHODOLOGY
         capa.rcaMethodologyRationale = (

@@ -210,7 +210,14 @@ async def _register_payload(db: AsyncSession, scoped, rows) -> dict[str, Any]:
     }
 
 
-@router.get("", response_model=ObservationListResponse)
+# No response_model on purpose — same as the other register endpoints
+# (incidents / near_miss / ptw / manhours). This route serves TWO shapes and a
+# fixed response_model silently filters the response down to its own fields:
+# with ObservationListResponse declared here, FastAPI dropped statusCounts,
+# categoryGroups, bottleneck, openCount and unsafeRecords from the
+# `register=true` payload, and the web register page crashed on the first of
+# them it read.
+@router.get("")
 async def list_observations(
     status_filter: str | None = None,
     register: bool = False,
