@@ -1042,7 +1042,7 @@ async def nc_register(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any
 
 
 async def nc_report(
-    db: AsyncSession, finding: AuditFinding
+    db: AsyncSession, finding: AuditFinding, *, viewer_id: str | None = None
 ) -> dict[str, Any]:
     """One NC as PIL/MR/F04-R1 itself — every box on the form, in form order.
 
@@ -1082,6 +1082,13 @@ async def nc_report(
         "formNo": PIL_FORM_NO,
         "findingId": finding.id,
         "stage": _stage(finding, capa, list(actions)),
+        # What THIS caller may edit. The screen renders from this rather than
+        # from the stage alone, so a control the API would refuse is never
+        # offered as editable.
+        "viewer": (
+            viewer_rights(audit, finding, response, viewer_id)
+            if audit is not None and viewer_id else None
+        ),
         # ── auditor half (yellow on the form) ─────────────────────────
         "auditorHalf": {
             "auditNumber": audit.auditNumber if audit else None,
@@ -1469,6 +1476,135 @@ async def delete_auditee_action(
     await db.flush()
 
 
+def auditor_ids(audit: ComplianceAudit) -> set[str]:
+    """Everyone on the AUDITOR side of this engagement."""
+    ids = {audit.leadAuditorUserId}
+    for c in (audit.coAuditors or []):
+        if isinstance(c, dict) and c.get("userId"):
+            ids.add(c["userId"])
+        elif isinstance(c, str):
+            ids.add(c)
+    return {i for i in ids if i}
+
+
+def auditee_ids_for(
+    audit: ComplianceAudit, response: AuditCheckpointResponse | None
+) -> set[str]:
+    """Everyone on the AUDITEE side for THIS checkpoint's department.
+
+    An auditee declared for Human Resources is not the auditee of an
+    Administration non-conformity, so the department is part of the test. An
+    auditee declared with no department at all is treated as covering the whole
+    audit, which is how the scheduler records a single-department engagement.
+    """
+    out: set[str] = set()
+    for a in (audit.auditees or []):
+        if not isinstance(a, dict):
+            if isinstance(a, str):
+                out.add(a)
+            continue
+        uid = a.get("userId")
+        if not uid:
+            continue
+        cats = a.get("responsibleCategories") or []
+        if not cats or (response is not None and response.categoryId in cats):
+            out.add(uid)
+    return out
+
+
+def viewer_rights(
+    audit: ComplianceAudit,
+    finding: AuditFinding,
+    response: AuditCheckpointResponse | None,
+    user_id: str,
+) -> dict[str, Any]:
+    """What THIS person may do to THIS NC report, right now.
+
+    Two independent tests, and both must pass:
+
+      * **custody** — is this half of the form currently open at all
+      * **identity** — is this person the party that half belongs to
+
+    Permissions alone cannot answer the second. `AUDIT_COMPLIANCE.UPDATE` is
+    held by the auditee roles and by every auditor role, so a check that stops
+    at the permission lets an auditor write the auditee's analysis.
+
+    Computed server-side and handed to the screen so the two can never disagree:
+    a control the API would refuse is never rendered as editable.
+    """
+    auditors = auditor_ids(audit)
+    auditees = auditee_ids_for(audit, response)
+    is_auditor = user_id in auditors
+    # Same-engagement exclusivity: being on the auditor side wins. Someone
+    # listed as both is an independence fault, and resolving it towards
+    # "auditor" fails safe — it withholds the auditee's section rather than
+    # handing an auditor the analysis they would later verify.
+    is_auditee = (user_id in auditees or user_id == finding.ownerId) and not is_auditor
+    stage = _stage(finding, None, [])
+
+    auditee_open = stage == "WITH_AUDITEE"
+    auditor_open = stage == "WITH_AUDITOR_DRAFT"
+
+    def reason_auditee() -> str | None:
+        if is_auditor:
+            return (
+                "This section belongs to the auditee. You are an auditor on this "
+                "engagement — ISO 19011 §7.2.3, auditors do not author the "
+                "response they will verify."
+            )
+        if not is_auditee:
+            return "Only the auditee named for this department can complete this section."
+        if stage == "WITH_AUDITOR_DRAFT":
+            return "Not yet issued — this opens once the auditor releases the report."
+        if not auditee_open:
+            return "Returned to the auditor — locked while effectiveness is verified."
+        return None
+
+    return {
+        "userId": user_id,
+        "isAuditor": is_auditor,
+        "isAuditee": is_auditee,
+        "canEditAuditorHalf": is_auditor and auditor_open,
+        "canEditAuditeeHalf": is_auditee and auditee_open,
+        "auditeeLockReason": reason_auditee(),
+        "auditorLockReason": (
+            None if is_auditor and auditor_open
+            else "This section belongs to the auditor." if not is_auditor
+            else "Locked since issue — the auditee is answering this wording."
+        ),
+    }
+
+
+async def assert_is_auditee_party(
+    db: AsyncSession, finding: AuditFinding, *, user_id: str
+) -> None:
+    """Raise unless this person is the auditee for this non-conformity.
+
+    The identity half of the gate. Custody is checked separately by
+    `assert_auditee_may_edit`; passing one without the other is what let an
+    auditor write the auditee's section.
+    """
+    audit = await db.get(ComplianceAudit, finding.auditId)
+    if audit is None:
+        raise ValueError("Audit not found.")
+    response = (
+        await db.get(AuditCheckpointResponse, finding.checkpointResponseId)
+        if finding.checkpointResponseId else None
+    )
+    rights = viewer_rights(audit, finding, response, user_id)
+    if rights["isAuditor"]:
+        raise ValueError(
+            f"{PIL_FORM_NO}: this section belongs to the auditee. You are an "
+            f"auditor on this engagement — ISO 19011 §7.2.3, auditors do not "
+            f"author the response they will verify."
+        )
+    if not rights["isAuditee"]:
+        raise ValueError(
+            f"{PIL_FORM_NO}: only the auditee named for this department can "
+            f"complete the Root Cause Analysis, Correction and Preventive Action."
+        )
+
+
 def assert_auditee_may_edit(finding: AuditFinding) -> None:
     """The accented half is writable only while the auditee holds the form."""
     if not finding.issuedAt:
@@ -1634,6 +1770,10 @@ __all__ = [
     "recall_nc_report",
     "submit_auditee_section",
     "assert_auditee_may_edit",
+    "assert_is_auditee_party",
+    "viewer_rights",
+    "auditor_ids",
+    "auditee_ids_for",
     "save_auditee_analysis",
     "save_auditee_action",
     "delete_auditee_action",

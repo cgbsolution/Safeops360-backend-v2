@@ -1520,7 +1520,7 @@ async def get_nc_report(
     audit = await _load_or_404(db, finding.auditId)
     await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
                    record_id=audit.id)
-    return await nc_rca_capa.nc_report(db, finding)
+    return await nc_rca_capa.nc_report(db, finding, viewer_id=user.id)
 
 
 class NcAuditorSectionRequest(BaseModel):
@@ -1558,7 +1558,7 @@ async def update_nc_auditor_section(
     except ValueError as e:
         raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
     await db.commit()
-    return await nc_rca_capa.nc_report(db, finding)
+    return await nc_rca_capa.nc_report(db, finding, viewer_id=user.id)
 
 
 @router.post("/nc-reports/{finding_id}/issue")
@@ -1632,7 +1632,7 @@ class NcActionRequest(BaseModel):
     actionId: str | None = None
 
 
-async def _require_auditee(db: AsyncSession, user: User, audit) -> None:
+async def _require_auditee(db: AsyncSession, user: User, audit, finding=None) -> None:
     """The auditee half of the form.
 
     AUDIT_COMPLIANCE.UPDATE, because that is the permission the auditee-class
@@ -1645,6 +1645,15 @@ async def _require_auditee(db: AsyncSession, user: User, audit) -> None:
                    record={"teamMembers": [{"userId": uid} for uid in
                                            svc.audit_party_ids(audit)]},
                    record_id=audit.id)
+    # ...and the IDENTITY test. The permission above is held by the auditee
+    # roles AND by every auditor role, so on its own it let a lead auditor write
+    # the auditee's root cause analysis — the one thing the form's colour key
+    # exists to prevent.
+    if finding is not None:
+        try:
+            await nc_rca_capa.assert_is_auditee_party(db, finding, user_id=user.id)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
 
 @router.patch("/nc-reports/{finding_id}/analysis")
@@ -1661,7 +1670,7 @@ async def save_nc_analysis(
     """
     finding = await _load_nc_or_404(db, finding_id)
     audit = await _load_or_404(db, finding.auditId)
-    await _require_auditee(db, user, audit)
+    await _require_auditee(db, user, audit, finding)
     try:
         result = await nc_rca_capa.save_auditee_analysis(
             db, finding,
@@ -1686,7 +1695,7 @@ async def save_nc_action(
     """Auditee records a Correction or a Preventive Action (form rows 18-25)."""
     finding = await _load_nc_or_404(db, finding_id)
     audit = await _load_or_404(db, finding.auditId)
-    await _require_auditee(db, user, audit)
+    await _require_auditee(db, user, audit, finding)
     kind = (nc_rca_capa.ACTION_TYPE_FOR_CORRECTION if body.actionType == "CORRECTION"
             else nc_rca_capa.ACTION_TYPE_FOR_PREVENTIVE)
     try:
@@ -1711,7 +1720,7 @@ async def delete_nc_action(
 ) -> None:
     finding = await _load_nc_or_404(db, finding_id)
     audit = await _load_or_404(db, finding.auditId)
-    await _require_auditee(db, user, audit)
+    await _require_auditee(db, user, audit, finding)
     try:
         await nc_rca_capa.delete_auditee_action(
             db, finding, action_id=action_id, actor_id=user.id)

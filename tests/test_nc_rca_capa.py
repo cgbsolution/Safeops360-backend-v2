@@ -32,6 +32,7 @@ from app.services.nc_rca_capa import (
     _stage,
     assert_actions_unlocked,
     assert_auditee_may_edit,
+    viewer_rights,
     issue_nc_report,
     mr_sign_off,
     seed_why_payload,
@@ -499,3 +500,92 @@ def test_a_backdated_due_date_still_yields_a_workable_closure_target():
     raised, which teaches people to ignore the breach count."""
     assert _days_until(date.today() - timedelta(days=400)) >= 7
     assert _days_until(None) > 0
+
+
+# ── the two halves belong to two PEOPLE, not just two stages ─────────
+
+
+def _audit(**over):
+    base = dict(
+        id="aud1", auditNumber="AUD-PI-2026-NW-0043", plantId="p1", title="t",
+        leadAuditorUserId="auditor-1",
+        coAuditors=[{"userId": "co-auditor-1"}],
+        auditees=[{"userId": "auditee-hr", "responsibleCategories": ["DEPT_HR"]},
+                  {"userId": "auditee-admin", "responsibleCategories": ["DEPT_ADMIN"]}],
+        plantManagerUserId="mr-1", actualEndAt=None, scheduledDate=None,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _response(**over):
+    base = dict(
+        id="r1", categoryId="DEPT_HR", categoryName="Human Resources", streamCode="IMS",
+        checkpointCode="PI-HR-IMS-008", checkpointQuestion="HIRA", observation="",
+        standardClauses=[], requirementReference="OHSMS 6.1.2", gradeAwarded=None,
+        complianceStatus=None, auditorNote=None, auditorEvidenceIds=[],
+        assignedOwnerId="auditee-hr", routedToUserId=None, assignedAuditorId=None,
+        sequence=1,
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _issued(**over):
+    """A report currently with the auditee."""
+    return _finding(auditeeSubmittedAt=None, ownerId="auditee-hr", **over)
+
+
+def test_the_auditor_cannot_write_the_auditees_analysis():
+    """The single rule the form's colour key exists to enforce. `UPDATE` is held
+    by the auditee roles AND every auditor role, so a permission-only gate let
+    the lead auditor author the response they would later verify."""
+    r = viewer_rights(_audit(), _issued(), _response(), "auditor-1")
+    assert r["isAuditor"] is True
+    assert r["canEditAuditeeHalf"] is False
+    assert "ISO 19011" in r["auditeeLockReason"]
+
+
+def test_a_co_auditor_is_locked_out_too():
+    r = viewer_rights(_audit(), _issued(), _response(), "co-auditor-1")
+    assert r["canEditAuditeeHalf"] is False
+
+
+def test_the_named_auditee_can_write_it():
+    r = viewer_rights(_audit(), _issued(), _response(), "auditee-hr")
+    assert r["isAuditee"] is True
+    assert r["canEditAuditeeHalf"] is True
+    assert r["auditeeLockReason"] is None
+
+
+def test_an_auditee_of_another_department_cannot():
+    """A Human Resources auditee is not the auditee of an Administration NC."""
+    r = viewer_rights(_audit(), _issued(), _response(), "auditee-admin")
+    assert r["canEditAuditeeHalf"] is False
+
+
+def test_a_bystander_cannot():
+    r = viewer_rights(_audit(), _issued(), _response(), "someone-else")
+    assert r["canEditAuditeeHalf"] is False
+
+
+def test_someone_listed_as_both_is_treated_as_the_auditor():
+    """Fails safe: it withholds the auditee's section rather than handing an
+    auditor the analysis they will later verify."""
+    a = _audit(auditees=[{"userId": "auditor-1", "responsibleCategories": ["DEPT_HR"]}])
+    r = viewer_rights(a, _issued(), _response(), "auditor-1")
+    assert r["isAuditor"] is True and r["isAuditee"] is False
+    assert r["canEditAuditeeHalf"] is False
+
+
+def test_the_auditee_is_never_offered_the_yellow_half():
+    drafting = _finding(issuedAt=None, auditeeSubmittedAt=None, ownerId="auditee-hr")
+    r = viewer_rights(_audit(), drafting, _response(), "auditee-hr")
+    assert r["canEditAuditorHalf"] is False
+
+
+def test_the_auditor_owns_the_yellow_half_before_issue():
+    drafting = _finding(issuedAt=None, auditeeSubmittedAt=None)
+    r = viewer_rights(_audit(), drafting, _response(), "auditor-1")
+    assert r["canEditAuditorHalf"] is True
+    assert r["auditorLockReason"] is None
