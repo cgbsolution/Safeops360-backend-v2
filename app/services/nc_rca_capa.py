@@ -179,7 +179,7 @@ async def ensure_findings_exist(
 
 async def non_conformities_for_audit(
     db: AsyncSession, audit_id: str
-) -> list[tuple[AuditFinding, AuditCheckpointResponse]]:
+) -> list[tuple[AuditFinding | None, AuditCheckpointResponse]]:
     """The findings that are NON-CONFORMITIES, paired with their checkpoint.
 
     Selection is on the CHECKPOINT's `assessmentStatus == FAIL`, not on the
@@ -197,22 +197,26 @@ async def non_conformities_for_audit(
     `observationOnly` would silently drop it, which is the class of bug that put
     375 observations on the floor at the CamsFinding boundary.
     """
+    # Driven from the CHECKPOINT, with the finding outer-joined on. Driving it
+    # from `AuditFinding` meant a non-conformity was invisible until someone had
+    # already raised its report — and the only way to raise one is from this
+    # register, so nothing could ever be raised at all.
     rows = (
         await db.execute(
-            select(AuditFinding, AuditCheckpointResponse)
-            .join(
-                AuditCheckpointResponse,
-                AuditFinding.checkpointResponseId == AuditCheckpointResponse.id,
+            select(AuditCheckpointResponse, AuditFinding)
+            .outerjoin(
+                AuditFinding,
+                (AuditFinding.checkpointResponseId == AuditCheckpointResponse.id)
+                & (AuditFinding.isDeleted.is_(False)),
             )
             .where(
-                AuditFinding.auditId == audit_id,
-                AuditFinding.isDeleted.is_(False),
+                AuditCheckpointResponse.auditId == audit_id,
                 AuditCheckpointResponse.assessmentStatus == "FAIL",
             )
-            .order_by(AuditCheckpointResponse.sequence, AuditFinding.findingCode)
+            .order_by(AuditCheckpointResponse.sequence)
         )
     ).all()
-    return [(f, r) for f, r in rows]
+    return [(f, r) for r, f in rows]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -413,24 +417,32 @@ async def trigger_for_audit(
         wanted = set(finding_ids)
         pairs = [(f, r) for f, r in pairs if f.id in wanted]
 
-    todo = [(f, r) for f, r in pairs if not f.rcaId]
+    # `ensure_findings_exist` ran above, so every pair should carry a finding;
+    # a None here means that one checkpoint could not be materialised, and it is
+    # reported rather than crashing the batch.
+    todo = [(f, r) for f, r in pairs if f is not None and not f.rcaId]
     skipped = [
         {"findingId": f.id, "findingCode": f.findingCode, "ncrNumber": f.ncrNumber,
          "reason": "already has an NC report"}
-        for f, _ in pairs if f.rcaId
+        for f, _ in pairs if f is not None and f.rcaId
+    ]
+    failures_pre = [
+        {"findingId": None, "findingCode": r.checkpointCode,
+         "reason": "no finding row could be created for this checkpoint"}
+        for f, r in pairs if f is None
     ]
     if not todo:
         return {
             "created": 0, "skipped": len(skipped), "failed": 0,
             "nonConformities": len(pairs), "findingsMaterialised": materialised,
-            "items": [], "skippedItems": skipped, "failures": [],
+            "items": [], "skippedItems": skipped, "failures": failures_pre,
         }
 
     rca_codes = await _allocate_rca_codes(db, len(todo))
     next_ncr = await _highest_ncr_number(db, audit.id) + 1
 
     items: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = list(failures_pre)
 
     for offset, ((finding, response), rca_code) in enumerate(zip(todo, rca_codes)):
         ncr_number = f"{next_ncr + offset:02d}"
@@ -885,7 +897,7 @@ async def nc_register(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any
     closure review.
     """
     pairs = await non_conformities_for_audit(db, audit.id)
-    capa_ids = [f.capaId for f, _ in pairs if f.capaId]
+    capa_ids = [f.capaId for f, _ in pairs if f is not None and f.capaId]
     capas = {
         c.id: c for c in (
             await db.execute(select(Capa).where(Capa.id.in_(capa_ids)))
@@ -905,6 +917,35 @@ async def nc_register(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any
     today = _now().date()
     rows: list[dict[str, Any]] = []
     for finding, response in pairs:
+        if finding is None:
+            # A failed checkpoint with no NC report raised yet. It IS a
+            # non-conformity — the auditor said so — and showing it is what
+            # makes the "Raise NC reports" action reachable.
+            rows.append({
+                "findingId": None,
+                "findingCode": None,
+                "ncrNumber": None,
+                "checkpointCode": response.checkpointCode,
+                "requirement": response.checkpointQuestion,
+                "department": response.categoryName,
+                "streamCode": response.streamCode,
+                "clauseRef": _clause_text(response),
+                "grade": response.gradeAwarded,
+                "severity": "MAJOR_NC",
+                "nonconformity": response.observation,
+                "ownerId": response.assignedOwnerId or response.routedToUserId,
+                "stage": "NOT_RAISED",
+                "stageAction": NC_STAGE_ACTION["NOT_RAISED"],
+                "holder": NC_STAGE_HOLDER["NOT_RAISED"],
+                "issuedAt": None, "auditeeSubmittedAt": None,
+                "rcaId": None, "rcaStatus": None, "rcaDueDate": None, "rcaOverdue": False,
+                "capaId": None, "capaNumber": None, "capaState": None,
+                "correctionCount": 0, "preventiveCount": 0, "openActionCount": 0,
+                "dueDate": None, "isOverdue": False, "isRepeatFinding": False,
+                "verificationResult": None, "auditorSignedAt": None,
+                "mrSignedAt": None, "closedAt": None,
+            })
+            continue
         capa = capas.get(finding.capaId) if finding.capaId else None
         actions = actions_by_capa.get(capa.id, []) if capa else []
         stage = _stage(finding, capa, actions)
