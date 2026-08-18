@@ -105,6 +105,19 @@ ACTION_TYPE_FOR_PREVENTIVE = "PREVENTIVE"
 # clause 9.3 NC alongside a shop-floor injury would make both unreadable.
 PIL_RCA_DOMAIN = "COMPLIANCE"
 
+# The form's Grade box is a controlled vocabulary, not free text. It was
+# rendering as an open input showing the raw enum ("MAJOR_IMPROVEMENT_NEEDED"),
+# which invited a typed value that no report, score or export could read back.
+#
+# Only the ADVERSE grades are offered: an NC report exists because a checkpoint
+# was marked Non-Conformance, so "Effective" and "N/A" are not outcomes it can
+# have. Ordered worst-first, the way the workbook lists them.
+NC_GRADE_CODES: tuple[str, ...] = (
+    "UNSATISFACTORY",
+    "MAJOR_IMPROVEMENT_NEEDED",
+    "SOME_IMPROVEMENT_NEEDED",
+)
+
 # Severity → how long the auditee has for the ROOT CAUSE, when no CapaSlaProfile
 # is seeded. The NC's own `dueDate` ("To be completed before", set by the
 # auditor on the form) governs total closure; this is the internal milestone
@@ -640,6 +653,16 @@ async def trigger_for_audit(
     }
 
 
+def _grade_label(code: str | None) -> str:
+    """Workbook wording for a grade code. Falls back to a de-underscored form so
+    a legacy or unknown value still reads as words rather than as an enum."""
+    from app.services import page_grading as _pg
+
+    if not code:
+        return ""
+    return _pg.GRADE_LABEL.get(code) or code.replace("_", " ").title()
+
+
 def _evidence_note(response: AuditCheckpointResponse) -> str:
     """The form's "Evidence" box, seeded from what the auditor captured.
 
@@ -1084,6 +1107,11 @@ async def nc_report(
             "evidenceNote": finding.evidenceNote,
             "evidence": (response.auditorEvidenceIds or []) if response else [],
             "grade": finding.gradeText or (response.gradeAwarded if response else None),
+            # value + label pairs, so the screen renders the workbook's wording
+            # ("Major Improvement Needed") while storing the code.
+            "gradeOptions": [
+                {"value": g, "label": _grade_label(g)} for g in NC_GRADE_CODES
+            ],
             "severity": finding.severity,
             "leadAuditor": audit.leadAuditorUserId if audit else None,
             "auditor": (response.assignedAuditorId if response else None)
@@ -1597,6 +1625,7 @@ async def mr_sign_off(
 
 __all__ = [
     "PIL_FORM_NO",
+    "NC_GRADE_CODES",
     "NC_STAGE_ACTION",
     "NC_STAGE_HOLDER",
     "AUDITOR_SECTION_FIELDS",
