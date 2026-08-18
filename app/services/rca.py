@@ -32,6 +32,21 @@ def normalise_rca_method(input_str: str | None) -> str | None:
     return _NORMALISE.get(input_str.strip())
 
 
+def _sentence(text: str | None) -> str:
+    """One clean sentence body: no wrapping whitespace, no leading punctuation,
+    no trailing full stop.
+
+    The generator appends its own "." and " Root cause: ", so text that already
+    ended in a period produced ".." and an observation pasted with a leading
+    ": " produced a summary that opened on a colon. Both were visible on the
+    CAPA screen of a signed-off non-conformity.
+    """
+    t = (text or "").strip()
+    while t[:1] in {":", "-", "\u2014", ".", ","}:
+        t = t[1:].lstrip()
+    return t.rstrip().rstrip(".").rstrip()
+
+
 def is_empty_rca_data(method: str, data: Any) -> bool:
     if data is None or not isinstance(data, dict):
         return True
@@ -72,8 +87,8 @@ def generate_rca_summary(method: str | None, data: Any) -> str | None:
         root = (data.get("rootCause") or "").strip()
         whys = data.get("whys") or []
         last_answer = next((w.get("answer", "").strip() for w in reversed(whys) if (w.get("answer") or "").strip()), "")
-        cause = root or last_answer or ""
-        problem = (data.get("problemStatement") or "Incident").strip()
+        cause = _sentence(root or last_answer)
+        problem = _sentence(data.get("problemStatement")) or "Incident"
         return f"{problem}. Root cause: {cause or '—'}."
     if method == "FISHBONE":
         roots = (data.get("rootCauses") or [])[:2]

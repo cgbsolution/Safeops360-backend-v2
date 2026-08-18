@@ -46,7 +46,7 @@ The form, mapped:
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
@@ -763,8 +763,12 @@ async def release_capa_from_rca(
 
     capa.rcaCompleted = True
     capa.rcaSummary = generate_rca_summary(PIL_METHODOLOGY, payload)
-    capa.rcaCompletedAt = _now()
-    capa.rcaCompletedByUserId = actor_id
+    # Set ONCE. This runs again when the auditee returns the report, and
+    # restamping moved "RCA completed" to the submission time — which made the
+    # analysis look like it happened AFTER the actions it unlocked.
+    if capa.rcaCompletedAt is None:
+        capa.rcaCompletedAt = _now()
+        capa.rcaCompletedByUserId = actor_id
     # Every rung except the last is a contributing factor; the last is the
     # system failure the form asks for. Keeping the chain rather than only its
     # conclusion is what lets a reviewer see whether the ladder actually
@@ -1468,7 +1472,24 @@ async def save_auditee_action(
     if evidence is not None:
         action.evidenceOfCompletion = evidence
     if completed_on is not None:
-        action.completedAt = completed_on
+        # The form's "Completed on" is a DATE; the audit trail needs a MOMENT.
+        # Storing the date verbatim gave midnight, so a Correction finished at
+        # 12:06 sorted ten hours BEFORE the CAPA that contains it was created —
+        # a trail that reads as impossible is worse than no trail.
+        #
+        # Today keeps the actual recording time. A back-dated completion keeps
+        # its own date but sits at the end of that day, so it still precedes
+        # everything that came after it without colliding with the boundary.
+        now = _now()
+        picked = completed_on
+        if picked.tzinfo is None:
+            picked = picked.replace(tzinfo=timezone.utc)
+        if picked.date() == now.date():
+            action.completedAt = now
+        elif picked.date() < now.date() and picked.timetz() == time(0, 0, tzinfo=timezone.utc):
+            action.completedAt = picked.replace(hour=23, minute=59, second=0)
+        else:
+            action.completedAt = picked
         action.status = "COMPLETED"
     await db.flush()
     return {"actionId": action.id, "actionType": action.actionType, "status": action.status}

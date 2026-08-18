@@ -35,6 +35,7 @@ from app.services.nc_rca_capa import (
     viewer_rights,
     issue_nc_report,
     mr_sign_off,
+    save_auditee_action,
     seed_why_payload,
     update_auditor_section,
     validate_why_payload,
@@ -616,3 +617,41 @@ def test_only_the_mr_signs_and_only_after_the_auditor():
     # And nobody may sign before the auditor has verified.
     unverified = _finding(ownerId="auditee-hr")
     assert viewer_rights(_audit(), unverified, _response(), "mr-1")["canSign"] is False
+
+
+# ── the audit trail has to read as possible ──────────────────────────
+
+
+def test_a_completion_dated_today_keeps_the_time_it_was_recorded():
+    """A date-only "Completed on" stamped midnight, so an action finished at
+    12:06 sorted ten hours BEFORE the CAPA that contains it was created. An
+    audit trail that reads as impossible is worse than no audit trail."""
+    from app.services.nc_rca_capa import _now
+
+    now = _now()
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    capa = _capa(state="ACTIONS_PLANNED")
+    action = SimpleNamespace(
+        id="a1", capaId="capa1", actionType=ACTION_TYPE_FOR_CORRECTION,
+        description="", ownerUserId="", dueDate=None, sortOrder=0,
+        status="PROPOSED", completedAt=None, evidenceOfCompletion=None,
+    )
+    db = _FakeDb(capa)
+
+    async def _get(model, _id):
+        return action if _id == "a1" else capa
+    db.get = _get
+
+    asyncio.run(save_auditee_action(
+        db, _finding(issuedAt=datetime.now(timezone.utc), auditeeSubmittedAt=None,
+                     ownerId="auditee-hr"),
+        action_type=ACTION_TYPE_FOR_CORRECTION, description="Re-ran the HIRA.",
+        owner_id="auditee-hr", due_date=date(2026, 9, 30),
+        completed_on=today_midnight, action_id="a1", actor_id="auditee-hr",
+    ))
+    assert action.status == "COMPLETED"
+    assert action.completedAt.hour != 0 or action.completedAt.minute != 0, (
+        "a completion recorded today must keep the time it was recorded, "
+        "not collapse to midnight"
+    )
+    assert action.completedAt.date() == now.date()
