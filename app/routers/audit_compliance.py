@@ -1573,6 +1573,117 @@ async def recall_nc_report(
     return result
 
 
+class NcWhyRow(BaseModel):
+    question: str = ""
+    answer: str = ""
+
+
+class NcAnalysisRequest(BaseModel):
+    """The auditee's Why-Why ladder. No `methodology` field, by design —
+    PIL/MR/F04-R1 prescribes Why-Why and offers no alternative."""
+    problemStatement: str | None = None
+    whys: list[NcWhyRow] | None = None
+    rootCause: str | None = None
+
+
+class NcActionRequest(BaseModel):
+    actionType: Literal["CORRECTION", "PREVENTIVE"]
+    description: str = Field(min_length=5)
+    ownerUserId: str
+    dueDate: date
+    completedOn: datetime | None = None
+    evidence: str | None = None
+    actionId: str | None = None
+
+
+async def _require_auditee(db: AsyncSession, user: User, audit) -> None:
+    """The auditee half of the form.
+
+    AUDIT_COMPLIANCE.UPDATE, because that is the permission the auditee-class
+    roles actually hold — AUDITEE, DEPARTMENT_HEAD, SAFETY_OFFICER, SUPERVISOR
+    and WORKER all have it at OWN_RECORDS. RCA.CREATE and CAPA.UPDATE, which the
+    generic RCA and CAPA screens demand, are held by none of them; gating this
+    on either would close the auditee's own section to the auditee.
+    """
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record={"teamMembers": [{"userId": uid} for uid in
+                                           svc.audit_party_ids(audit)]},
+                   record_id=audit.id)
+
+
+@router.patch("/nc-reports/{finding_id}/analysis")
+async def save_nc_analysis(
+    finding_id: str,
+    body: NcAnalysisRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditee writes the Root Cause Analysis (form rows 16-17).
+
+    Returns the outstanding `problems` so the screen can show what the form
+    still needs, and `actionsUnlocked` once the ladder is complete.
+    """
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require_auditee(db, user, audit)
+    try:
+        result = await nc_rca_capa.save_auditee_analysis(
+            db, finding,
+            problem_statement=body.problemStatement,
+            whys=[w.model_dump() for w in body.whys] if body.whys is not None else None,
+            root_cause=body.rootCause,
+            actor_id=user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return result
+
+
+@router.post("/nc-reports/{finding_id}/actions")
+async def save_nc_action(
+    finding_id: str,
+    body: NcActionRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditee records a Correction or a Preventive Action (form rows 18-25)."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require_auditee(db, user, audit)
+    kind = (nc_rca_capa.ACTION_TYPE_FOR_CORRECTION if body.actionType == "CORRECTION"
+            else nc_rca_capa.ACTION_TYPE_FOR_PREVENTIVE)
+    try:
+        result = await nc_rca_capa.save_auditee_action(
+            db, finding, action_type=kind, description=body.description,
+            owner_id=body.ownerUserId, due_date=body.dueDate,
+            completed_on=body.completedOn, evidence=body.evidence,
+            action_id=body.actionId, actor_id=user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return result
+
+
+@router.delete("/nc-reports/{finding_id}/actions/{action_id}", status_code=204)
+async def delete_nc_action(
+    finding_id: str,
+    action_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require_auditee(db, user, audit)
+    try:
+        await nc_rca_capa.delete_auditee_action(
+            db, finding, action_id=action_id, actor_id=user.id)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+
+
 @router.post("/nc-reports/{finding_id}/submit")
 async def submit_nc_report(
     finding_id: str,

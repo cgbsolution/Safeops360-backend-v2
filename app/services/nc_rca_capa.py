@@ -49,7 +49,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit_compliance import AuditCheckpointResponse, ComplianceAudit
@@ -1063,6 +1063,12 @@ async def nc_report(
                 "whys": (rca.analysisPayload or {}).get("whys", []) if rca else [],
                 "rootCause": (rca.analysisPayload or {}).get("rootCause") if rca else None,
                 "dueDate": capa.rcaDueDate.isoformat() if capa and capa.rcaDueDate else None,
+                # The opening Why, derived from the failed requirement. The
+                # form's own example starts there rather than at the symptom.
+                "suggestedFirstWhy": (
+                    ((rca.analysisPayload or {}).get("pilNcReport") or {}).get("suggestedFirstWhy")
+                    if rca else None
+                ),
                 "locked": bool(rca and rca.status == "APPROVED"),
                 "problems": validate_why_payload(rca.analysisPayload) if rca else [],
             },
@@ -1233,6 +1239,20 @@ async def submit_auditee_section(
     if problems:
         raise ValueError(" ".join(problems))
 
+    # The auditee's analysis is complete and is now the record the auditor
+    # verifies against, so it stops being a draft. There is deliberately no
+    # separate approver: `RCA.APPROVE` is held by HSE_MANAGER, CRO, RISK_OWNER
+    # and the admin roles and by no auditee-class role, so a human approval gate
+    # between the ladder and the Correction would strand every real auditee.
+    # The paper form has no such step either — the auditor's verification at the
+    # foot of the page is the review.
+    if rca is not None and rca.status != "APPROVED":
+        rca.status = "APPROVED"
+        rca.approvedAt = _now()
+        rca.approverId = actor_id
+        await release_capa_from_rca(db, rca, actor_id=actor_id)
+        finding.rcaStatus = rca.status
+
     finding.auditeeSubmittedAt = _now()
     finding.auditeeSubmittedById = actor_id
     finding.status = "VERIFICATION"
@@ -1247,6 +1267,137 @@ async def submit_auditee_section(
         "stage": "WITH_AUDITOR_VERIFY",
         "submittedAt": finding.auditeeSubmittedAt.isoformat(),
     }
+
+
+async def save_auditee_analysis(
+    db: AsyncSession, finding: AuditFinding, *,
+    problem_statement: str | None = None,
+    whys: list[dict] | None = None,
+    root_cause: str | None = None,
+    actor_id: str,
+) -> dict[str, Any]:
+    """The auditee writes the Why-Why ladder — THROUGH THE NC REPORT.
+
+    This exists because of a permission fact that made the first design
+    unusable: `RCA.CREATE` and even `RCA.READ` are held by HSE_MANAGER, CRO,
+    RISK_OWNER and the admin roles — and by no auditee-class role at all.
+    SUPERVISOR, SAFETY_OFFICER, DEPARTMENT_HEAD and WORKER have none of them.
+    Sending the auditee to /erm/rca/<id> to fill in their own analysis therefore
+    sent them to a screen they cannot open, on a form whose entire point is that
+    the auditee fills that section.
+
+    So the ladder is written here instead, under `AUDIT_COMPLIANCE.UPDATE` —
+    which every auditee-class role holds at OWN_RECORDS — plus the custody rule.
+    The RootCauseAnalysis stays system-of-record; this is a door into it, not a
+    second copy of it.
+
+    Releasing the CAPA is automatic once the ladder is complete. The paper form
+    has no approval step between the analysis and the Correction, and inventing
+    one meant an approver role (`RCA.APPROVE`) that no auditee can reach — the
+    auditee would fill in the analysis and then wait for a permission that never
+    arrives. The auditor's verification at the foot of the form IS the review.
+    """
+    assert_auditee_may_edit(finding)
+    if not finding.rcaId:
+        raise ValueError("This non-conformity has no analysis record.")
+    rca = await db.get(RootCauseAnalysis, finding.rcaId)
+    if rca is None:
+        raise ValueError("This non-conformity has no analysis record.")
+
+    payload = dict(rca.analysisPayload or {})
+    if problem_statement is not None:
+        payload["problemStatement"] = problem_statement
+    if whys is not None:
+        payload["whys"] = [
+            {"question": (w or {}).get("question", ""), "answer": (w or {}).get("answer", "")}
+            for w in whys
+        ]
+    if root_cause is not None:
+        payload["rootCause"] = root_cause
+    rca.analysisPayload = payload
+    rca.methodology = PIL_METHODOLOGY          # never anything else on this form
+    rca.narrative = generate_rca_summary(PIL_METHODOLOGY, payload)
+    rca.analystId = actor_id                   # the auditee owns the analysis
+    if rca.status == "DRAFT":
+        rca.status = "IN_ANALYSIS"
+    rca.updatedBy = actor_id
+    await db.flush()
+
+    problems = validate_why_payload(payload)
+    released = False
+    if not problems:
+        # Complete ladder → the Correction and Preventive Action boxes open.
+        await release_capa_from_rca(db, rca, actor_id=actor_id)
+        released = True
+    finding.rcaStatus = rca.status
+    await db.flush()
+    return {
+        "findingId": finding.id, "rcaId": rca.id,
+        "problems": problems, "actionsUnlocked": released,
+    }
+
+
+async def save_auditee_action(
+    db: AsyncSession, finding: AuditFinding, *,
+    action_type: str, description: str, owner_id: str,
+    due_date: date, completed_on: datetime | None = None,
+    evidence: str | None = None, action_id: str | None = None,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Correction or Preventive Action, written on the NC report.
+
+    Same reason as the analysis above: `CAPA.UPDATE` is held by AUDITEE and
+    DEPARTMENT_HEAD but NOT by SUPERVISOR, SAFETY_OFFICER or WORKER, so the
+    generic CAPA screen is closed to most of the people the form addresses.
+    """
+    assert_auditee_may_edit(finding)
+    if action_type not in (ACTION_TYPE_FOR_CORRECTION, ACTION_TYPE_FOR_PREVENTIVE):
+        raise ValueError(f"Unknown action type {action_type!r}.")
+    capa = await db.get(Capa, finding.capaId) if finding.capaId else None
+    if capa is None:
+        raise ValueError("This non-conformity has no CAPA.")
+    if capa.state == "UNDER_RCA":
+        raise ValueError(
+            f"{PIL_FORM_NO}: complete the Root Cause Analysis first — at least "
+            f"{PIL_MIN_WHY_LEVELS} levels of Why and a stated root cause."
+        )
+
+    if action_id:
+        action = await db.get(CapaAction, action_id)
+        if action is None or action.capaId != capa.id:
+            raise ValueError("Action not found on this non-conformity.")
+    else:
+        last = (await db.execute(
+            select(func.max(CapaAction.sortOrder))
+            .where(CapaAction.capaId == capa.id, CapaAction.actionType == action_type)
+        )).scalar() or 0
+        action = CapaAction(
+            capaId=capa.id, actionType=action_type, sortOrder=last + 1, status="PROPOSED",
+            description="", ownerUserId=owner_id, dueDate=due_date,
+        )
+        db.add(action)
+
+    action.description = description
+    action.ownerUserId = owner_id
+    action.dueDate = due_date
+    if evidence is not None:
+        action.evidenceOfCompletion = evidence
+    if completed_on is not None:
+        action.completedAt = completed_on
+        action.status = "COMPLETED"
+    await db.flush()
+    return {"actionId": action.id, "actionType": action.actionType, "status": action.status}
+
+
+async def delete_auditee_action(
+    db: AsyncSession, finding: AuditFinding, *, action_id: str, actor_id: str
+) -> None:
+    assert_auditee_may_edit(finding)
+    action = await db.get(CapaAction, action_id)
+    if action is None or action.capaId != finding.capaId:
+        raise ValueError("Action not found on this non-conformity.")
+    await db.delete(action)
+    await db.flush()
 
 
 def assert_auditee_may_edit(finding: AuditFinding) -> None:
@@ -1413,6 +1564,9 @@ __all__ = [
     "recall_nc_report",
     "submit_auditee_section",
     "assert_auditee_may_edit",
+    "save_auditee_analysis",
+    "save_auditee_action",
+    "delete_auditee_action",
     "PIL_METHODOLOGY",
     "PIL_MIN_WHY_LEVELS",
     "PIL_RCA_PROMPT",
