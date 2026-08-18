@@ -1159,6 +1159,15 @@ async def nc_report(
             # The gate, stated to the client so it can disable the Add buttons
             # with a reason rather than letting the auditee type an action and
             # then rejecting it on submit.
+            # Sensible starting values for a new Correction / Preventive Action.
+            # The picker used to default to whoever happened to be first in the
+            # user directory, which put an unrelated name in the Responsibility
+            # box of a governed form — an auditee accepting the default would
+            # have assigned the action to a stranger.
+            "defaultResponsibility": finding.ownerId,
+            "defaultTargetDate": (
+                finding.dueDate.isoformat() if finding.dueDate else None
+            ),
             "actionsLocked": bool(capa and capa.state == "UNDER_RCA" and capa.rcaRecordId),
             "actionsLockedReason": (
                 f"{PIL_FORM_NO}: approve the root cause analysis first."
