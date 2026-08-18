@@ -73,6 +73,28 @@ def _is_nc_report(rca: RootCauseAnalysis) -> bool:
     return isinstance(payload, dict) and bool(payload.get("pilNcReport"))
 
 
+async def _assert_nc_custody_allows_edit(db: AsyncSession, rca: RootCauseAnalysis) -> None:
+    """403 unless the NC report this RCA belongs to is currently the auditee's.
+
+    The RCA module is a general-purpose editor; without this, an NC report's
+    ladder stays writable through the generic PATCH long after the form has
+    gone back to the auditor for verification. The custody rule lives in
+    `nc_rca_capa` and is enforced at every door into the record, not only the
+    NC-report screen.
+    """
+    from app.models.cams_completion import AuditFinding
+
+    if rca.originType != "EVENT" or not rca.sourceEventId:
+        return
+    finding = await db.get(AuditFinding, rca.sourceEventId)
+    if finding is None or finding.rcaId != rca.id:
+        return
+    try:
+        nc_rca_capa.assert_auditee_may_edit(finding)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
 async def _require(db: AsyncSession, user: User, code: str, *, plant_id: str | None = None,
                    record: dict | None = None, record_id: str | None = None) -> None:
     res = await can(db, user.id, code, PermissionContext(plant_id=plant_id, record=record, record_id=record_id))
@@ -422,6 +444,22 @@ async def update_rca(rca_id: str, body: S.RcaUpdate, user: User = Depends(get_cu
     if "methodology" in data and data["methodology"]:
         from app.services.rca import normalise_rca_method
         data["methodology"] = normalise_rca_method(data["methodology"]) or rca.methodology
+    if _is_nc_report(rca):
+        # PIL/MR/F04-R1 prescribes ONE technique. The methodology is not the
+        # auditee's choice on an NC report, so it cannot be changed off Why-Why
+        # — a fishbone posted here would satisfy none of the validation the form
+        # defines and would print as an empty ladder on the issued page.
+        if data.get("methodology") not in (None, nc_rca_capa.PIL_METHODOLOGY):
+            raise HTTPException(
+                422,
+                f"{nc_rca_capa.PIL_FORM_NO} prescribes Why-Why analysis for every "
+                f"internal-audit non-conformity. The methodology cannot be changed.",
+            )
+        data.pop("methodology", None)
+        # And it is writable only while the AUDITEE holds the form. The ladder
+        # is in the accented half; editing it after the report has gone back to
+        # the auditor would change the analysis they are verifying against.
+        await _assert_nc_custody_allows_edit(db, rca)
     for k, v in data.items():
         setattr(rca, k, v)
     if rca.status == "DRAFT" and ("analysisPayload" in data or "narrative" in data):

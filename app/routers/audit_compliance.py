@@ -8,7 +8,7 @@ module. The service flushes; the get_db dependency commits at request end.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -1485,6 +1485,124 @@ async def get_nc_report(
     await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
                    record_id=audit.id)
     return await nc_rca_capa.nc_report(db, finding)
+
+
+class NcAuditorSectionRequest(BaseModel):
+    """The yellow half of PIL/MR/F04-R1. All optional — the screen saves as the
+    auditor types, and completeness is enforced at ISSUE, not on every keystroke."""
+    requirementText: str | None = None
+    observedNonconformity: str | None = None
+    evidenceNote: str | None = None
+    gradeText: str | None = None
+    clauseNo: str | None = None
+    orgRepresentativeId: str | None = None
+    dueDate: date | None = None
+
+
+class NcRecallRequest(BaseModel):
+    reason: str = Field(min_length=5)
+
+
+@router.patch("/nc-reports/{finding_id}/auditor-section")
+async def update_nc_auditor_section(
+    finding_id: str,
+    body: NcAuditorSectionRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditor completes their half of the form (rows 4-15). Pre-issue only."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    try:
+        await nc_rca_capa.update_auditor_section(
+            db, finding, data=body.model_dump(exclude_unset=True), actor_id=user.id,
+        )
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return await nc_rca_capa.nc_report(db, finding)
+
+
+@router.post("/nc-reports/{finding_id}/issue")
+async def issue_nc_report(
+    finding_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Hand the form to the auditee. The first custody change."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    try:
+        result = await nc_rca_capa.issue_nc_report(db, finding, actor_id=user.id)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    if finding.ownerId:
+        await svc._notify(
+            db, finding.ownerId,
+            f"NCR {finding.ncrNumber} issued — {audit.auditNumber}",
+            f"A non-conformance report has been issued to you. Complete the Root "
+            f"Cause Analysis, Correction and Preventive Action by "
+            f"{finding.dueDate.isoformat() if finding.dueDate else 'the stated date'}.",
+        )
+    await db.commit()
+    return result
+
+
+@router.post("/nc-reports/{finding_id}/recall")
+async def recall_nc_report(
+    finding_id: str,
+    body: NcRecallRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Pull an issued form back to correct the auditor half."""
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    try:
+        result = await nc_rca_capa.recall_nc_report(
+            db, finding, reason=body.reason, actor_id=user.id)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await db.commit()
+    return result
+
+
+@router.post("/nc-reports/{finding_id}/submit")
+async def submit_nc_report(
+    finding_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Auditee returns the completed form. The second custody change.
+
+    Gated on AUDIT_COMPLIANCE.UPDATE rather than EXECUTE: this is the AUDITEE's
+    action, and the auditee-class roles hold UPDATE at OWN_RECORDS scope while
+    EXECUTE is the auditor's side of the module.
+    """
+    finding = await _load_nc_or_404(db, finding_id)
+    audit = await _load_or_404(db, finding.auditId)
+    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+                   record={"teamMembers": [{"userId": uid} for uid in
+                                           svc.audit_party_ids(audit)]},
+                   record_id=audit.id)
+    try:
+        result = await nc_rca_capa.submit_auditee_section(db, finding, actor_id=user.id)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e)) from e
+    await svc._notify(
+        db, audit.leadAuditorUserId,
+        f"NCR {finding.ncrNumber} returned — {audit.auditNumber}",
+        "The auditee has completed the Root Cause Analysis, Correction and "
+        "Preventive Action. Verification of effective closure is now due.",
+    )
+    await db.commit()
+    return result
 
 
 @router.post("/nc-reports/{finding_id}/verify")

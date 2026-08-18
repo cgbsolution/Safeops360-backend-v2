@@ -568,6 +568,35 @@ class Evidence:
         img.save(buf, format="JPEG", quality=82)
         return buf.getvalue()
 
+    def preflight(self) -> None:
+        """Push ONE real object through the whole pipeline before anything else.
+
+        Generate, upload, sign, delete. It takes a second and it converts every
+        storage misconfiguration — wrong key, missing bucket, renamed keyword —
+        from "the audit silently would not seed" into a message naming the
+        actual fault, before 206 checkpoints have been graded against it.
+        """
+        if not self.enabled:
+            return
+        from app.services.storage import (
+            create_signed_download_url, delete_storage_object, upload_object,
+        )
+
+        path = svc.attachment_storage_path("preflight", "PREFLIGHT", "preflight.jpg")
+        data = self._frame(
+            code="PREFLIGHT", dept="DEPT_HR", stream="IMS", verdict="—",
+            question="Storage preflight — written and removed by the seeder.",
+            site="preflight", captured="",
+        )
+        upload_object(path, data, "image/jpeg")
+        url = create_signed_download_url(path, expires_in_sec=60)
+        if not url:
+            raise RuntimeError(f"Storage signed no URL for {path}")
+        try:
+            delete_storage_object(path)
+        except Exception:  # noqa: BLE001 — leaving one stray object is harmless
+            pass
+
     def photos(self, *, audit_id: str, code: str, dept: str, stream: str,
                verdict: str, question: str, site: str, captured: datetime,
                n: int = 1) -> list[dict]:
@@ -600,12 +629,14 @@ class Evidence:
             )
             file_name = f"{code}-{frame:02d}.jpg"
             path = svc.attachment_storage_path(audit_id, code, file_name)
-            try:
-                upload_object(path, data, "image/jpeg")
-                url = create_signed_download_url(path, expires_in=EVIDENCE_URL_TTL_SEC)
-            except Exception as e:  # noqa: BLE001
-                print(f"     ! evidence upload failed for {code}: {e}")
-                return []
+            # NOT wrapped in try/except. An upload that fails here guarantees
+            # `submit_audit` will reject the audit for a missing evidence photo
+            # 200 checkpoints later, and the first version of this seeder
+            # swallowed the error into a one-line warning and carried on —
+            # which is how a wrong keyword argument presented as "the audit
+            # would not seed" instead of as "expires_in is not a parameter".
+            upload_object(path, data, "image/jpeg")
+            url = create_signed_download_url(path, expires_in_sec=EVIDENCE_URL_TTL_SEC)
             out.append({
                 "url": url if isinstance(url, str) else (url or {}).get("signedUrl", ""),
                 "storagePath": path,
@@ -614,6 +645,112 @@ class Evidence:
                 "caption": f"{code} — {DEPT_LABEL.get(dept, dept)} [{stream}] — generated placeholder",
             })
         return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Connection resilience
+# ─────────────────────────────────────────────────────────────────────
+# `pool_pre_ping` (already on in app/core/db.py) validates a connection at
+# CHECKOUT. It cannot help when the connection dies mid-statement, which is what
+# a pooled Supabase link over a flaky WAN does — `ConnectionDoesNotExistError:
+# connection was closed in the middle of operation`, several thousand rows into
+# a seed run.
+#
+# So each unit of work runs in its own short session and is retried on a
+# transport failure with a fresh one. Retrying is safe because every unit here
+# is idempotent-by-construction: it re-reads its rows and re-applies the same
+# state, so a retry after a half-applied transaction converges on the same
+# result rather than doubling anything.
+_TRANSIENT = (
+    "connection was closed",
+    "connection does not exist",
+    "connection is closed",
+    "server closed the connection",
+    "connection reset",
+    "cannot perform operation",
+    "ssl connection has been closed",
+    "terminating connection",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    text = f"{exc}".lower()
+    cause = f"{getattr(exc, '__cause__', '')}".lower()
+    return any(t in text or t in cause for t in _TRANSIENT)
+
+
+async def in_session(fn, *, label: str = "", attempts: int = 5):
+    """Run `fn(db)` in a fresh session and commit. Retry on a dropped link.
+
+    On failure the whole engine pool is disposed, not just the session: the
+    pool can be holding several connections killed by the same network event,
+    and handing the retry another dead one from the same pool just fails again.
+    """
+    from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+
+    from app.core.db import engine
+
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            async with AsyncSessionLocal() as db:
+                out = await fn(db)
+                await db.commit()
+                return out
+        except (DBAPIError, OperationalError, InterfaceError, OSError) as e:
+            if attempt == attempts or not _is_transient(e):
+                raise
+            print(f"     ~ link dropped{label}; disposing pool, retry "
+                  f"{attempt}/{attempts - 1} in {delay:.0f}s")
+            try:
+                await engine.dispose()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Schema preflight
+# ─────────────────────────────────────────────────────────────────────
+# Columns this seeder needs that `scripts/add_nc_report_rca_capa.py` adds.
+# SQLAlchemy SELECTs every mapped column, so a single missing one makes any
+# query touching AuditFinding fail — including the seeder's own teardown, and
+# including the product's Findings page. Checking here turns a 90-line asyncpg
+# traceback into one sentence naming the script to run.
+REQUIRED_AUDITFINDING_COLUMNS = (
+    "ncrNumber", "rcaId", "rcaStatus", "orgRepresentativeId",
+    "verificationDetails", "auditorSignedById", "auditorSignedAt",
+    "mrSignedById", "mrSignedAt",
+)
+
+
+async def preflight_schema() -> None:
+    from sqlalchemy import text as sa_text
+
+    async with AsyncSessionLocal() as db:
+        present = {
+            r[0] for r in (await db.execute(sa_text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'AuditFinding'"
+            ))).all()
+        }
+    if not present:
+        raise SystemExit(
+            "\nThe AuditFinding table does not exist in this database.\n"
+            "Run:  python scripts/add_cams_completion.py\n"
+        )
+    missing = [c for c in REQUIRED_AUDITFINDING_COLUMNS if c not in present]
+    if missing:
+        raise SystemExit(
+            f"\nThe PIL NC-report columns are not applied to this database.\n"
+            f"Missing on AuditFinding: {', '.join(missing)}\n\n"
+            f"Run the migration first:\n"
+            f"    python scripts/add_nc_report_rca_capa.py\n\n"
+            f"It is additive and re-runnable. Until it runs, every query that\n"
+            f"touches AuditFinding fails — this seeder, and the product's\n"
+            f"Findings page and unified register with it.\n"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -926,80 +1063,110 @@ async def phase_schedule(spec: dict, ev: Evidence) -> dict:
 
 
 async def phase_conduct(ctx: dict, ev: Evidence) -> dict:
-    """Grade all 206 with the tristate vocabulary, submit, issue both interims."""
-    async with AsyncSessionLocal() as db:
+    """Grade all 206 with the tristate vocabulary, submit, issue both interims.
+
+    Evidence is generated and uploaded FIRST, with no database session open.
+    Uploading inside the session was the real cause of the dropped connections:
+    ~250 blocking HTTP round trips interleaved with the writes left the pooled
+    Postgres connection idle for minutes at a stretch, and Supabase's pooler
+    reaps it. Separating the two means the database is only ever touched in
+    short, retryable bursts.
+    """
+    tally = {"CONFORMANCE": 0, "NON_CONFORMANCE": 0, "OBSERVATION": 0, "NA": 0}
+    nc_seen = 0
+    plan: list[dict] = []
+
+    for cp in ctx["checkpoints"]:
+        verdict = verdict_for(ctx["key"], cp["code"], cp["criticality"])
+        tally[verdict] += 1
+        idx = int(hashlib.sha256(cp["code"].encode()).hexdigest()[:4], 16)
+
+        if verdict == "NA":
+            plan.append({"checkpointCode": cp["code"], "gradeAwarded": pg.GRADE_NA,
+                         "auditFindings": NA_NOTES[idx % len(NA_NOTES)]})
+            continue
+
+        if verdict == pg.TRI_NON_CONFORMANCE:
+            note = NC_SCENARIOS[nc_seen % len(NC_SCENARIOS)]["finding"]
+            nc_seen += 1
+        elif verdict == pg.TRI_OBSERVATION:
+            note = OBSERVATION_NOTES[idx % len(OBSERVATION_NOTES)].format(n=(idx % 8) + 5)
+        else:
+            note = CONFORMANCE_NOTES[idx % len(CONFORMANCE_NOTES)].format(n=(idx % 8) + 5)
+
+        photos = ev.photos(
+            audit_id=ctx["auditId"], code=cp["code"], dept=cp["dept"],
+            stream=cp["stream"], verdict=pg.TRISTATE_LABEL.get(verdict, verdict),
+            question=cp["question"], site=ctx["plantName"], captured=ctx["scheduled"],
+            n=2 if verdict == pg.TRI_NON_CONFORMANCE else 1,
+        )
+        payload = {
+            "checkpointCode": cp["code"],
+            "conformance": verdict,
+            "auditFindings": note,
+            "riskGrade": risk_for(cp["criticality"]),
+        }
+        if photos:
+            payload["photos"] = photos
+        plan.append(payload)
+
+    n_photos = sum(len(p.get("photos") or []) for p in plan)
+    print(f"  4a. evidence prepared   {n_photos} image(s) for {len(plan)} checkpoint(s)")
+
+    # Write in retryable bursts. `save_response` MERGES, so replaying a chunk
+    # after a dropped connection re-applies the same verdict rather than
+    # duplicating anything.
+    CHUNK = 25
+
+    async def _save(db, *, batch: list[dict]):
         lead = await db.get(User, ctx["leadId"])
-        tally = {"CONFORMANCE": 0, "NON_CONFORMANCE": 0, "OBSERVATION": 0, "NA": 0}
-        nc_seen = 0
-
-        for cp in ctx["checkpoints"]:
-            verdict = verdict_for(ctx["key"], cp["code"], cp["criticality"])
-            tally[verdict] += 1
-            idx = int(hashlib.sha256(cp["code"].encode()).hexdigest()[:4], 16)
-
-            if verdict == "NA":
-                note = NA_NOTES[idx % len(NA_NOTES)]
-                payload = {"checkpointCode": cp["code"], "gradeAwarded": pg.GRADE_NA,
-                           "auditFindings": note}
-                await svc.save_response(db, user=lead, audit_id=ctx["auditId"], payload=payload)
-                continue
-
-            if verdict == pg.TRI_NON_CONFORMANCE:
-                sc = NC_SCENARIOS[nc_seen % len(NC_SCENARIOS)]
-                nc_seen += 1
-                note = sc["finding"]
-            elif verdict == pg.TRI_OBSERVATION:
-                note = OBSERVATION_NOTES[idx % len(OBSERVATION_NOTES)].format(n=(idx % 8) + 5)
-            else:
-                note = CONFORMANCE_NOTES[idx % len(CONFORMANCE_NOTES)].format(n=(idx % 8) + 5)
-
-            photos = ev.photos(
-                audit_id=ctx["auditId"], code=cp["code"], dept=cp["dept"],
-                stream=cp["stream"], verdict=pg.TRISTATE_LABEL.get(verdict, verdict),
-                question=cp["question"], site=ctx["plantName"],
-                captured=ctx["scheduled"],
-                n=2 if verdict == pg.TRI_NON_CONFORMANCE else 1,
-            )
-            payload = {
-                "checkpointCode": cp["code"],
-                "conformance": verdict,
-                "auditFindings": note,
-                "riskGrade": risk_for(cp["criticality"]),
-            }
-            if photos:
-                payload["photos"] = photos
+        for payload in batch:
             await svc.save_response(db, user=lead, audit_id=ctx["auditId"], payload=payload)
 
-        await db.flush()
-        print("  4. graded               " + ", ".join(
-            f"{pg.TRISTATE_LABEL.get(k, k)}={v}" for k, v in tally.items() if v))
+    for offset in range(0, len(plan), CHUNK):
+        batch = plan[offset:offset + CHUNK]
+        await in_session(
+            lambda db, b=batch: _save(db, batch=b),
+            label=f" (grading {offset + 1}-{offset + len(batch)}/{len(plan)})",
+        )
+    print("  4. graded               " + ", ".join(
+        f"{pg.TRISTATE_LABEL.get(k, k)}={v}" for k, v in tally.items() if v))
 
-        res = await svc.submit_audit(db, user=lead, audit_id=ctx["auditId"])
-        print(f"  5. submitted            {res['capasSpawned']} CAPA auto-spawned, "
-              f"score {res['score']['score_obtained']}/{res['score']['score_allotted']} "
-              f"= {res['score']['overall_score_pct']}%")
+    async def _submit(db):
+        lead = await db.get(User, ctx["leadId"])
+        return await svc.submit_audit(db, user=lead, audit_id=ctx["auditId"])
 
-        interims = []
-        for stream in STREAMS:
-            r = await svc.generate_report(
+    res = await in_session(_submit, label=" (submit)")
+    print(f"  5. submitted            {res['capasSpawned']} CAPA auto-spawned, "
+          f"score {res['score']['score_obtained']}/{res['score']['score_allotted']} "
+          f"= {res['score']['overall_score_pct']}%")
+
+    interims = []
+    for stream in STREAMS:
+        async def _report(db, stream=stream):
+            lead = await db.get(User, ctx["leadId"])
+            return await svc.generate_report(
                 db, user=lead, audit_id=ctx["auditId"], report_type="INTERIM", stream=stream,
             )
-            interims.append(r["reportCode"])
-        print(f"  6. interim reports      {', '.join(interims)}")
+        r = await in_session(_report, label=f" (interim {stream})")
+        interims.append(r["reportCode"])
+    print(f"  6. interim reports      {', '.join(interims)}")
 
-        routed = (await db.execute(
+    async def _routed(db):
+        rows = (await db.execute(
             select(AuditCheckpointResponse).where(
                 AuditCheckpointResponse.auditId == ctx["auditId"],
                 AuditCheckpointResponse.workflowState == "AWAITING_AUDITEE",
             ).order_by(AuditCheckpointResponse.sequence)
         )).scalars().all()
-        findings = [
+        return [
             {"id": r.id, "code": r.checkpointCode, "dept": r.categoryId,
              "ownerId": r.assignedOwnerId or r.routedToUserId}
-            for r in routed
+            for r in rows
         ]
-        await db.commit()
-        return {"findings": findings, "interims": interims}
+
+    findings = await in_session(_routed, label=" (routed findings)")
+    return {"findings": findings, "interims": interims}
 
 
 async def phase_resolve(ctx: dict, findings: list[dict], ev: Evidence) -> None:
@@ -1009,239 +1176,287 @@ async def phase_resolve(ctx: dict, findings: list[dict], ev: Evidence) -> None:
     escalate to the Management Representative, and raise-CAPA — because a demo
     that only ever shows the happy path teaches the screen wrong.
     """
-    async with AsyncSessionLocal() as db:
+    tally = {"ACCEPT": 0, "MORE_INFO": 0, "ESCALATE": 0, "CAPA": 0}
+
+    # ONE RETRIED SESSION PER FINDING. `transition_checkpoint` runs several
+    # statements per action and up to four actions per finding; fifty of those
+    # over one connection is what the flaky link kept killing. Retrying is safe
+    # because each finding re-reads its own row and re-applies the same
+    # transitions.
+    async def _resolve_one(db, *, i: int, f: dict):
         lead = await db.get(User, ctx["leadId"])
         pm = await db.get(User, ctx["pmId"])
-        tally = {"ACCEPT": 0, "MORE_INFO": 0, "ESCALATE": 0, "CAPA": 0}
+        owner = (await db.get(User, f["ownerId"])) if f["ownerId"] else lead
+        owner = owner or lead
+        reply = AUDITEE_REPLIES[i % len(AUDITEE_REPLIES)]
+        branch = ["ACCEPT", "ACCEPT", "MORE_INFO", "ACCEPT", "ESCALATE",
+                  "ACCEPT", "CAPA", "ACCEPT"][i % 8]
 
-        for i, f in enumerate(findings):
-            owner = (await db.get(User, f["ownerId"])) if f["ownerId"] else lead
-            owner = owner or lead
-            reply = AUDITEE_REPLIES[i % len(AUDITEE_REPLIES)]
-            branch = ["ACCEPT", "ACCEPT", "MORE_INFO", "ACCEPT", "ESCALATE",
-                      "ACCEPT", "CAPA", "ACCEPT"][i % 8]
-
-            try:
+        try:
+            await svc.transition_checkpoint(
+                db, user=owner, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                action="AUDITEE_RESPOND",
+                payload={"comment": reply, "actionTaken": reply},
+            )
+            if branch == "MORE_INFO":
+                await svc.transition_checkpoint(
+                    db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="REQUEST_MORE_INFO",
+                    payload={"comment": "Please attach the controlled copy of the "
+                                        "record, not the working copy."},
+                )
                 await svc.transition_checkpoint(
                     db, user=owner, audit_id=ctx["auditId"], checkpoint_id=f["id"],
                     action="AUDITEE_RESPOND",
-                    payload={"comment": reply, "actionTaken": reply},
+                    payload={"comment": "Controlled copy attached, revision confirmed "
+                                        "against the master list.",
+                             "actionTaken": "Controlled copy retrieved and attached."},
                 )
-                if branch == "MORE_INFO":
-                    await svc.transition_checkpoint(
-                        db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="REQUEST_MORE_INFO",
-                        payload={"comment": "Please attach the controlled copy of the "
-                                            "record, not the working copy."},
-                    )
-                    await svc.transition_checkpoint(
-                        db, user=owner, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="AUDITEE_RESPOND",
-                        payload={"comment": "Controlled copy attached, revision confirmed "
-                                            "against the master list.",
-                                 "actionTaken": "Controlled copy retrieved and attached."},
-                    )
-                    await svc.transition_checkpoint(
-                        db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="ACCEPT", payload={"comment": "Accepted on the second round."},
-                    )
-                elif branch == "ESCALATE":
-                    # ESCALATE parks the row with the plant manager; only
-                    # PM_ACCEPT resolves it from there. Using plain ACCEPT would
-                    # be rejected by the state machine.
-                    await svc.transition_checkpoint(
-                        db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="ESCALATE",
-                        payload={"comment": "Response does not address the systemic cause; "
-                                            "referred to the Management Representative."},
-                    )
-                    await svc.transition_checkpoint(
-                        db, user=pm, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="PM_ACCEPT",
-                        payload={"comment": "Reviewed with both parties. Action plan agreed "
-                                            "and resourced; finding accepted."},
-                    )
-                elif branch == "CAPA":
-                    # RAISE_CAPA is the auditor-side spawn; it lands the row on
-                    # ACCEPTED_WITH_CAPA. The NC-report trigger later ADOPTS this
-                    # CAPA rather than raising a second one against the same
-                    # non-conformity.
-                    await svc.transition_checkpoint(
-                        db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="RAISE_CAPA",
-                        payload={"comment": "Accepted; systemic action tracked as a CAPA."},
-                    )
-                else:
-                    await svc.transition_checkpoint(
-                        db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
-                        action="ACCEPT",
-                        payload={"comment": "Evidence sighted and accepted."},
-                    )
-                tally[branch] += 1
-            except ValueError as e:
-                print(f"     ! {f['code']}: {e}")
+                await svc.transition_checkpoint(
+                    db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="ACCEPT", payload={"comment": "Accepted on the second round."},
+                )
+            elif branch == "ESCALATE":
+                # ESCALATE parks the row with the plant manager; only
+                # PM_ACCEPT resolves it from there. Using plain ACCEPT would
+                # be rejected by the state machine.
+                await svc.transition_checkpoint(
+                    db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="ESCALATE",
+                    payload={"comment": "Response does not address the systemic cause; "
+                                        "referred to the Management Representative."},
+                )
+                await svc.transition_checkpoint(
+                    db, user=pm, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="PM_ACCEPT",
+                    payload={"comment": "Reviewed with both parties. Action plan agreed "
+                                        "and resourced; finding accepted."},
+                )
+            elif branch == "CAPA":
+                # RAISE_CAPA is the auditor-side spawn; it lands the row on
+                # ACCEPTED_WITH_CAPA. The NC-report trigger later ADOPTS this
+                # CAPA rather than raising a second one against the same
+                # non-conformity.
+                await svc.transition_checkpoint(
+                    db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="RAISE_CAPA",
+                    payload={"comment": "Accepted; systemic action tracked as a CAPA."},
+                )
+            else:
+                await svc.transition_checkpoint(
+                    db, user=lead, audit_id=ctx["auditId"], checkpoint_id=f["id"],
+                    action="ACCEPT",
+                    payload={"comment": "Evidence sighted and accepted."},
+                )
+            tally[branch] += 1
+        except ValueError as e:
+            await db.rollback()
+            print(f"     ! {f['code']}: {e}")
 
-        await db.commit()
-        print("  7. findings resolved    " + ", ".join(f"{k}={v}" for k, v in tally.items() if v))
+    for i, f in enumerate(findings):
+        await in_session(
+            lambda db, i=i, f=f: _resolve_one(db, i=i, f=f),
+            label=f" (finding {i + 1}/{len(findings)})",
+        )
+
+    print("  7. findings resolved    " + ", ".join(f"{k}={v}" for k, v in tally.items() if v))
 
 
 async def phase_nc_reports(ctx: dict, profile: str) -> dict:
-    """PIL/MR/F04-R1 — raise, analyse, action, verify and close every NC."""
-    async with AsyncSessionLocal() as db:
+    """PIL/MR/F04-R1 — raise, analyse, action, verify and close every NC.
+
+    Each NC is ONE retried unit of work in its own session (see `in_session`).
+    Driving twenty of them through seven stages inside a single session is
+    thousands of statements over one connection, and on a flaky link that
+    connection will not survive them.
+    """
+    async def _trigger(db):
         lead = await db.get(User, ctx["leadId"])
-        pm = await db.get(User, ctx["pmId"])
         audit = await db.get(ComplianceAudit, ctx["auditId"])
+        return await nc_rca_capa.trigger_for_audit(db, audit, actor_id=lead.id)
 
-        result = await nc_rca_capa.trigger_for_audit(db, audit, actor_id=lead.id)
-        await db.commit()
-        print(f"  8. NC reports raised    {result['created']} "
-              f"(of {result['nonConformities']} non-conformities; "
-              f"{result['findingsMaterialised']} finding rows materialised)")
-        if result["failures"]:
-            for fl in result["failures"]:
-                print(f"     ! {fl['findingCode']}: {fl['reason']}")
+    result = await in_session(_trigger, label=" (raising NC reports)")
+    print(f"  8. NC reports raised    {result['created']} "
+          f"(of {result['nonConformities']} non-conformities; "
+          f"{result['findingsMaterialised']} finding rows materialised)")
+    if result["failures"]:
+        for fl in result["failures"]:
+            print(f"     ! {fl['findingCode']}: {fl['reason']}")
 
-    stages = {s: 0 for s in nc_rca_capa.NC_STAGES}
-    async with AsyncSessionLocal() as db:
-        lead = await db.get(User, ctx["leadId"])
-        pm = await db.get(User, ctx["pmId"])
-        findings = (await db.execute(
-            select(AuditFinding).where(
+    async def _list_ncs(db):
+        rows = (await db.execute(
+            select(AuditFinding.id).where(
                 AuditFinding.auditId == ctx["auditId"],
                 AuditFinding.rcaId.isnot(None),
                 AuditFinding.isDeleted.is_(False),
             ).order_by(AuditFinding.ncrNumber)
         )).scalars().all()
+        return list(rows)
 
-        for i, finding in enumerate(findings):
-            sc = NC_SCENARIOS[i % len(NC_SCENARIOS)]
-            owner = (await db.get(User, finding.ownerId)) if finding.ownerId else lead
-            owner = owner or lead
-            rca = await db.get(RootCauseAnalysis, finding.rcaId)
-            capa = await db.get(Capa, finding.capaId) if finding.capaId else None
-            if rca is None or capa is None:
-                continue
+    finding_ids = await in_session(_list_ncs, label=" (listing NCs)")
 
-            # How far this NC is driven. H1 closes everything; H2 stops each NC
-            # at a different stage so the register shows its whole vocabulary.
-            depth = 7 if profile == "ALL_CLOSED" else (i % 7) + 1
+    async def _drive(db, *, i: int, finding_id: str):
+        lead = await db.get(User, ctx["leadId"])
+        pm = await db.get(User, ctx["pmId"])
+        finding = await db.get(AuditFinding, finding_id)
+        if finding is None:
+            return
+        sc = NC_SCENARIOS[i % len(NC_SCENARIOS)]
+        owner = (await db.get(User, finding.ownerId)) if finding.ownerId else lead
+        owner = owner or lead
+        rca = await db.get(RootCauseAnalysis, finding.rcaId)
+        capa = await db.get(Capa, finding.capaId) if finding.capaId else None
+        if rca is None or capa is None:
+            return
 
-            # ── 1. the auditee fills the Why-Why ladder ──────────────
-            if depth >= 1:
-                payload = dict(rca.analysisPayload or {})
-                payload["problemStatement"] = finding.description or sc["finding"]
-                payload["whys"] = [{"question": q, "answer": a} for q, a in sc["whys"]]
-                payload["rootCause"] = sc["root_cause"]
-                rca.analysisPayload = payload
-                rca.narrative = (
-                    f"Why-Why analysis to {len(sc['whys'])} levels against "
-                    f"{nc_rca_capa.PIL_FORM_NO}. The chain reaches a documented-system "
-                    f"failure rather than an individual lapse."
+        # How far this NC is driven. H1 closes everything; H2 stops each NC
+        # at a different stage so the register shows its whole vocabulary.
+        # 8 rungs, not 7. Rung 7 is "verified, awaiting the M.R." — a real and
+        # common resting state that a 7-rung ladder made unreachable, because
+        # its last rung ran verification and the M.R. signature together.
+        #   1 RCA_PENDING   2 RCA_IN_REVIEW   3 ACTIONS_PENDING
+        #   4 actions proposed   5 actions in progress   6 AWAITING_VERIFICATION
+        #   7 AWAITING_MR_SIGNOFF   8 CLOSED
+        depth = 8 if profile == "ALL_CLOSED" else (i % 8) + 1
+        # One NC fails its first re-check and loops back before finally closing,
+        # so the register has a worked example of the INEFFECTIVE path. Pinned
+        # to the first fully-closed NC rather than a fixed index: the previous
+        # gate named i == 2, which lands on rung 3 and never reaches
+        # verification at all, so the branch was dead code.
+        loops_back = profile == "MIXED" and depth == 8 and i % 16 == 7
+
+        # ── 1. the auditee fills the Why-Why ladder ──────────────
+        if depth >= 1:
+            payload = dict(rca.analysisPayload or {})
+            payload["problemStatement"] = finding.description or sc["finding"]
+            payload["whys"] = [{"question": q, "answer": a} for q, a in sc["whys"]]
+            payload["rootCause"] = sc["root_cause"]
+            rca.analysisPayload = payload
+            rca.narrative = (
+                f"Why-Why analysis to {len(sc['whys'])} levels against "
+                f"{nc_rca_capa.PIL_FORM_NO}. The chain reaches a documented-system "
+                f"failure rather than an individual lapse."
+            )
+            rca.status = "IN_ANALYSIS"
+            rca.updatedBy = owner.id
+            await db.flush()
+            await nc_rca_capa.sync_finding_rca_status(db, rca)
+
+        # ── 2. submitted for review ──────────────────────────────
+        if depth >= 2:
+            problems = nc_rca_capa.validate_why_payload(rca.analysisPayload)
+            if problems:
+                print(f"     ! NCR {finding.ncrNumber} ladder rejected: {problems}")
+            else:
+                rca.status = "PEER_REVIEW"
+                await db.flush()
+                await nc_rca_capa.sync_finding_rca_status(db, rca)
+
+        # ── 3. approved — this releases the CAPA ─────────────────
+        if depth >= 3:
+            rca.status = "APPROVED"
+            rca.approverId = lead.id
+            rca.approvedAt = datetime.now(timezone.utc)
+            await db.flush()
+            await nc_rca_capa.release_capa_from_rca(db, rca, actor_id=lead.id)
+            await nc_rca_capa.sync_finding_rca_status(db, rca)
+
+        # ── 4. Correction + Preventive Action planned ────────────
+        if depth >= 4:
+            due = datetime.now(timezone.utc) + timedelta(days=21)
+            db.add(CapaAction(
+                capaId=capa.id, actionType=nc_rca_capa.ACTION_TYPE_FOR_CORRECTION,
+                description=sc["correction"],
+                rationale=f"Correction — {nc_rca_capa.PIL_CORRECTION_PROMPT}.",
+                ownerUserId=owner.id, dueDate=due, status="PROPOSED", sortOrder=0,
+            ))
+            db.add(CapaAction(
+                capaId=capa.id, actionType=nc_rca_capa.ACTION_TYPE_FOR_PREVENTIVE,
+                description=sc["preventive"],
+                rationale=f"Preventive Action — {nc_rca_capa.PIL_PREVENTIVE_PROMPT}.",
+                ownerUserId=owner.id, dueDate=due + timedelta(days=14),
+                status="PROPOSED", sortOrder=0,
+            ))
+            await db.flush()
+
+        actions = (await db.execute(
+            select(CapaAction).where(CapaAction.capaId == capa.id)
+        )).scalars().all()
+
+        # ── 5. actions worked ────────────────────────────────────
+        if depth == 5:
+            for a in actions:
+                a.status = "IN_PROGRESS"
+                a.startedAt = datetime.now(timezone.utc) - timedelta(days=4)
+            capa.state = "ACTIONS_IN_PROGRESS"
+            await db.flush()
+
+        # ── 6. actions completed, awaiting verification ──────────
+        if depth >= 6:
+            for a in actions:
+                a.status = "COMPLETED"
+                a.startedAt = datetime.now(timezone.utc) - timedelta(days=12)
+                a.completedAt = datetime.now(timezone.utc) - timedelta(days=3)
+                a.evidenceOfCompletion = (
+                    "Revised document issued and circulated; records for the "
+                    "following cycle sampled and found compliant."
                 )
-                rca.status = "IN_ANALYSIS"
-                rca.updatedBy = owner.id
-                await db.flush()
-                await nc_rca_capa.sync_finding_rca_status(db, rca)
+                a.approverUserId = pm.id
+                a.approvedAt = datetime.now(timezone.utc) - timedelta(days=2)
+            capa.state = "PENDING_VERIFICATION"
+            await db.flush()
 
-            # ── 2. submitted for review ──────────────────────────────
-            if depth >= 2:
-                problems = nc_rca_capa.validate_why_payload(rca.analysisPayload)
-                if problems:
-                    print(f"     ! NCR {finding.ncrNumber} ladder rejected: {problems}")
-                else:
-                    rca.status = "PEER_REVIEW"
-                    await db.flush()
-                    await nc_rca_capa.sync_finding_rca_status(db, rca)
-
-            # ── 3. approved — this releases the CAPA ─────────────────
-            if depth >= 3:
-                rca.status = "APPROVED"
-                rca.approverId = lead.id
-                rca.approvedAt = datetime.now(timezone.utc)
-                await db.flush()
-                await nc_rca_capa.release_capa_from_rca(db, rca, actor_id=lead.id)
-                await nc_rca_capa.sync_finding_rca_status(db, rca)
-
-            # ── 4. Correction + Preventive Action planned ────────────
-            if depth >= 4:
-                due = datetime.now(timezone.utc) + timedelta(days=21)
-                db.add(CapaAction(
-                    capaId=capa.id, actionType=nc_rca_capa.ACTION_TYPE_FOR_CORRECTION,
-                    description=sc["correction"],
-                    rationale=f"Correction — {nc_rca_capa.PIL_CORRECTION_PROMPT}.",
-                    ownerUserId=owner.id, dueDate=due, status="PROPOSED", sortOrder=0,
-                ))
-                db.add(CapaAction(
-                    capaId=capa.id, actionType=nc_rca_capa.ACTION_TYPE_FOR_PREVENTIVE,
-                    description=sc["preventive"],
-                    rationale=f"Preventive Action — {nc_rca_capa.PIL_PREVENTIVE_PROMPT}.",
-                    ownerUserId=owner.id, dueDate=due + timedelta(days=14),
-                    status="PROPOSED", sortOrder=0,
-                ))
-                await db.flush()
-
-            actions = (await db.execute(
-                select(CapaAction).where(CapaAction.capaId == capa.id)
-            )).scalars().all()
-
-            # ── 5. actions worked ────────────────────────────────────
-            if depth == 5:
-                for a in actions:
-                    a.status = "IN_PROGRESS"
-                    a.startedAt = datetime.now(timezone.utc) - timedelta(days=4)
-                capa.state = "ACTIONS_IN_PROGRESS"
-                await db.flush()
-
-            # ── 6. actions completed, awaiting verification ──────────
-            if depth >= 6:
+        # ── 7. the auditor verifies effectiveness ────────────────
+        if depth >= 7:
+            # The loop-back first, where this NC is the worked example: a
+            # re-check that finds the nonconformity still there sends the CAPA
+            # back to its owner rather than closing anything. The actions are
+            # then redone and re-verified, so the NC ends closed WITH a failed
+            # round in its history — which is what the INEFFECTIVE path
+            # actually looks like on a real register.
+            if loops_back:
+                await nc_rca_capa.verify_nc(
+                    db, finding,
+                    verification_details=(
+                        "Re-checked on site. The revised procedure is issued but the "
+                        "records for the following cycle still show the original "
+                        "practice — the change has not reached the people doing the "
+                        "work. Not effective."
+                    ),
+                    result="INEFFECTIVE", actor_id=lead.id,
+                )
                 for a in actions:
                     a.status = "COMPLETED"
-                    a.startedAt = datetime.now(timezone.utc) - timedelta(days=12)
-                    a.completedAt = datetime.now(timezone.utc) - timedelta(days=3)
+                    a.completedAt = datetime.now(timezone.utc) - timedelta(days=1)
                     a.evidenceOfCompletion = (
-                        "Revised document issued and circulated; records for the "
-                        "following cycle sampled and found compliant."
+                        "Re-worked after the failed verification: the change was "
+                        "briefed to every affected role holder and the following "
+                        "cycle's records re-sampled."
                     )
-                    a.approverUserId = pm.id
-                    a.approvedAt = datetime.now(timezone.utc) - timedelta(days=2)
                 capa.state = "PENDING_VERIFICATION"
                 await db.flush()
 
-            # ── 7. verified and signed off ───────────────────────────
-            if depth >= 7:
-                # One NC in the mixed audit fails its first re-check. A register
-                # in which verification never fails does not show what the
-                # INEFFECTIVE path is for.
-                if profile == "MIXED" and i == 2:
-                    await nc_rca_capa.verify_nc(
-                        db, finding,
-                        verification_details=(
-                            "Re-checked on site. The revised procedure is issued but the "
-                            "records for the following cycle still show the original "
-                            "practice — the change has not reached the people doing the "
-                            "work. Not effective."
-                        ),
-                        result="INEFFECTIVE", actor_id=lead.id,
-                    )
-                    for a in actions:
-                        a.status = "IN_PROGRESS"
-                        a.completedAt = None
-                    await db.flush()
-                else:
-                    await nc_rca_capa.verify_nc(
-                        db, finding, verification_details=sc["verification"],
-                        result="EFFECTIVE", actor_id=lead.id,
-                    )
-                    await nc_rca_capa.mr_sign_off(db, finding, actor_id=pm.id)
+            await nc_rca_capa.verify_nc(
+                db, finding, verification_details=sc["verification"],
+                result="EFFECTIVE", actor_id=lead.id,
+            )
 
-            await db.flush()
+        # ── 8. the M.R. signs, and the NC closes ─────────────────
+        if depth >= 8:
+            await nc_rca_capa.mr_sign_off(db, finding, actor_id=pm.id)
 
-        await db.commit()
+    for i, fid in enumerate(finding_ids):
+        await in_session(
+            lambda db, i=i, fid=fid: _drive(db, i=i, finding_id=fid),
+            label=f" (NCR {i + 1}/{len(finding_ids)})",
+        )
 
     # Recompute the register so what we print is what the screen will show.
-    async with AsyncSessionLocal() as db:
+    async def _register(db):
         audit = await db.get(ComplianceAudit, ctx["auditId"])
-        reg = await nc_rca_capa.nc_register(db, audit)
+        return await nc_rca_capa.nc_register(db, audit)
+
+    reg = await in_session(_register, label=" (NC register)")
     live = {k: v for k, v in reg["byStage"].items() if v}
     print(f"  9. NC lifecycle         {reg['closed']}/{reg['total']} closed — "
           + ", ".join(f"{k.replace('_',' ').title()}={v}" for k, v in live.items()))
@@ -1337,7 +1552,19 @@ async def phase_close(ctx: dict) -> list[str]:
 async def seed_one(spec: dict, ev: Evidence) -> dict:
     print(f"\n{'=' * 74}\n{spec['title']}\n{'=' * 74}")
     ctx = await phase_schedule(spec, ev)
-    conducted = await phase_conduct(ctx, ev)
+    try:
+        conducted = await phase_conduct(ctx, ev)
+    except Exception:
+        # Print the real traceback. Losing it is what turned a wrong keyword
+        # argument into "the data did not seed" — the audit row was committed
+        # by phase_schedule and everything after it silently rolled back.
+        import traceback
+        traceback.print_exc()
+        raise SystemExit(
+            f"\nConduct phase failed for {ctx['auditNumber']}.\n"
+            f"The audit row exists and is still 'scheduled'. Fix the cause above\n"
+            f"and re-run — the seeder rebuilds this audit from scratch.\n"
+        )
     await phase_resolve(ctx, conducted["findings"], ev)
     reg = await phase_nc_reports(ctx, spec["nc_profile"])
     finals = await phase_close(ctx)
@@ -1356,9 +1583,47 @@ async def main() -> None:
     args = ap.parse_args()
     specs = AUDITS if args.audit is None else [AUDITS[args.audit - 1]]
 
+    # Silence outbound email for the duration of the seed.
+    #
+    # `transition_checkpoint` sends a handoff notification on nearly every
+    # action, awaited INSIDE the caller's transaction. Seeding fires ~150 of
+    # them, and against a live SMTP host that is slow or unreachable each one
+    # blocks for its timeout while the Postgres transaction sits open — which is
+    # how the pooler came to close the connection mid-operation. It is also
+    # simply wrong for a seeder to email real auditees about invented findings.
+    #
+    # Patched on the notifications module rather than on the caller, because
+    # `_notify` imports `send_email` at call time, so this reaches every path.
+    from app.services import notifications as _notifications
+
+    async def _no_email(*_a, **_kw) -> bool:
+        return False
+
+    _notifications.send_email = _no_email  # type: ignore[assignment]
+    print("Email: suppressed for this run (seeded findings must not notify real people).")
+
+    # Schema before storage: a missing column is cheaper to discover than a
+    # round trip to Supabase, and it is the prerequisite that actually blocks.
+    await preflight_schema()
+
     ev = Evidence(allow_metadata_only=args.no_evidence)
     if ev.enabled:
-        print("Evidence: real images, uploaded to Supabase storage.")
+        try:
+            ev.preflight()
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(
+                f"\nStorage preflight failed: {e}\n\n"
+                f"Stopping here rather than grading 206 checkpoints against a\n"
+                f"storage layer that cannot accept them — `submit_audit` refuses\n"
+                f"any Non-Conformance or Observation on a critical/major\n"
+                f"checkpoint with no photograph, so the audit could not be\n"
+                f"submitted anyway.\n\n"
+                f"Fix the storage configuration, or run with --no-evidence to\n"
+                f"seed without evidence files.\n"
+            ) from e
+        print("Evidence: real images, uploaded to Supabase storage (preflight OK).")
     elif ev.metadata_only:
         print(f"Evidence: METADATA ONLY — {ev.reason}.\n"
               f"          Checkpoints carry observations and photo records, but no\n"

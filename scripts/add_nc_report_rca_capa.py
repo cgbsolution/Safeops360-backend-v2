@@ -34,9 +34,18 @@ Run from the backend root:
 
 from __future__ import annotations
 
-from sqlalchemy import create_engine, text
+import sys
+from pathlib import Path
 
-from app.core.config import get_settings
+# Running a FILE puts `scripts/` on sys.path, not the backend root, so `app` is
+# not importable however sensible the working directory is. Same bootstrap as
+# scripts/seed_page_audit_category_libraries.py, so the command in the docstring
+# above actually works instead of needing PYTHONPATH=. in front of it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sqlalchemy import create_engine, text  # noqa: E402
+
+from app.core.config import get_settings  # noqa: E402
 
 ALTERS: list[str] = [
     'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "ncrNumber" TEXT',
@@ -48,6 +57,19 @@ ALTERS: list[str] = [
     'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "auditorSignedAt" TIMESTAMPTZ',
     'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "mrSignedById" TEXT',
     'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "mrSignedAt" TIMESTAMPTZ',
+    # The auditor's half as written on the form — seeded from the checkpoint,
+    # then editable, so editing an issued NC report cannot rewrite the audit
+    # evidence it was raised from.
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "requirementText" TEXT',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "observedNonconformity" TEXT',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "evidenceNote" TEXT',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "gradeText" TEXT',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "clauseNo" TEXT',
+    # Custody — the two moments the form changes hands.
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "issuedAt" TIMESTAMPTZ',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "issuedById" TEXT',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "auditeeSubmittedAt" TIMESTAMPTZ',
+    'ALTER TABLE "AuditFinding" ADD COLUMN IF NOT EXISTS "auditeeSubmittedById" TEXT',
     'CREATE INDEX IF NOT EXISTS "ix_AuditFinding_rca" ON "AuditFinding" ("rcaId")',
     # Partial: findings from every other library carry a NULL ncrNumber and are
     # not in this index at all.

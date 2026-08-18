@@ -874,6 +874,33 @@ async def _load_capa_for_write(db: AsyncSession, capa_id: str) -> Capa:
     return capa
 
 
+async def _assert_nc_custody(db: AsyncSession, capa: Capa) -> None:
+    """409 unless this CAPA's NC report is currently with its auditee.
+
+    No-ops for every CAPA that is not a PIL/MR/F04-R1 non-conformity, which is
+    almost all of them — the guard is keyed on the audit finding that points at
+    this CAPA, so an ordinary CAPA never reaches the custody rules at all.
+    """
+    from app.models.cams_completion import AuditFinding
+    from sqlalchemy import select as _select
+
+    finding = (
+        await db.execute(
+            _select(AuditFinding).where(
+                AuditFinding.capaId == capa.id,
+                AuditFinding.ncrNumber.is_not(None),
+                AuditFinding.isDeleted.is_(False),
+            )
+        )
+    ).scalars().first()
+    if finding is None:
+        return
+    try:
+        nc_rca_capa.assert_auditee_may_edit(finding)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
 @router.patch("/{capa_id}", response_model=CapaOut)
 async def update_capa(
     capa_id: str,
@@ -1010,6 +1037,11 @@ async def add_action(
         nc_rca_capa.assert_actions_unlocked(capa)
     except ValueError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    # Correction and Preventive Action are in the AUDITEE's half of the form,
+    # so they are writable only while the auditee holds it. Without this the
+    # generic CAPA screen stays a way to add actions to a report already back
+    # with the auditor for verification.
+    await _assert_nc_custody(db, capa)
 
     # Sequence the new action after existing same-type actions
     last_sort = (

@@ -22,14 +22,20 @@ import pytest
 from app.services.nc_rca_capa import (
     ACTION_TYPE_FOR_CORRECTION,
     ACTION_TYPE_FOR_PREVENTIVE,
+    NC_STAGE_ACTION,
+    NC_STAGE_HOLDER,
+    NC_STAGES,
     PIL_MIN_WHY_LEVELS,
     _capa_severity,
     _clause_text,
     _days_until,
     _stage,
     assert_actions_unlocked,
+    assert_auditee_may_edit,
+    issue_nc_report,
     mr_sign_off,
     seed_why_payload,
+    update_auditor_section,
     validate_why_payload,
     verify_nc,
 )
@@ -213,8 +219,17 @@ def _finding(**over):
     base = dict(
         id="f1", rcaId="rca1", rcaStatus="APPROVED", capaId="capa1", ncrNumber="01",
         auditorSignedAt=None, auditorSignedById=None, mrSignedAt=None, mrSignedById=None,
-        status="IN_REMEDIATION", verificationDetails=None, dueDate=None,
+        status="IN_REMEDIATION", verificationDetails=None, dueDate=date(2026, 9, 30),
         closedAt=None, closedById=None,
+        # Custody: issued to the auditee AND returned, unless a test says otherwise.
+        issuedAt=datetime(2026, 8, 1, tzinfo=timezone.utc), issuedById="auditor-1",
+        auditeeSubmittedAt=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        auditeeSubmittedById="auditee-1",
+        requirementText="Objectives are reviewed annually.",
+        observedNonconformity="FY26 objectives not updated.",
+        gradeText="Major Improvement Needed", clauseNo="ISO 9001:2015 6.2",
+        evidenceNote="Register sighted.", orgRepresentativeId="pm-1",
+        ownerId="auditee-1",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -224,35 +239,103 @@ def _action(status="PROPOSED", action_type=ACTION_TYPE_FOR_CORRECTION):
     return SimpleNamespace(id="a1", status=status, actionType=action_type)
 
 
-def test_an_untriggered_nonconformity_reports_as_such():
-    assert _stage(_finding(rcaId=None, rcaStatus=None), None, []) == "NOT_TRIGGERED"
+def test_a_nonconformity_with_no_report_is_not_raised():
+    assert _stage(_finding(rcaId=None, rcaStatus=None), None, []) == "NOT_RAISED"
 
 
-def test_stage_tracks_the_rca_then_the_actions_then_the_signatures():
-    assert _stage(_finding(rcaStatus="DRAFT"), _capa(), []) == "RCA_PENDING"
-    assert _stage(_finding(rcaStatus="PEER_REVIEW"), _capa(), []) == "RCA_IN_REVIEW"
-    assert _stage(_finding(), _capa(state="ACTIONS_PLANNED"), []) == "ACTIONS_PENDING"
-    assert _stage(_finding(), _capa(), [_action("IN_PROGRESS")]) == "ACTIONS_IN_PROGRESS"
-    assert _stage(_finding(), _capa(), [_action("COMPLETED")]) == "AWAITING_VERIFICATION"
-    assert _stage(
-        _finding(auditorSignedAt=datetime.now(timezone.utc)), _capa(), [_action("COMPLETED")]
-    ) == "AWAITING_MR_SIGNOFF"
-    assert _stage(
-        _finding(auditorSignedAt=datetime.now(timezone.utc), mrSignedAt=datetime.now(timezone.utc)),
-        _capa(), [_action("COMPLETED")],
-    ) == "CLOSED"
+def test_a_raised_report_starts_with_the_auditor_not_the_auditee():
+    """PIL/MR/F04-R1 begins in the auditor's hands — the yellow half is theirs,
+    and the auditee sees nothing until it is issued. The first model started
+    every NC at the auditee, which is the paper form read backwards."""
+    f = _finding(issuedAt=None, auditeeSubmittedAt=None)
+    assert _stage(f, _capa(), []) == "WITH_AUDITOR_DRAFT"
 
 
-def test_an_approved_rca_whose_capa_never_unlocked_does_not_read_as_actionable():
-    """If the release failed, the auditee cannot add an action. A register
-    saying ACTIONS_PENDING would be telling them to do something the API
-    refuses."""
-    assert _stage(_finding(rcaStatus="APPROVED"), _capa(state="UNDER_RCA"), []) == "RCA_IN_REVIEW"
+def test_issuing_moves_custody_to_the_auditee():
+    f = _finding(issuedAt=datetime.now(timezone.utc), auditeeSubmittedAt=None)
+    assert _stage(f, _capa(), []) == "WITH_AUDITEE"
 
 
-def test_a_cancelled_action_does_not_hold_an_nc_open():
-    actions = [_action("COMPLETED"), _action("CANCELLED")]
-    assert _stage(_finding(), _capa(), actions) == "AWAITING_VERIFICATION"
+def test_returning_moves_custody_back_to_the_auditor():
+    assert _stage(_finding(), _capa(), [_action("COMPLETED")]) == "WITH_AUDITOR_VERIFY"
+
+
+def test_the_auditor_signature_hands_it_to_the_mr():
+    f = _finding(auditorSignedAt=datetime.now(timezone.utc))
+    assert _stage(f, _capa(), [_action("COMPLETED")]) == "WITH_MR"
+
+
+def test_the_mr_signature_closes_it():
+    f = _finding(auditorSignedAt=datetime.now(timezone.utc),
+                 mrSignedAt=datetime.now(timezone.utc))
+    assert _stage(f, _capa(), [_action("COMPLETED")]) == "CLOSED"
+
+
+def test_every_stage_names_a_holder_and_an_action():
+    """The register renders both from these tables; a stage missing from either
+    shows a blank 'who has it' or a blank 'what next' column."""
+    for stage in NC_STAGES:
+        assert stage in NC_STAGE_ACTION
+        assert stage in NC_STAGE_HOLDER
+    assert NC_STAGE_HOLDER["WITH_AUDITEE"] == "AUDITEE"
+    assert NC_STAGE_HOLDER["WITH_AUDITOR_VERIFY"] == "AUDITOR"
+    assert NC_STAGE_HOLDER["CLOSED"] is None
+
+
+# ── the custody gates ───────────────────────────────────────
+
+
+def test_the_auditee_cannot_write_before_the_report_is_issued():
+    with pytest.raises(ValueError, match="not been issued"):
+        assert_auditee_may_edit(_finding(issuedAt=None, auditeeSubmittedAt=None))
+
+
+def test_the_auditee_cannot_write_after_returning_it():
+    """Editing the analysis after the form has gone back would change what the
+    auditor is verifying against."""
+    with pytest.raises(ValueError, match="returned to the"):
+        assert_auditee_may_edit(_finding())
+
+
+def test_the_auditee_may_write_while_they_hold_it():
+    f = _finding(issuedAt=datetime.now(timezone.utc), auditeeSubmittedAt=None)
+    assert assert_auditee_may_edit(f) is None
+
+
+def test_the_auditor_section_locks_once_issued():
+    """Changing the stated requirement under an auditee who is answering it
+    rewrites the question. Correcting an issued NC means recalling it."""
+    with pytest.raises(ValueError, match="already with the auditee"):
+        asyncio.run(update_auditor_section(
+            _FakeDb(), _finding(), data={"requirementText": "changed"}, actor_id="a"))
+
+
+def test_the_auditor_section_is_writable_before_issue():
+    f = _finding(issuedAt=None, auditeeSubmittedAt=None)
+    asyncio.run(update_auditor_section(
+        _FakeDb(), f, data={"requirementText": "Objectives are reviewed each April."},
+        actor_id="auditor-1"))
+    assert f.requirementText == "Objectives are reviewed each April."
+
+
+def test_an_incomplete_auditor_section_cannot_be_issued():
+    """The auditee would otherwise discover the gap only after opening it."""
+    f = _finding(issuedAt=None, auditeeSubmittedAt=None, requirementText="",
+                 observedNonconformity="", gradeText="")
+    with pytest.raises(ValueError, match="Requirements"):
+        asyncio.run(issue_nc_report(_FakeDb(), f, actor_id="auditor-1"))
+
+
+def test_issuing_stamps_custody():
+    f = _finding(issuedAt=None, auditeeSubmittedAt=None, status="OPEN")
+    out = asyncio.run(issue_nc_report(_FakeDb(), f, actor_id="auditor-1"))
+    assert out["stage"] == "WITH_AUDITEE"
+    assert f.issuedAt is not None and f.issuedById == "auditor-1"
+
+
+def test_a_report_cannot_be_issued_twice():
+    with pytest.raises(ValueError, match="already been issued"):
+        asyncio.run(issue_nc_report(_FakeDb(), _finding(), actor_id="auditor-1"))
 
 
 # ── closure: two signatures, in order ────────────────────────────────
@@ -299,6 +382,18 @@ def test_effectiveness_cannot_be_verified_while_actions_are_open():
         ))
 
 
+def test_nothing_can_be_verified_while_the_auditee_still_holds_the_form():
+    """Verification is the box at the FOOT of the form, under the auditee's
+    half. It cannot be reached over their heads."""
+    with pytest.raises(ValueError, match="still with the auditee"):
+        asyncio.run(verify_nc(
+            _FakeDb(_capa(state="ACTIONS_PLANNED"), rows=[]),
+            _finding(auditeeSubmittedAt=None),
+            verification_details="Closing this without waiting for them.",
+            result="EFFECTIVE", actor_id="auditor-1",
+        ))
+
+
 def test_nothing_can_be_verified_before_the_rca_is_approved():
     with pytest.raises(ValueError, match="not approved"):
         asyncio.run(verify_nc(
@@ -322,6 +417,11 @@ def test_an_ineffective_recheck_reopens_rather_than_closes():
     assert capa.state == "ACTIONS_PLANNED"
     assert finding.status == "IN_REMEDIATION"
     assert finding.ncrNumber == "01"
+    # Custody returns to the AUDITEE, but the report stays issued — this is the
+    # same form coming round again, not a new one.
+    assert finding.auditeeSubmittedAt is None
+    assert finding.issuedAt is not None
+    assert _stage(finding, capa, []) == "WITH_AUDITEE"
     # The signature belonged to a verification that failed; keeping it would
     # present a reopened NC as auditor-signed.
     assert finding.auditorSignedAt is None

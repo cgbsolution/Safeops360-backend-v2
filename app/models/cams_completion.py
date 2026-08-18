@@ -111,6 +111,34 @@ class AuditFinding(Base, IdMixin):
     # Form row 14, auditor half: "Organization Representative".
     orgRepresentativeId: Mapped[str | None] = mapped_column(String)
 
+    # ── The auditor's half, as WRITTEN ON THE FORM ────────────────────────
+    #
+    # Seeded from the audited checkpoint and then editable, because the two are
+    # not the same statement. The checkpoint's question is a library sentence
+    # asked of every department; "Requirements" on an NC report is what THIS
+    # auditee was actually held to. The observation captured on a phone at the
+    # workstation is field notes; "Observed Nonconformity" is the wording that
+    # goes to a certification body. Storing the form's copy separately means
+    # editing the report cannot rewrite the audit evidence it came from, and
+    # re-materialising a checkpoint cannot silently rewrite an issued NC.
+    requirementText: Mapped[str | None] = mapped_column(Text)
+    observedNonconformity: Mapped[str | None] = mapped_column(Text)
+    evidenceNote: Mapped[str | None] = mapped_column(Text)
+    gradeText: Mapped[str | None] = mapped_column(String)
+    clauseNo: Mapped[str | None] = mapped_column(String)
+
+    # ── Custody: who holds the form right now ─────────────────────────────
+    #
+    # PIL/MR/F04-R1 is a document that changes hands twice — auditor writes the
+    # yellow half and ISSUES it; auditee writes the analysis and Correction and
+    # RETURNS it; auditor verifies. Both handovers are recorded because each is
+    # the moment responsibility moves, and an NC register that cannot say who
+    # is holding a finding cannot be chased.
+    issuedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    issuedById: Mapped[str | None] = mapped_column(String)
+    auditeeSubmittedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    auditeeSubmittedById: Mapped[str | None] = mapped_column(String)
+
     # Form rows 26-30 — the closure block. Verification of EFFECTIVENESS lives
     # on the Capa (which already models it, and whose INEFFECTIVE result loops
     # the actions back); what lives here is the NC report's own two-signature

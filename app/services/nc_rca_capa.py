@@ -579,8 +579,24 @@ async def trigger_for_audit(
         finding.rcaStatus = rca.status
         finding.capaId = capa.id
         finding.orgRepresentativeId = audit.plantManagerUserId
-        if finding.status == "OPEN":
-            finding.status = "CAPA_RAISED"
+        # Seed the yellow half from the audited checkpoint. The auditor edits
+        # and issues it; nothing reaches the auditee until they do. Seeding
+        # rather than leaving it blank is the difference between an auditor
+        # reviewing a draft and an auditor re-typing what the audit already
+        # recorded — but these are the FORM's copies, so editing them later
+        # cannot rewrite the checkpoint they came from.
+        finding.requirementText = response.checkpointQuestion or finding.title
+        finding.observedNonconformity = finding.description or response.observation or ""
+        finding.evidenceNote = _evidence_note(response)
+        finding.gradeText = (
+            response.gradeAwarded or response.complianceStatus or finding.severity
+        )
+        finding.clauseNo = clause
+        # NOT issued. The form is raised into the auditor's hands, which is
+        # where PIL/MR/F04-R1 starts — the auditee sees nothing until the
+        # auditor has completed their half and released it.
+        finding.issuedAt = None
+        finding.issuedById = None
 
         items.append({
             "findingId": finding.id,
@@ -610,6 +626,25 @@ async def trigger_for_audit(
         "skippedItems": skipped,
         "failures": failures,
     }
+
+
+def _evidence_note(response: AuditCheckpointResponse) -> str:
+    """The form's "Evidence" box, seeded from what the auditor captured.
+
+    Names the photographs rather than embedding them: the images are already
+    attached to the checkpoint and render on the form from there. What this
+    box is for on paper is the auditor's description of what was SEEN, which
+    is the auditor note if there is one and a count of the exhibits if not.
+    """
+    note = (response.auditorNote or "").strip()
+    n = len(response.auditorEvidenceIds or [])
+    if note and n:
+        return f"{note} ({n} photograph{'s' if n != 1 else ''} attached.)"
+    if note:
+        return note
+    if n:
+        return f"{n} photograph{'s' if n != 1 else ''} attached at the checkpoint."
+    return ""
 
 
 def _clause_text(response: AuditCheckpointResponse) -> str | None:
@@ -744,45 +779,102 @@ async def sync_finding_rca_status(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# The register — NC → RCA → CAPA → closure, one row per NC
+# Custody — who is holding the form
 # ─────────────────────────────────────────────────────────────────────
-# Where an NC actually IS, as one value. Derived from the three records rather
-# than stored, for the same reason `library_segregation` is derived: a stored
-# stage is a fourth thing that can contradict the three it summarises.
+# PIL/MR/F04-R1 is a document that changes hands, and its colour key is the
+# specification: the yellow half is the AUDITOR's, the accented half is the
+# AUDITEE's, and the verification block at the foot is the auditor's again.
+# So the stage an NC is at is a statement about WHO HOLDS IT, not about which
+# child record happens to exist.
+#
+# The first cut modelled record state instead — RCA_PENDING, ACTIONS_PENDING,
+# AWAITING_VERIFICATION. Every one of those is true of the data and none of
+# them answers the only question a Management Representative asks at a closure
+# review: whose desk is this on? "ACTIONS_PENDING" is the same answer whether
+# the auditee has never seen the report or has had it for three weeks.
 NC_STAGES = (
-    "NOT_TRIGGERED",      # a non-conformity with no NC report raised yet
-    "RCA_PENDING",        # auditee has the form, ladder not submitted
-    "RCA_IN_REVIEW",      # submitted, awaiting approval
-    "ACTIONS_PENDING",    # RCA approved, no Correction/Preventive planned yet
-    "ACTIONS_IN_PROGRESS",
-    "AWAITING_VERIFICATION",   # actions done, auditor has not re-checked
-    "AWAITING_MR_SIGNOFF",     # auditor verified, MR has not signed
+    "NOT_RAISED",           # a non-conformity with no NC report yet
+    "WITH_AUDITOR_DRAFT",   # yellow half being written; auditee cannot see it
+    "WITH_AUDITEE",         # issued — 5-Why, Correction and Preventive Action
+    "WITH_AUDITOR_VERIFY",  # returned — auditor re-checks effectiveness
+    "WITH_MR",              # auditor signed; Management Representative to close
     "CLOSED",
 )
 
+# What each holder is being asked to do, in the form's own words. Carried in
+# the register and on the form so the screen never has to invent a label for a
+# stage — a mismatch between the two is how a workflow starts being explained
+# differently in two places.
+NC_STAGE_ACTION = {
+    "NOT_RAISED": "Raise the NC report",
+    "WITH_AUDITOR_DRAFT": "Complete the auditor section and issue to the auditee",
+    "WITH_AUDITEE": "Complete the Root Cause Analysis, Correction and Preventive Action",
+    "WITH_AUDITOR_VERIFY": "Verify effective closure",
+    "WITH_MR": "M.R. signature to close",
+    "CLOSED": "Closed",
+}
+
+# Which role may act at each stage. The form's two colours, made enforceable.
+NC_STAGE_HOLDER = {
+    "NOT_RAISED": "AUDITOR",
+    "WITH_AUDITOR_DRAFT": "AUDITOR",
+    "WITH_AUDITEE": "AUDITEE",
+    "WITH_AUDITOR_VERIFY": "AUDITOR",
+    "WITH_MR": "MR",
+    "CLOSED": None,
+}
+
 
 def _stage(finding: AuditFinding, capa: Capa | None, actions: list[CapaAction]) -> str:
+    """Where the form is, derived from custody. Never stored.
+
+    Read newest-fact-first: each signature or handover supersedes everything
+    before it, so a reopened NC (auditor signature cleared by an INEFFECTIVE
+    verification) falls back through the same ladder rather than needing a
+    separate rule.
+    """
     if finding.mrSignedAt:
         return "CLOSED"
     if finding.auditorSignedAt:
-        return "AWAITING_MR_SIGNOFF"
+        return "WITH_MR"
     if not finding.rcaId:
-        return "NOT_TRIGGERED"
-    if finding.rcaStatus in ("DRAFT", "IN_ANALYSIS", None):
-        return "RCA_PENDING"
-    if finding.rcaStatus == "PEER_REVIEW":
-        return "RCA_IN_REVIEW"
-    # RCA approved from here on — unless the CAPA never came out of the gate.
-    # Reading the CAPA rather than trusting `rcaStatus` alone matters: if the
-    # release failed, the auditee cannot add an action, and a register saying
-    # ACTIONS_PENDING would be telling them to do something the API refuses.
-    if capa is not None and capa.state == "UNDER_RCA":
-        return "RCA_IN_REVIEW"
-    if not actions:
-        return "ACTIONS_PENDING"
-    if all(a.status in ("COMPLETED", "CANCELLED") for a in actions):
-        return "AWAITING_VERIFICATION"
-    return "ACTIONS_IN_PROGRESS"
+        return "NOT_RAISED"
+    if not finding.issuedAt:
+        return "WITH_AUDITOR_DRAFT"
+    if finding.auditeeSubmittedAt:
+        return "WITH_AUDITOR_VERIFY"
+    return "WITH_AUDITEE"
+
+
+def _auditee_progress(
+    finding: AuditFinding, rca: RootCauseAnalysis | None, actions: list[CapaAction]
+) -> dict[str, Any]:
+    """What the auditee still owes, while the form is theirs.
+
+    The custody stage says whose desk it is on; this says how far through they
+    are. Both are needed — collapsing them is what made the old model unable to
+    distinguish "not started" from "nearly done".
+    """
+    payload = (rca.analysisPayload or {}) if rca else {}
+    problems = validate_why_payload(payload) if rca else ["No analysis record."]
+    corrections = [a for a in actions if a.actionType == ACTION_TYPE_FOR_CORRECTION]
+    preventives = [a for a in actions if a.actionType == ACTION_TYPE_FOR_PREVENTIVE]
+    return {
+        "rcaComplete": not problems,
+        "rcaProblems": problems,
+        "correctionCount": len(corrections),
+        "preventiveCount": len(preventives),
+        "openActionCount": sum(
+            1 for a in actions if a.status not in ("COMPLETED", "CANCELLED")
+        ),
+        # The three things the accented half of the form asks for. All three
+        # are required before it can be returned — a report with an analysis
+        # and no Correction has not answered "what is done to solve this".
+        "readyToSubmit": bool(
+            not problems and corrections and preventives
+            and all(a.status in ("COMPLETED", "CANCELLED") for a in actions)
+        ),
+    }
 
 
 async def nc_register(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any]:
@@ -831,6 +923,12 @@ async def nc_register(db: AsyncSession, audit: ComplianceAudit) -> dict[str, Any
             "nonconformity": finding.description or response.observation,
             "ownerId": finding.ownerId,
             "stage": stage,
+            "stageAction": NC_STAGE_ACTION.get(stage),
+            "holder": NC_STAGE_HOLDER.get(stage),
+            "issuedAt": finding.issuedAt.isoformat() if finding.issuedAt else None,
+            "auditeeSubmittedAt": (
+                finding.auditeeSubmittedAt.isoformat() if finding.auditeeSubmittedAt else None
+            ),
             "rcaId": finding.rcaId,
             "rcaStatus": finding.rcaStatus,
             "rcaDueDate": rca_due.isoformat() if rca_due else None,
@@ -931,13 +1029,20 @@ async def nc_report(
             "managementSystem": response.streamCode if response else None,
             "standardClauses": (response.standardClauses or []) if response else [],
             "ncrNumber": finding.ncrNumber,
-            "clauseNo": _clause_text(response) if response else None,
-            "requirements": response.checkpointQuestion if response else None,
-            "observedNonconformity": finding.description or (
+            "clauseNo": finding.clauseNo or (_clause_text(response) if response else None),
+            # Editable only before issue — the screen greys the half out on this.
+            "editable": not finding.issuedAt and not finding.mrSignedAt,
+            # The FORM's copies, not the checkpoint's. Seeded from it at
+            # trigger time and the auditor's to correct before issuing.
+            "requirements": finding.requirementText or (
+                response.checkpointQuestion if response else None
+            ),
+            "observedNonconformity": finding.observedNonconformity or finding.description or (
                 response.observation if response else None
             ),
+            "evidenceNote": finding.evidenceNote,
             "evidence": (response.auditorEvidenceIds or []) if response else [],
-            "grade": response.gradeAwarded if response else None,
+            "grade": finding.gradeText or (response.gradeAwarded if response else None),
             "severity": finding.severity,
             "leadAuditor": audit.leadAuditorUserId if audit else None,
             "auditor": (response.assignedAuditorId if response else None)
@@ -999,6 +1104,168 @@ async def nc_report(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# The two handovers
+# ─────────────────────────────────────────────────────────────────────
+AUDITOR_SECTION_FIELDS = (
+    "requirementText", "observedNonconformity", "evidenceNote",
+    "gradeText", "clauseNo", "orgRepresentativeId", "dueDate",
+)
+
+
+async def update_auditor_section(
+    db: AsyncSession, finding: AuditFinding, *, data: dict[str, Any], actor_id: str
+) -> AuditFinding:
+    """The yellow half. Editable only while the auditor holds the form.
+
+    Locked after issue on purpose. Once an auditee is working to a stated
+    requirement and a stated nonconformity, changing either underneath them
+    rewrites the question they are answering — the same reason
+    `replicate_response` refuses to touch a finding that is already with its
+    auditee. Correcting an issued NC means recalling it, which is a visible act.
+    """
+    if finding.issuedAt:
+        raise ValueError(
+            f"NCR {finding.ncrNumber} is already with the auditee. Recall it "
+            f"before editing the auditor section."
+        )
+    for key in AUDITOR_SECTION_FIELDS:
+        if key in data:
+            setattr(finding, key, data[key])
+    await db.flush()
+    return finding
+
+
+async def issue_nc_report(
+    db: AsyncSession, finding: AuditFinding, *, actor_id: str
+) -> dict[str, Any]:
+    """Auditor hands the form to the auditee — the first custody change.
+
+    The completeness check is the point of the step. An NC issued without a
+    stated requirement or a stated nonconformity cannot be analysed, and the
+    auditee discovers that only after opening it; refusing here puts the cost
+    on the person who can actually fix it.
+    """
+    if finding.issuedAt:
+        raise ValueError(f"NCR {finding.ncrNumber} has already been issued.")
+    missing = [
+        label for label, value in (
+            ("Requirements", finding.requirementText),
+            ("Observed Nonconformity", finding.observedNonconformity),
+            ("Grade", finding.gradeText),
+        ) if not (value or "").strip()
+    ]
+    if not finding.dueDate:
+        missing.append("To be completed before")
+    if missing:
+        raise ValueError(
+            f"{PIL_FORM_NO}: complete the auditor section before issuing — "
+            f"missing {', '.join(missing)}."
+        )
+
+    finding.issuedAt = _now()
+    finding.issuedById = actor_id
+    if finding.status == "OPEN":
+        finding.status = "CAPA_RAISED"
+    await db.flush()
+    return {
+        "findingId": finding.id,
+        "ncrNumber": finding.ncrNumber,
+        "stage": "WITH_AUDITEE",
+        "issuedAt": finding.issuedAt.isoformat(),
+        "ownerId": finding.ownerId,
+    }
+
+
+async def recall_nc_report(
+    db: AsyncSession, finding: AuditFinding, *, reason: str, actor_id: str
+) -> dict[str, Any]:
+    """Pull an issued form back for correction. Recorded, never silent."""
+    if finding.mrSignedAt:
+        raise ValueError("This non-conformity is closed.")
+    if not finding.issuedAt:
+        raise ValueError(f"NCR {finding.ncrNumber} has not been issued.")
+    finding.issuedAt = None
+    finding.issuedById = None
+    finding.auditeeSubmittedAt = None
+    finding.auditeeSubmittedById = None
+    finding.verificationDetails = (
+        f"{(finding.verificationDetails or '').strip()}\n"
+        f"[recalled by auditor] {reason}".strip()
+    )
+    await db.flush()
+    return {"findingId": finding.id, "ncrNumber": finding.ncrNumber,
+            "stage": "WITH_AUDITOR_DRAFT"}
+
+
+async def submit_auditee_section(
+    db: AsyncSession, finding: AuditFinding, *, actor_id: str
+) -> dict[str, Any]:
+    """Auditee returns the form — the second custody change.
+
+    Refuses an incomplete return for the same reason `issue` refuses an
+    incomplete issue: the auditor would otherwise be asked to verify the
+    effectiveness of actions that have not been written down.
+    """
+    if not finding.issuedAt:
+        raise ValueError(
+            f"{PIL_FORM_NO}: NCR {finding.ncrNumber} has not been issued yet."
+        )
+    if finding.auditeeSubmittedAt:
+        raise ValueError(f"NCR {finding.ncrNumber} has already been returned.")
+
+    rca = await db.get(RootCauseAnalysis, finding.rcaId) if finding.rcaId else None
+    capa = await db.get(Capa, finding.capaId) if finding.capaId else None
+    actions = (
+        await db.execute(select(CapaAction).where(CapaAction.capaId == capa.id))
+    ).scalars().all() if capa else []
+
+    problems = validate_why_payload(rca.analysisPayload if rca else None)
+    if not any(a.actionType == ACTION_TYPE_FOR_CORRECTION for a in actions):
+        problems.append(f"Record the Correction — {PIL_CORRECTION_PROMPT.lower()}.")
+    if not any(a.actionType == ACTION_TYPE_FOR_PREVENTIVE for a in actions):
+        problems.append(f"Record the Preventive Action — {PIL_PREVENTIVE_PROMPT.lower()}.")
+    open_actions = [a for a in actions if a.status not in ("COMPLETED", "CANCELLED")]
+    if open_actions:
+        problems.append(
+            f"{len(open_actions)} action(s) are not yet complete. Mark each "
+            f"'Completed on' before returning the report."
+        )
+    if problems:
+        raise ValueError(" ".join(problems))
+
+    finding.auditeeSubmittedAt = _now()
+    finding.auditeeSubmittedById = actor_id
+    finding.status = "VERIFICATION"
+    if capa is not None and capa.state != "PENDING_VERIFICATION":
+        capa.state = "PENDING_VERIFICATION"
+        capa.stateChangedAt = _now()
+        capa.stateChangedByUserId = actor_id
+    await db.flush()
+    return {
+        "findingId": finding.id,
+        "ncrNumber": finding.ncrNumber,
+        "stage": "WITH_AUDITOR_VERIFY",
+        "submittedAt": finding.auditeeSubmittedAt.isoformat(),
+    }
+
+
+def assert_auditee_may_edit(finding: AuditFinding) -> None:
+    """The accented half is writable only while the auditee holds the form."""
+    if not finding.issuedAt:
+        raise ValueError(
+            f"{PIL_FORM_NO}: NCR {finding.ncrNumber} has not been issued by the "
+            f"auditor yet."
+        )
+    if finding.auditeeSubmittedAt:
+        raise ValueError(
+            f"{PIL_FORM_NO}: NCR {finding.ncrNumber} has been returned to the "
+            f"auditor and is awaiting verification."
+        )
+    if finding.mrSignedAt:
+        raise ValueError("This non-conformity is closed.")
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Closure — the form's last two rows
 # ─────────────────────────────────────────────────────────────────────
 async def verify_nc(
@@ -1019,6 +1286,19 @@ async def verify_nc(
     """
     if result not in ("EFFECTIVE", "PARTIALLY_EFFECTIVE", "INEFFECTIVE", "INCONCLUSIVE"):
         raise ValueError(f"Unknown verification result {result!r}.")
+    # Custody first. Verification is the auditor's box at the FOOT of the form,
+    # under the auditee's half — it cannot be reached while the auditee still
+    # holds the report, or before the report was ever issued.
+    if not finding.issuedAt:
+        raise ValueError(
+            f"{PIL_FORM_NO}: NCR {finding.ncrNumber} has not been issued yet."
+        )
+    if not finding.auditeeSubmittedAt:
+        raise ValueError(
+            f"{PIL_FORM_NO}: NCR {finding.ncrNumber} is still with the auditee — "
+            f"there is nothing to verify until the Root Cause Analysis, "
+            f"Correction and Preventive Action are returned."
+        )
 
     capa = await db.get(Capa, finding.capaId) if finding.capaId else None
     if capa is None:
@@ -1060,6 +1340,13 @@ async def verify_nc(
         # keeping it would present a re-opened NC as auditor-signed.
         finding.auditorSignedById = None
         finding.auditorSignedAt = None
+        # Custody returns to the AUDITEE. `issuedAt` is deliberately left
+        # standing — the report was issued once and this is the same report
+        # coming back round, not a new one. Clearing the return stamp is what
+        # puts it back on their desk, and it is what makes the round trip
+        # countable: a form returned twice has been through two rounds.
+        finding.auditeeSubmittedAt = None
+        finding.auditeeSubmittedById = None
     else:
         capa.state = "VERIFIED"
         finding.status = "VERIFICATION"
@@ -1118,6 +1405,14 @@ async def mr_sign_off(
 
 __all__ = [
     "PIL_FORM_NO",
+    "NC_STAGE_ACTION",
+    "NC_STAGE_HOLDER",
+    "AUDITOR_SECTION_FIELDS",
+    "update_auditor_section",
+    "issue_nc_report",
+    "recall_nc_report",
+    "submit_auditee_section",
+    "assert_auditee_may_edit",
     "PIL_METHODOLOGY",
     "PIL_MIN_WHY_LEVELS",
     "PIL_RCA_PROMPT",
