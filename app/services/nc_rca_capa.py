@@ -1569,12 +1569,32 @@ def viewer_rights(
             return "Returned to the auditor — locked while effectiveness is verified."
         return None
 
+    # The closure block at the foot of the form. Same principle as the two
+    # halves: the STAGE says the step is due, the IDENTITY says this person is
+    # the one who performs it. Gating these on stage alone showed an auditee a
+    # "Record verification & sign" button on a section that is not theirs and
+    # that the API would refuse — the auditee's own analysis is what is being
+    # verified, so they cannot be the verifier.
+    is_mr = user_id == audit.plantManagerUserId
     return {
         "userId": user_id,
         "isAuditor": is_auditor,
         "isAuditee": is_auditee,
+        "isMr": is_mr,
         "canEditAuditorHalf": is_auditor and auditor_open,
         "canEditAuditeeHalf": is_auditee and auditee_open,
+        "canVerify": is_auditor and stage == "WITH_AUDITOR_VERIFY",
+        # The M.R. is the Organization Representative named on the form. An
+        # auditor may also hold CLOSE, but the second signature exists to be a
+        # different person from the first.
+        "canSign": is_mr and stage == "WITH_MR",
+        "closureWaitingReason": (
+            None if (is_auditor and stage == "WITH_AUDITOR_VERIFY") or (is_mr and stage == "WITH_MR")
+            else "Awaiting the auditor's verification of effective closure."
+            if stage == "WITH_AUDITOR_VERIFY"
+            else "Awaiting the Management Representative's signature."
+            if stage == "WITH_MR" else None
+        ),
         "auditeeLockReason": reason_auditee(),
         "auditorLockReason": (
             None if is_auditor and auditor_open

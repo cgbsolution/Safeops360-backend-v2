@@ -589,3 +589,30 @@ def test_the_auditor_owns_the_yellow_half_before_issue():
     r = viewer_rights(_audit(), drafting, _response(), "auditor-1")
     assert r["canEditAuditorHalf"] is True
     assert r["auditorLockReason"] is None
+
+
+def test_the_auditee_is_never_offered_the_verification_block():
+    """The auditee's own analysis is what is being verified. They cannot be the
+    verifier, whatever stage the form is at or what a client prop says."""
+    returned = _finding(ownerId="auditee-hr")          # with the auditor to verify
+    r = viewer_rights(_audit(), returned, _response(), "auditee-hr")
+    assert r["canVerify"] is False
+    assert r["canSign"] is False
+    assert "auditor" in r["closureWaitingReason"]
+
+
+def test_only_the_auditor_verifies():
+    returned = _finding(ownerId="auditee-hr")
+    assert viewer_rights(_audit(), returned, _response(), "auditor-1")["canVerify"] is True
+    assert viewer_rights(_audit(), returned, _response(), "mr-1")["canVerify"] is False
+
+
+def test_only_the_mr_signs_and_only_after_the_auditor():
+    signed = _finding(ownerId="auditee-hr", auditorSignedAt=datetime.now(timezone.utc))
+    assert viewer_rights(_audit(), signed, _response(), "mr-1")["canSign"] is True
+    # The auditor already signed; the second signature is a different person.
+    assert viewer_rights(_audit(), signed, _response(), "auditor-1")["canSign"] is False
+    assert viewer_rights(_audit(), signed, _response(), "auditee-hr")["canSign"] is False
+    # And nobody may sign before the auditor has verified.
+    unverified = _finding(ownerId="auditee-hr")
+    assert viewer_rights(_audit(), unverified, _response(), "mr-1")["canSign"] is False
