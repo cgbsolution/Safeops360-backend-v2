@@ -1505,7 +1505,7 @@ async def nc_register(
     the Management Representative works a closure review from."""
     audit = await _load_or_404(db, audit_id)
     await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
-                   record_id=audit.id)
+                   record=_reader_record(audit), record_id=audit.id)
     return await nc_rca_capa.nc_register(db, audit)
 
 
@@ -1519,7 +1519,7 @@ async def get_nc_report(
     finding = await _load_nc_or_404(db, finding_id)
     audit = await _load_or_404(db, finding.auditId)
     await _require(db, user, "AUDIT_COMPLIANCE.READ", plant_id=audit.plantId,
-                   record_id=audit.id)
+                   record=_reader_record(audit), record_id=audit.id)
     return await nc_rca_capa.nc_report(db, finding, viewer_id=user.id)
 
 
