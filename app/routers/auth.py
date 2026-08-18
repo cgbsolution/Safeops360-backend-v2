@@ -31,6 +31,7 @@ import secrets
 import time
 from typing import Any
 
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from jose import JWTError, jwt
 from sqlalchemy import func, select
@@ -64,7 +65,13 @@ from app.schemas.auth import (
     VerifyOtpRequest,
     VerifyOtpResponse,
 )
-from app.services.permissions import _load_user_snapshot, get_permissions
+from app.services.permissions import (
+    PermissionContext,
+    _load_user_snapshot,
+    can,
+    get_permissions,
+    invalidate_user_permissions,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -179,6 +186,50 @@ async def my_permissions(
 ) -> PermissionsResponse:
     perms = await get_permissions(db, user.id)
     return PermissionsResponse(permissions=perms)
+
+
+class InvalidatePermissionsRequest(BaseModel):
+    """Whose snapshot to drop. Empty/absent = every user."""
+    userIds: list[str] | None = None
+
+
+@router.post("/permissions/invalidate")
+async def invalidate_permissions(
+    body: InvalidatePermissionsRequest | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Drop the backend's permission snapshot cache after an RBAC edit.
+
+    The missing half of a two-process design. `access_snapshot` below promises
+    that "a permission edit that calls `invalidate_user_permissions()` clears
+    both at once" — but nothing ever called it on this side. The RBAC admin
+    lives in Next.js and writes `RolePermission` through Prisma, then clears the
+    TypeScript cache; the FastAPI process holds a SEPARATE five-minute snapshot
+    cache that never heard about the change.
+
+    So a permission edit appeared to do nothing for up to five minutes, and on a
+    multi-instance deployment it appeared to work intermittently — whichever
+    instance served the request decided whether you saw the old grants or the
+    new ones. That is far worse than a slow update, because it looks like the
+    admin screen is broken rather than like a cache.
+
+    Gated on CONFIGURATION.PERMISSIONS: the same right needed to change grants
+    in the first place, so this cannot be used to probe or disrupt anything a
+    caller could not already alter directly.
+    """
+    res = await can(db, user.id, "CONFIGURATION.PERMISSIONS", PermissionContext())
+    if not res.allowed:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, res.reason or "Missing CONFIGURATION.PERMISSIONS"
+        )
+    ids = (body.userIds if body else None) or None
+    if ids:
+        for uid in ids:
+            invalidate_user_permissions(uid)
+    else:
+        invalidate_user_permissions(None)
+    return {"invalidated": len(ids) if ids else "all"}
 
 
 @router.get("/access-snapshot")

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.deps import get_current_user
+from app.models.plant import Plant
 from app.models.user import User
 from app.services import audit_assignment as assignment
 from app.services import audit_compliance as svc
@@ -674,6 +675,41 @@ async def my_checkpoints(
     await _require(db, user, "AUDIT_COMPLIANCE.READ")
     plants = await get_accessible_plants(db, user.id)
     return await svc.my_assigned_checkpoints(db, user=user, accessible_plants=plants)
+
+
+@router.get("/plants")
+async def audit_plants(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Plants this caller may run audits on — the plant switcher's list.
+
+    Exists because the Audits page was sourcing that list from
+    `/api/hira/wizard/study-options`, whose own comment says it is reused "so we
+    don't need a new backend endpoint just for this". Three things were wrong
+    with borrowing it:
+
+      * It is gated on `HIRA.CREATE OR CAPA.CREATE`. A user with audit rights and
+        neither gets a 403 and therefore an EMPTY plant list — no switcher at all.
+      * It scopes with the module-agnostic `get_accessible_plants`, which this
+        router already rejected for exactly this reason: it returns "all plants"
+        as soon as the caller holds ANY ALL_PLANTS grant, so the switcher could
+        offer plants the user cannot audit. Choosing one produced an empty
+        register or a 403 on schedule.
+      * A HIRA permission change would silently move which plants can be audited.
+
+    Scoped on AUDIT_COMPLIANCE.READ, fail-closed, same as the audit list itself —
+    so what the switcher offers and what the register shows can never disagree.
+    """
+    await _require(db, user, "AUDIT_COMPLIANCE.READ")
+    accessible = await get_accessible_plants_for(db, user.id, "AUDIT_COMPLIANCE.READ")
+    q = select(Plant.id, Plant.code, Plant.name)
+    if accessible is not None:
+        if not accessible:
+            return {"plants": []}
+        q = q.where(Plant.id.in_(accessible))
+    rows = (await db.execute(q.order_by(Plant.name))).all()
+    return {"plants": [{"id": r[0], "code": r[1], "name": r[2]} for r in rows]}
 
 
 @router.get("/users")
