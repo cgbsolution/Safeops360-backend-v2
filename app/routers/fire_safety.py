@@ -7,8 +7,11 @@ escalation and the FSER panel. Plant-scoped via QueryScope.
 NB: gated by the FIRE licence module in the model (registry/editions); the router is
 mounted always-on in dev because the unsigned dev licence predates the FIRE code —
 add "fire_safety": "FIRE" to ROUTER_MODULE once a FIRE-inclusive licence is issued.
-RBAC uses the HSE permissions (INCIDENT.READ/UPDATE) until dedicated FIRE.* grants
-are seeded.
+
+RBAC uses the dedicated FIRE.* grants (see services/fire_permissions.py and
+prisma/seed-rbac.ts). The earlier INCIDENT.READ/UPDATE bootstrap is retired; it
+had two live defects — auditors could not read the register they inspect, and
+contractors could — both of which the FIRE grants close.
 """
 
 from __future__ import annotations
@@ -33,25 +36,34 @@ from app.models.user import User
 from app.services import fire_certificates as certsvc
 from app.services import fire_defects as defectsvc
 from app.services import fire_frequency as freqsvc
+from app.services import fire_permissions as perm
 from app.services import fire_safety as svc
 from app.services.access_scope import build_query_scope
 from app.services.permissions import can
 
 router = APIRouter(prefix="/api/fire", tags=["fire-safety"])
 
-_READ = "INCIDENT.READ"
-_WRITE = "INCIDENT.UPDATE"
+# Dedicated FIRE.* grants now exist, so the INCIDENT.* bootstrap this router
+# documented is retired. It was not merely untidy — it had two live defects that
+# the docstring called out and nothing fixed:
+#
+#   * AUDITOR and LEAD_AUDITOR hold no INCIDENT grant, so the roles whose job is
+#     to inspect this register could not open it.
+#   * WORKER and CONTRACTOR_WORKMAN hold INCIDENT.READ at OWN_RECORDS, which
+#     get_accessible_plants_for widens to the whole plant — so a contractor could
+#     read the entire fire estate.
+#
+# Both are closed by the FIRE grants in prisma/seed-rbac.ts (auditors get
+# READ+EXPORT; workers and contractors get nothing). `fire_permissions.require`
+# falls back to the old codes only while FIRE.* is un-seeded, so this switch does
+# not lock out a deployment that has not reseeded yet.
+_READ = perm.READ
+_WRITE = perm.UPDATE
+_require = perm.require
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-async def _require(db: AsyncSession, user: User, perm: str, plant_id: str | None = None) -> None:
-    from app.services.permissions import PermissionContext
-    res = await can(db, user.id, perm, PermissionContext(plant_id=plant_id))
-    if not res.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, res.reason or "Access denied")
 
 
 def _eq(e: FireEquipment) -> dict[str, Any]:
@@ -410,7 +422,7 @@ async def trigger_inspection(eid: str, user: User = Depends(get_current_user), d
     e = await db.get(FireEquipment, eid)
     if not e or e.isDeleted:
         raise HTTPException(404, "Equipment not found")
-    await _require(db, user, _WRITE, plant_id=e.plantId)
+    await _require(db, user, perm.EXECUTE, plant_id=e.plantId)
     n = (await db.execute(select(func.count()).select_from(CamsEngagement).where(CamsEngagement.sourceModule == "FIRE"))).scalar() or 0
     eng = CamsEngagement(
         engagementCode=f"FIRE-INSP-{_now().year}-{n + 1:04d}",
@@ -999,7 +1011,7 @@ async def close_defect(fid: str, body: DefectCloseBody, user: User = Depends(get
     f = await db.get(CamsFinding, fid)
     if not f or f.isDeleted:
         raise HTTPException(404, "Defect not found")
-    await _require(db, user, _WRITE, plant_id=f.siteId)
+    await _require(db, user, perm.CLOSE, plant_id=f.siteId)
     res = await defectsvc.close_defect(
         db, f, actor_id=user.id, verification_engagement_id=body.verificationEngagementId, note=body.note,
     )
@@ -1015,7 +1027,7 @@ async def verify_defect(fid: str, body: DefectCloseBody, user: User = Depends(ge
     f = await db.get(CamsFinding, fid)
     if not f or f.isDeleted:
         raise HTTPException(404, "Defect not found")
-    await _require(db, user, _WRITE, plant_id=f.siteId)
+    await _require(db, user, perm.CLOSE, plant_id=f.siteId)
     res = await defectsvc.verify_defect(db, f, actor_id=user.id, note=body.note)
     if not res["ok"]:
         raise HTTPException(409, detail=res)

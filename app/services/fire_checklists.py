@@ -47,6 +47,8 @@ from app.models.cams import (
 )
 from app.models.fire_safety import FireEquipment, PlantNonWorkingDay
 from app.services import cams as cams_svc
+from app.services import fire_capa
+from app.services import fire_signoff
 from app.services.fire_checklist_templates import (
     LAYOUT_DAY_GRID, LAYOUT_MONTH_GRID, LAYOUT_QUARTER_GRID,
 )
@@ -489,15 +491,50 @@ def unanswered_mandatory(tpl: CamsTemplate, resp: CamsResponse) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════
 # Sign-off chain
 # ═══════════════════════════════════════════════════════════════════════════
+def signature_enforced(tpl: CamsTemplate) -> bool:
+    """Whether this sheet demands a drawn/typed signature per record.
+
+    Per template, not global, and the reason is practical rather than lax. A daily
+    round is signed once for the month on the paper original; demanding 31 drawn
+    signatures for 31 daily records gets the tablet handed round and one person
+    signing for everybody, which is weaker evidence than the userId stamp alone.
+    Monthly, quarterly and annual sheets each print their own signature block, so
+    those enforce.
+
+    A template can override with `documentMeta.requireSignature`.
+    """
+    meta = template_meta(tpl)
+    override = meta.get("requireSignature")
+    if isinstance(override, bool):
+        return override
+    return meta.get("frequency") != "DAILY"
+
+
 async def advance(
     db, tpl: CamsTemplate, run: CamsEngagement, to_stage: str, *, actor_id: str,
-) -> CamsEngagement:
+    # (userId, display name), resolved by the caller from a LIVE user row. Plain
+    # strings rather than the ORM object on purpose: reading an attribute off an
+    # expired instance triggers a lazy refresh, which under asyncio raises
+    # MissingGreenlet instead of issuing a query — so a service that reads one
+    # fails or not depending on how far its caller is from the last commit.
+    # See fire_signoff.signer_identity.
+    signer: tuple[str, str] | None = None,
+    signature_kind: str | None = None,
+    signature_payload: str | None = None,
+    typed_name: str | None = None,
+    designation: str | None = None,
+) -> tuple[CamsEngagement, dict[str, Any]]:
     """Move a run one stage along Prepared -> Reviewed -> Approved.
 
     Order is enforced by requiring the exact predecessor stage, so approving a
-    draft is a 409 rather than a silent two-step jump. Findings are synced and the
-    score computed at SUBMITTED — the moment the sheet stops being a working copy
-    — not at approval, so a reviewer sees the same defects the preparer did.
+    draft is a 409 rather than a silent two-step jump. Findings and CAPAs are
+    raised at SUBMITTED — the moment the sheet stops being a working copy — not at
+    approval, so a reviewer sees the same defects the preparer did and is
+    reviewing something the CAPA register already knows about.
+
+    Returns (run, outcome). `outcome` carries what the transition created — the
+    defects raised and CAPAs opened — because an operator who has just submitted a
+    sheet with four failures needs telling, not a silent 200.
     """
     step = _STAGE_STEP.get(to_stage)
     if step is None:
@@ -511,6 +548,34 @@ async def advance(
 
     resp = await load_response(db, run)
     now = _now()
+    outcome: dict[str, Any] = {}
+
+    # ── signature, before any state moves ────────────────────────────────────
+    # Validated and built first so a bad payload fails the transition instead of
+    # leaving a stage advanced with no signature against it.
+    sig_entry = None
+    if signer is not None:
+        try:
+            offered = fire_signoff.require_for_stage(
+                run, to_stage,
+                signature_kind=signature_kind,
+                signature_payload=signature_payload,
+                typed_name=typed_name,
+                enforce=signature_enforced(tpl),
+            )
+        except fire_signoff.SignatureRequired as exc:
+            raise ChecklistError(str(exc), 400) from exc
+        if offered is not None:
+            try:
+                sig_entry = fire_signoff.build_entry(
+                    stage=to_stage, user_id=signer[0], user_name=signer[1],
+                    signature_kind=offered["kind"],
+                    signature_payload=offered["payload"],
+                    typed_name=offered["typed"],
+                    designation=designation,
+                )
+            except ValueError as exc:
+                raise ChecklistError(str(exc), 400) from exc
 
     if to_stage == STAGE_SUBMITTED:
         missing = unanswered_mandatory(tpl, resp)
@@ -520,7 +585,21 @@ async def advance(
             raise ChecklistError(f"{len(missing)} required check(s) not answered: {head}{more}", 400)
         answers_by_q = {a["questionId"]: a for a in (resp.answers or [])}
         sections = sorted(tpl.sections, key=lambda s: s.orderIndex)
-        await cams_svc.sync_findings_from_answers(db, run, sections, answers_by_q, actor_id=actor_id)
+
+        # Every "No" becomes a tracked defect, deduped to one open CAPA per
+        # (asset, item) so an unfixed lamp is one CAPA with 29 occurrences rather
+        # than 29 CAPAs. See services/fire_capa.py.
+        asset = await db.get(FireEquipment, run.sourceEntityId) if run.sourceEntityId else None
+        outcome = await fire_capa.sync_failures(
+            db,
+            run=run,
+            sections=sections,
+            answers_by_q=answers_by_q,
+            asset_id=run.sourceEntityId or "",
+            asset_code=(asset.equipmentCode if asset else run.areaOrAssetRef or ""),
+            period_label=run.periodLabel or "",
+            actor_id=actor_id,
+        )
         score = cams_svc.compute_score(sections, answers_by_q, tpl.scoringConfig)
         resp.answers = list(answers_by_q.values())
         resp.sectionScores = score["sectionScores"]
@@ -534,10 +613,14 @@ async def advance(
     else:
         run.approvedBy, run.approvedAt = actor_id, now
 
+    if sig_entry is not None:
+        fire_signoff.record(run, sig_entry)
+        outcome["signature"] = {"role": sig_entry["role"], "kind": sig_entry["signatureKind"]}
+
     run.status = new_status
     run.updatedBy = actor_id
     await db.flush()
-    return run
+    return run, outcome
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -601,6 +684,11 @@ def run_out(tpl: CamsTemplate, run: CamsEngagement, resp: CamsResponse | None,
             "approvedBy": run.approvedBy,
             "approvedAt": run.approvedAt.isoformat() if run.approvedAt else None,
             "roles": meta.get("signOffRoles", []),
+            # The captured marks, with images — a single-record view renders them.
+            # Grid responses use fire_signoff.summary() instead, which strips the
+            # images: 31 daily records x 3 signatures would be ~23 MB of base64.
+            "signatures": fire_signoff.out(run),
+            "signatureRequired": None,
         },
         "sections": sections,
     }
@@ -710,7 +798,7 @@ def shift_window(layout: str, window: str, delta: int) -> str:
 
 
 __all__ = [
-    "ChecklistError", "SOURCE_MODULE",
+    "ChecklistError", "SOURCE_MODULE", "signature_enforced",
     "STAGE_DRAFT", "STAGE_SUBMITTED", "STAGE_REVIEWED", "STAGE_APPROVED",
     "stage_of", "is_locked", "period_label", "validate_period", "period_start",
     "grid_periods", "non_working_days", "load_template", "template_meta",

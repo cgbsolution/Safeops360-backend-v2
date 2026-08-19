@@ -176,7 +176,15 @@ async def upsert_template(db, t: TemplateDef, owner_id: str, audit_type_id: str)
             q.ncTriggersFinding = item.triggers_finding
             q.evidenceRequiredOnNc = False
             q.weight = None
-            q.options = None
+            # `options` is CamsTemplateQuestion's generic per-question config slot.
+            # The per-item NC severity goes here rather than into a new column that
+            # only this module would populate; services/fire_capa.py reads it back.
+            # `noFindingReason` is carried too so the screen can explain why a
+            # pass/fail check does not raise, instead of looking like an oversight.
+            cfg = {"ncSeverity": item.nc_severity}
+            if item.no_finding_reason:
+                cfg["noFindingReason"] = item.no_finding_reason
+            q.options = cfg
     await db.flush()
     return tpl, action
 

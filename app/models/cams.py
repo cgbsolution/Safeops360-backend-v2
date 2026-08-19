@@ -160,6 +160,30 @@ class CamsEngagement(Base, IdMixin):
     approvedBy: Mapped[str | None] = mapped_column(String)
     approvedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # ── Captured signatures ──────────────────────────────────────────────────
+    #
+    # A userId and a timestamp record WHO the system believes acted. They do not
+    # record a person putting their name to a statement, and the paper sheet this
+    # reproduces has a "Sign. & Date:" box under each of its three roles — an
+    # export with a blank box next to a name is not the document the auditor was
+    # handed.
+    #
+    # Shape is copied EXACTLY from `ComplianceAudit.signOffs` (WP-41), the
+    # platform's established sign-off record:
+    #
+    #   [{role, userId, name, designation, signatureKind, signatureImage,
+    #     typedName, statement, signedAt}]
+    #
+    # Same JSON shape, same DRAWN/TYPED vocabulary, same `SignatureModal` canvas
+    # on the front end, same `services/signoff.validate_signature` guard. This is
+    # deliberately not a fire-specific signature mechanism: there is one on this
+    # platform and this is a second consumer of it.
+    #
+    # The `reviewedBy`/`approvedBy` columns above stay as the queryable index —
+    # "which sheets has this person approved" must not be a JSON scan — and the
+    # signature is the evidence behind the stamp, not a replacement for it.
+    signOffs: Mapped[list | None] = mapped_column(JSON)
+
     responses: Mapped[list["CamsResponse"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")
     findings: Mapped[list["CamsFinding"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")
 
@@ -350,6 +374,30 @@ class CamsFinding(Base, IdMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, default="OPEN")
     isRepeatFinding: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     repeatOfFindingId: Mapped[str | None] = mapped_column(String)
+
+    # ── Re-observation of an OPEN finding ────────────────────────────────────
+    #
+    # `isRepeatFinding` / `repeatOfFindingId` describe a defect that came BACK
+    # after being closed. These three describe one that never went away: the same
+    # check failing on the same asset day after day while the CAPA is still open.
+    #
+    # That distinction is what lets a routine daily checklist raise CAPAs at all.
+    # Without it, a power lamp dead for three weeks is either 21 CAPAs (a register
+    # nobody reads) or none (a failure nobody acts on). With it, it is one CAPA
+    # that says "observed 21 times, last on 2026-08-24" — which is the sentence a
+    # CAPA owner can act on and an auditor can check.
+    #
+    # Real columns rather than a JSON blob because "which defects recur most" is a
+    # question worth being able to ORDER BY, and because the first attempt at this
+    # wrote the count into a `sourceMetadata` attribute that does not exist on this
+    # model — every write silently did nothing and the count was permanently stuck
+    # at 2. A typed column fails loudly instead.
+    occurrenceCount: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    lastObservedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The period labels it was seen in ("2026-08-24", "2026-Q3"), newest last and
+    # capped by the writer — a year of daily observations is 365 labels and the
+    # useful facts are the count, the first and the last.
+    observedPeriods: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     dueDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     closedBy: Mapped[str | None] = mapped_column(String)
     closedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

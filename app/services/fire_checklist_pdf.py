@@ -36,7 +36,10 @@ Three renderers because the workbooks have three shapes:
 
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import datetime
+from io import BytesIO
 from typing import Any
 
 from fpdf import FPDF
@@ -44,6 +47,9 @@ from fpdf import FPDF
 # The shared toolchain: same sanitiser, same timezone rule, same colour constants
 # as every other PDF this platform emits.
 from app.services.report_pdf import REPORT_TZ, REPORT_TZ_LABEL, _s
+# The platform's signature size ceiling — shared so a payload this renderer will
+# refuse is exactly the payload the API refused to store.
+from app.services.signoff import MAX_SIGNATURE_BYTES
 
 # Midnight Executive — this is a new module, so it ships in the new design
 # language rather than the legacy violet. Navy rules and headers, gold accents,
@@ -139,19 +145,53 @@ class _Sheet(FPDF):
                            f"{self.doc.get('documentNo', '')}"), align="C")
 
 
-def _sign_off_block(pdf: _Sheet, sign: dict[str, Any] | None, roles: list[str] | None) -> None:
+def _signature_png(data_uri: str | None) -> BytesIO | None:
+    """Decode a captured signature into something fpdf2 can place.
+
+    Returns None on anything malformed. A signature that will not decode must not
+    take the export down with it — the rest of the record is still the record, and
+    the box simply prints empty, which is honest about what is there.
+    """
+    if not data_uri or not data_uri.startswith("data:image/"):
+        return None
+    try:
+        _header, _, b64 = data_uri.partition(",")
+        raw = base64.b64decode(b64, validate=False)
+    except (ValueError, binascii.Error):
+        return None
+    if not raw or len(raw) > MAX_SIGNATURE_BYTES:
+        return None
+    return BytesIO(raw)
+
+
+def _sign_off_block(
+    pdf: _Sheet,
+    sign: dict[str, Any] | None,
+    roles: list[str] | None,
+    signatures: list[dict[str, Any]] | None = None,
+) -> None:
     """Prepared / Reviewed / Approved, printed exactly where the sheets print it.
 
-    Prints the recorded name and timestamp where the stage is complete and leaves
-    the cell blank where it is not — a blank "Sign. & Date" on the export is the
-    correct rendering of an unsigned record, and pre-filling it would be the
-    export asserting an approval that never happened.
+    Draws the CAPTURED signature into the "Sign. & Date" box when there is one —
+    that is the whole reason the mark is captured. Where a stage was signed by
+    typed name instead, the typed name is printed in an italic hand and labelled
+    "(typed)", because a typed signature is weaker evidence and an export that
+    renders the two identically is hiding that.
+
+    A stage that is not signed prints an EMPTY box. That is the correct rendering
+    of an unsigned record: pre-filling it from `userId` would be the export
+    asserting an approval that never happened, which is the specific problem this
+    change exists to fix.
     """
     roles = roles or ["Prepared by: Person In-charge", "Reviewed by: Intermediatory Head",
                       "Approved by: HOD"]
     sign = sign or {}
+    by_role = {s.get("role"): s for s in (signatures or []) if s.get("role")}
+    stages = (("prepared", "PREPARED_BY"), ("reviewed", "REVIEWED_BY"), ("approved", "APPROVED_BY"))
+
     w = (pdf.w - 16) / 3
-    if pdf.get_y() > pdf.h - 34:
+    box_h = 16.0  # tall enough to hold a drawn mark, as the paper box is
+    if pdf.get_y() > pdf.h - (box_h + 20):
         pdf.add_page()
     pdf.ln(3)
     pdf.set_draw_color(*RULE)
@@ -162,14 +202,82 @@ def _sign_off_block(pdf: _Sheet, sign: dict[str, Any] | None, roles: list[str] |
         pdf.cell(w, 6, _s(r), border=1, align="C", fill=True)
     pdf.ln(6)
 
+    # Empty bordered boxes first, then the marks placed inside them — drawing the
+    # frames in one pass keeps the row aligned regardless of what each holds.
+    y_top = pdf.get_y()
+    x_left = pdf.get_x()
+    for _ in stages:
+        pdf.cell(w, box_h, "", border=1)
+    pdf.ln(box_h)
+
     pdf.set_text_color(*INK)
-    pdf.set_font("Helvetica", "", 7)
-    for stage in ("prepared", "reviewed", "approved"):
-        name = sign.get(f"{stage}ByName") or ""
-        at = sign.get(f"{stage}At")
-        text = f"Sign. & Date: {name}  {_date(at)}".rstrip() if name else "Sign. & Date:"
-        pdf.cell(w, 8, _s(text), border=1)
-    pdf.ln(8)
+    for idx, (stage, role) in enumerate(stages):
+        x = x_left + idx * w
+        entry = by_role.get(role)
+        name = (entry or {}).get("name") or sign.get(f"{stage}ByName") or ""
+        at = (entry or {}).get("signedAt") or sign.get(f"{stage}At")
+
+        if entry and entry.get("signatureKind") == "DRAWN":
+            img = _signature_png(entry.get("signatureImage"))
+            if img is not None:
+                try:
+                    # Height-constrained so a wide canvas cannot spill into the
+                    # neighbouring role's box.
+                    pdf.image(img, x=x + 2, y=y_top + 1, h=box_h - 8, keep_aspect_ratio=True)
+                except Exception:  # noqa: BLE001 — a bad image must not kill the export
+                    pass
+        elif entry and entry.get("signatureKind") == "TYPED":
+            pdf.set_xy(x + 2, y_top + 2.5)
+            pdf.set_font("Helvetica", "I", 10)
+            pdf.set_text_color(*NAVY)
+            pdf.cell(w - 4, 6, _s(entry.get("typedName") or name), align="L")
+            pdf.set_xy(x + 2, y_top + 8)
+            pdf.set_font("Helvetica", "", 5.2)
+            pdf.set_text_color(*GREY)
+            pdf.cell(w - 4, 3, _s("(typed signature)"), align="L")
+
+        # Name and date on the baseline of the box, as the paper prints it.
+        #
+        # A stage stamped by the workflow but with NO captured mark is labelled as
+        # such. This is the whole point of the change: without the label the box
+        # reads identically whether the HOD actually signed or the system merely
+        # recorded that their account clicked Approve, and an auditor cannot tell
+        # a signed record from an unsigned one.
+        pdf.set_xy(x + 2, y_top + box_h - 5.5)
+        pdf.set_font("Helvetica", "", 6.4)
+        if not name:
+            pdf.set_text_color(*GREY)
+            caption = "Sign. & Date:"
+        elif entry is None:
+            pdf.set_text_color(*AMBER)
+            caption = f"Sign. & Date: {name}  {_date(at)}  (no signature captured)"
+        else:
+            pdf.set_text_color(*INK)
+            caption = f"Sign. & Date: {name}  {_date(at)}".rstrip()
+        pdf.cell(w - 4, 4, _s(caption), align="L")
+
+    pdf.set_xy(pdf.l_margin, y_top + box_h)
+    pdf.set_text_color(*INK)
+
+    # The attestation each signature was made against. A mark with no statement
+    # is a mark, not an attestation, and "what did they actually certify?" is the
+    # first question asked of a signed record.
+    statements = [((by_role.get(r) or {}).get("statement"), r) for _s, r in stages]
+    if any(st for st, _r in statements):
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "I", 5.6)
+        pdf.set_text_color(*GREY)
+        body_w = pdf.w - pdf.l_margin - pdf.r_margin
+        for st, role in statements:
+            if not st:
+                continue
+            # x reset per line: multi_cell leaves the cursor where the last line
+            # ended, so without this the second statement starts mid-page and
+            # runs off the right edge.
+            pdf.set_x(pdf.l_margin)
+            pdf.multi_cell(body_w, 2.9, _s(f"{role.replace('_', ' ').title()}: {st}"),
+                           border=0, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(*INK)
 
 
 def _footnotes(pdf: _Sheet, lines: list[str] | None) -> None:
@@ -382,7 +490,8 @@ def render_form(payload: dict[str, Any]) -> bytes:
             pdf.set_text_color(*INK)
 
     _footnotes(pdf, doc.get("footnotes"))
-    _sign_off_block(pdf, payload.get("signOff"), doc.get("signOffRoles"))
+    sign = payload.get("signOff") or {}
+    _sign_off_block(pdf, sign, doc.get("signOffRoles"), sign.get("signatures"))
     return _out(pdf)
 
 

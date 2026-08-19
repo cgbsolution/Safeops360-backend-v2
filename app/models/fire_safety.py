@@ -495,9 +495,60 @@ class PlantNonWorkingDay(Base, IdMixin):
     __table_args__ = (Index("ix_PlantNonWorkingDay_plant_day", "plantId", "day", unique=True),)
 
 
+# ── Branded register skins ───────────────────────────────────────────────────
+class FireRegisterViewConfig(Base, IdMixin):
+    """A type-scoped, client-branded view over the ONE fire asset register.
+
+    "Register of Fire Extinguishers" (PIL/EHSD/CL/028-R1) is a controlled
+    document with its own number, revision, column order and print layout. So is
+    a Register of Fire Alarm Panels, if a client asks for one. What they are NOT
+    is separate asset registers — every one of them is `FireEquipment` filtered
+    by `assetType`, and treating them as separate stores is exactly how this
+    module ended up with two add/edit paths onto one table.
+
+    So a branded register is a CONFIG ROW: filter, columns, branding, PDF layout.
+    Adding the next one is a seed entry, not a screen.
+
+    `columns` is an ordered list of field keys the type-scoped screen renders, so
+    the extinguisher sheet's sixteen columns in the client's own order live as
+    data rather than as JSX. `pdfTemplateKey` selects a layout in
+    services/fire_checklist_pdf.py rather than naming a file, so a missing key is
+    a caught error and not a 500 halfway through a render.
+
+    One ACTIVE config per (tenant, assetType): two active configs would make
+    "which register is THE register for extinguishers" a question the UI answers
+    arbitrarily. Enforced by a partial unique index, not by convention.
+    """
+
+    __tablename__ = "FireRegisterViewConfig"
+    tenantId: Mapped[str | None] = mapped_column(String)  # NULL = platform default
+    assetType: Mapped[str] = mapped_column(String, nullable=False)
+    brandName: Mapped[str] = mapped_column(String, nullable=False)
+    routeSlug: Mapped[str] = mapped_column(String, nullable=False)  # e.g. "extinguisher-register"
+    documentNo: Mapped[str] = mapped_column(String, nullable=False)
+    supersedesNo: Mapped[str | None] = mapped_column(String)
+    revision: Mapped[str] = mapped_column(String, nullable=False, default="R1")
+    effectiveDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    department: Mapped[str] = mapped_column(String, nullable=False, default="EHS")
+    # [{key, label}] — ordered, as the client's sheet prints them.
+    columns: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    pdfTemplateKey: Mapped[str] = mapped_column(String, nullable=False, default="GENERIC_REGISTER")
+    isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    createdAt: Mapped[datetime] = _c()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    updatedAt: Mapped[datetime] = _u()
+    updatedBy: Mapped[str | None] = mapped_column(String)
+    __table_args__ = (
+        Index("ix_FireRegisterViewConfig_type", "assetType", "isActive"),
+        Index("ix_FireRegisterViewConfig_slug", "routeSlug"),
+    )
+
+
 __all__ = [
     "FireEquipment", "AssemblyPoint", "FireEmergencyPlan",
     "FireDrill", "FireDrillFinding", "FireIncidentLink",
     "FireZone", "InspectionFrequencyMaster", "FireAmcContract",
     "FireAssetCertificate", "FireFalseAlarmLog", "PlantNonWorkingDay",
+    "FireRegisterViewConfig",
 ]

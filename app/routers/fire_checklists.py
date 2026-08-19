@@ -1,10 +1,13 @@
 """Fire checklist + extinguisher register API (PIL/EHS/CL 025-028).
 
 Mounted on the same `/api/fire` prefix as `routers/fire_safety.py` — one module,
-one URL namespace — and carries the same RBAC pairing that router established
-(INCIDENT.READ / INCIDENT.UPDATE, borrowed from HSE until dedicated FIRE.* grants
-are seeded). Splitting it into its own file rather than growing fire_safety.py
-past 1,500 lines is the only reason it is separate.
+one URL namespace. Splitting it into its own file rather than growing
+fire_safety.py past 1,500 lines is the only reason it is separate.
+
+RBAC is per action, not a read/write pair: `FIRE.EXECUTE` fills a sheet,
+`FIRE.VERIFY` reviews it, `FIRE.APPROVE` locks it, and those go to different
+roles because the sign-off block printed on the client's own sheets says they
+should. See services/fire_permissions.py.
 
 Everything here is a thin HTTP shell over two services:
 
@@ -21,7 +24,7 @@ seeder or a future scheduled job.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
@@ -33,27 +36,27 @@ from app.core.deps import get_current_user
 from app.models.cams import CamsEngagement, CamsTemplate
 from app.models.fire_safety import FireEquipment, PlantNonWorkingDay
 from app.models.user import User
+from app.services import fire_capa
+from app.services import fire_checklist_admin as admin
 from app.services import fire_checklist_pdf as pdfsvc
 from app.services import fire_checklists as svc
 from app.services import fire_register as regsvc
+from app.services import fire_signoff
+from app.services import fire_permissions as perm
 from app.services.access_scope import build_query_scope
-from app.services.fire_checklist_templates import ALL_TEMPLATES
-from app.services.permissions import PermissionContext, can
 
 router = APIRouter(prefix="/api/fire", tags=["fire-safety"])
 
-_READ = "INCIDENT.READ"
-_WRITE = "INCIDENT.UPDATE"
+# Permission codes are named per action rather than collapsed into a read/write
+# pair, because the sheets themselves separate the three sign-off authorities and
+# a router that cannot tell EXECUTE from APPROVE cannot enforce that separation.
+# services/fire_permissions.py holds the codes and the migration guard for
+# deployments whose RBAC has not been reseeded yet.
+_require = perm.require
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-async def _require(db: AsyncSession, user: User, perm: str, plant_id: str | None = None) -> None:
-    res = await can(db, user.id, perm, PermissionContext(plant_id=plant_id))
-    if not res.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, res.reason or "Access denied")
 
 
 def _domain(exc: svc.ChecklistError) -> HTTPException:
@@ -85,41 +88,260 @@ def _with_names(payload: dict[str, Any], names: dict[str, str]) -> dict[str, Any
 # ═══════════════════════════════════════════════════════════════════════════
 # Templates + asset pickers
 # ═══════════════════════════════════════════════════════════════════════════
+@router.get("/checklists/capabilities")
+async def read_capabilities(
+    plantId: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """What this principal may do, so a screen can hide what it cannot offer.
+
+    A page that shows an Approve button to someone who will get a 403 teaches the
+    rule by failing at it, and on a shared plant terminal the operator cannot tell
+    a permission problem from a bug.
+    """
+    return await perm.capabilities(db, user, plantId)
+
+
 @router.get("/checklists/templates")
 async def list_templates(
     assetType: str | None = Query(None),
     frequency: str | None = Query(None),
+    includeRetired: bool = Query(False),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Every seeded controlled checklist, with its document header."""
-    await _require(db, user, _READ)
-    codes = [t.code for t in ALL_TEMPLATES]
-    rows = (
-        await db.execute(
-            select(CamsTemplate)
-            .where(CamsTemplate.templateCode.in_(codes))
-            .where(CamsTemplate.isDeleted.is_(False))
-        )
-    ).scalars().all()
+    """Every fire checklist in the library, with its controlled-document header.
+
+    Discriminates on `documentMeta.assetType`, NOT on the eleven seeded template
+    codes. The earlier code-list filter meant a checklist added through the
+    product was invisible to every screen that lists them — which made "add
+    another checklist" a feature that appeared to do nothing.
+
+    Retired revisions are excluded by default: they still serve the inspections
+    already filed against them, but offering one for a new inspection is how a
+    plant ends up recording against a superseded sheet.
+    """
+    await _require(db, user, perm.READ)
+    rows = await admin.list_templates(db, include_retired=includeRetired)
     items = []
     for t in rows:
-        meta = dict(t.documentMeta or {})
+        meta = t.documentMeta or {}
         if assetType and meta.get("assetType") != assetType:
             continue
         if frequency and meta.get("frequency") != frequency:
             continue
-        items.append({
-            "id": t.id, "templateCode": t.templateCode, "name": t.name,
-            "status": t.status, "version": t.version, "document": meta,
-        })
-    # Seeded order, not alphabetical — Daily before Monthly before Quarterly is
-    # how the workbook tabs read and how an inspector expects the tabs to sit.
-    order = {c: i for i, c in enumerate(codes)}
-    items.sort(key=lambda x: order.get(x["templateCode"], 999))
+        items.append(admin.out(t))
     if not items and not (assetType or frequency):
-        raise HTTPException(404, "No fire checklist templates seeded. Run seed_fire_checklists.py.")
+        raise HTTPException(404, "No fire checklist templates found. Run seed_fire_checklists.py, "
+                                 "or add one from the Checklist Library screen.")
     return {"items": items, "total": len(items)}
+
+
+@router.get("/checklists/templates/{template_id}")
+async def read_template(
+    template_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One checklist with its full editable definition."""
+    await _require(db, user, perm.READ)
+    try:
+        tpl = await admin.load(db, template_id)
+        return admin.out(tpl, run_count_value=await admin.run_count(db, tpl.id), with_definition=True)
+    except svc.ChecklistError as exc:
+        raise _domain(exc) from exc
+
+
+class ChecklistItemIn(BaseModel):
+    # The stable identity of this row across revisions and re-seeds; every stored
+    # answer is keyed to it. Lowercase slug, validated server-side.
+    key: str
+    text: str
+    type: str = "YES_NO_NA"
+    guidance: str | None = None
+    mandatory: bool = True
+    # A "No" raises a finding and a CAPA. ON by default: duplicates are prevented
+    # by one-open-CAPA-per-(asset,item) in services/fire_capa.py, not by declining
+    # to raise them. Switching it off on a Yes/No/NA item requires a reason.
+    triggersFinding: bool = True
+    ncSeverity: str = "MINOR_NC"
+    noFindingReason: str | None = None
+
+
+class ChecklistSectionIn(BaseModel):
+    title: str
+    note: str | None = None
+    items: list[ChecklistItemIn] = Field(default_factory=list)
+
+
+class ChecklistDefinitionIn(BaseModel):
+    """A controlled checklist, as its own document plus its sections."""
+
+    name: str | None = None
+    documentNo: str
+    supersedesNo: str | None = None
+    revision: str = "R1"
+    effectiveDate: str | None = None
+    reviewDate: str | None = None
+    department: str = "EHS"
+    assetType: str
+    frequency: str
+    layout: str
+    siteVariant: str | None = None
+    sourceSheet: str | None = None
+    signOffRoles: list[str] | None = None
+    footnotes: list[str] | None = None
+    templateCode: str | None = None
+    sections: list[ChecklistSectionIn] = Field(default_factory=list)
+
+
+async def _audit_type_id(db: AsyncSession) -> str | None:
+    """The FIRE-CHECKLIST audit type the seeder creates, if it exists yet."""
+    from app.models.cams import CamsAuditType
+
+    return (
+        await db.execute(select(CamsAuditType.id).where(CamsAuditType.typeCode == "FIRE-CHECKLIST"))
+    ).scalars().first()
+
+
+@router.post("/checklists/templates", status_code=201)
+async def create_template(
+    body: ChecklistDefinitionIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Add a checklist. Created as DRAFT — publishing is a separate authority.
+
+    TEMPLATE_AUTHOR, not UPDATE: transcribing a client's controlled sheet and
+    editing an inspection record are different jobs, and the person who does the
+    first should not automatically be able to rule their own transcription fit to
+    publish.
+    """
+    await _require(db, user, perm.TEMPLATE_AUTHOR)
+    try:
+        tpl = await admin.create(
+            db, body.model_dump(), actor_id=user.id, audit_type_id=await _audit_type_id(db),
+        )
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    tpl = await admin.load(db, tpl.id)
+    return admin.out(tpl, run_count_value=0, with_definition=True)
+
+
+@router.put("/checklists/templates/{template_id}")
+async def update_template(
+    template_id: str,
+    body: ChecklistDefinitionIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Edit a checklist. Refused once inspections are recorded against it."""
+    await _require(db, user, perm.TEMPLATE_AUTHOR)
+    try:
+        tpl = await admin.load(db, template_id)
+        await admin.update(db, tpl, body.model_dump(), actor_id=user.id)
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    tpl = await admin.load(db, template_id)
+    return admin.out(tpl, run_count_value=await admin.run_count(db, tpl.id), with_definition=True)
+
+
+class CloneIn(BaseModel):
+    revision: str | None = None
+
+
+@router.post("/checklists/templates/{template_id}/clone", status_code=201)
+async def clone_template(
+    template_id: str,
+    body: CloneIn | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """A new DRAFT revision of an existing sheet.
+
+    The supported route for revising a frozen checklist: the old revision keeps
+    serving the inspections already filed against it, and the new one carries
+    `supersedesNo` pointing at its parent — the same lineage the paper sheets
+    print.
+    """
+    await _require(db, user, perm.TEMPLATE_AUTHOR)
+    try:
+        parent = await admin.load(db, template_id)
+        child = await admin.clone_revision(
+            db, parent, actor_id=user.id, revision=(body.revision if body else None),
+        )
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    child = await admin.load(db, child.id)
+    return admin.out(child, run_count_value=0, with_definition=True)
+
+
+@router.post("/checklists/templates/{template_id}/publish")
+async def publish_template(
+    template_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Publish a revision for use, retiring the previous one of the same sheet.
+
+    TEMPLATE_APPROVE, deliberately not the same code as TEMPLATE_AUTHOR: this
+    publishes a version of a controlled document that every future inspection on
+    the site is recorded against. It is a document-control act, and the person who
+    transcribed the sheet should not also be the one who rules it fit to publish.
+    """
+    await _require(db, user, perm.TEMPLATE_APPROVE)
+    try:
+        tpl = await admin.load(db, template_id)
+        _tpl, retired = await admin.publish(db, tpl, actor_id=user.id)
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    tpl = await admin.load(db, template_id)
+    payload = admin.out(tpl, run_count_value=await admin.run_count(db, tpl.id), with_definition=True)
+    payload["retiredTemplates"] = retired
+    return payload
+
+
+@router.post("/checklists/templates/{template_id}/retire")
+async def retire_template(
+    template_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Stop offering this sheet. Inspections already filed against it stay readable."""
+    await _require(db, user, perm.TEMPLATE_APPROVE)
+    try:
+        tpl = await admin.load(db, template_id)
+        await admin.retire(db, tpl, actor_id=user.id)
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    tpl = await admin.load(db, template_id)
+    return admin.out(tpl, run_count_value=await admin.run_count(db, tpl.id))
+
+
+@router.delete("/checklists/templates/{template_id}")
+async def delete_template(
+    template_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Delete a checklist — or retire it, and say so, if inspections exist.
+
+    Returns 200 with `{deleted, retired, reason}` rather than 204, because
+    "retired instead of deleted" is an outcome the operator needs to be told
+    about. A silent 204 that actually retired the sheet would be a lie.
+    """
+    await _require(db, user, perm.DELETE)
+    try:
+        tpl = await admin.load(db, template_id)
+        result = await admin.delete(db, tpl, actor_id=user.id)
+        await db.commit()
+    except svc.ChecklistError as exc:
+        await db.rollback()
+        raise _domain(exc) from exc
+    return {"templateId": template_id, **result}
 
 
 @router.get("/checklists/assets")
@@ -130,8 +352,8 @@ async def list_checklist_assets(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """The asset picker behind each checklist screen. Plant-scoped."""
-    await _require(db, user, _READ)
-    scope = await build_query_scope(db, user.id, _READ)
+    await _require(db, user, perm.READ)
+    scope = await build_query_scope(db, user.id, perm.READ)
     stmt = scope.apply(
         select(FireEquipment)
         .where(FireEquipment.isDeleted.is_(False))
@@ -199,7 +421,7 @@ async def get_or_create_run(
         tpl = await svc.load_template(db, template_code=templateCode)
         meta = svc.template_meta(tpl)
         asset = await svc.resolve_asset(db, tpl, assetId)
-        await _require(db, user, _READ if not create else _WRITE, plant_id=asset.plantId)
+        await _require(db, user, perm.READ if not create else perm.EXECUTE, plant_id=asset.plantId)
         period = period or svc.period_label(meta.get("frequency", "DAILY"), _now().date())
         svc.validate_period(meta.get("frequency", "DAILY"), period)
 
@@ -237,7 +459,7 @@ async def create_run(
         tpl = await svc.load_template(db, template_code=body.templateCode)
         meta = svc.template_meta(tpl)
         asset = await svc.resolve_asset(db, tpl, body.assetId)
-        await _require(db, user, _WRITE, plant_id=asset.plantId)
+        await _require(db, user, perm.EXECUTE, plant_id=asset.plantId)
         period = body.period or svc.period_label(meta.get("frequency", "DAILY"), _now().date())
         run, created = await svc.get_or_create_run(db, tpl, asset, period, actor_id=user.id)
         await db.commit()
@@ -254,7 +476,7 @@ async def read_run(
     run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     tpl, run, asset = await _load_run(db, run_id)
-    await _require(db, user, _READ, plant_id=run.siteId)
+    await _require(db, user, perm.READ, plant_id=run.siteId)
     resp = await svc.load_response(db, run)
     return _with_names(
         svc.run_out(tpl, run, resp, asset),
@@ -289,7 +511,7 @@ async def save_responses(
     sheet's twenty items cannot blank the other twelve by omitting them.
     """
     tpl, run, asset = await _load_run(db, run_id)
-    await _require(db, user, _WRITE, plant_id=run.siteId)
+    await _require(db, user, perm.EXECUTE, plant_id=run.siteId)
     try:
         resp = await svc.save_answers(
             db, tpl, run, [a.model_dump(exclude_none=True) for a in body.answers], actor_id=user.id,
@@ -305,39 +527,166 @@ async def save_responses(
     )
 
 
-async def _advance(db: AsyncSession, user: User, run_id: str, stage: str) -> dict[str, Any]:
+# Prepared / Reviewed / Approved are three separate authorities, not one write
+# grant. Collapsing them would let one principal fill a sheet, review it and
+# approve it -- which is exactly what the three-stage block printed on the sheet
+# exists to prevent, and stage-ORDER enforcement is no substitute: order stops
+# you skipping a stage, not from being all three people.
+_STAGE_PERMISSION = {
+    svc.STAGE_SUBMITTED: perm.EXECUTE,
+    svc.STAGE_REVIEWED: perm.VERIFY,
+    svc.STAGE_APPROVED: perm.APPROVE,
+}
+
+
+class SignOffBody(BaseModel):
+    """The signature accompanying a stage transition.
+
+    Mirrors `assurance.SignOffBody` field-for-field — same DRAWN/TYPED vocabulary,
+    same `signaturePayload` data-URI convention — because it is the same platform
+    mechanism, not a fire-specific one.
+
+    Optional on the wire so a DAILY sheet can advance without one (see
+    `svc.signature_enforced` for why daily rounds are exempted); the service
+    rejects a missing signature on every sheet that requires it.
+    """
+
+    signatureKind: Literal["DRAWN", "TYPED"] = "DRAWN"
+    signaturePayload: str | None = None   # PNG data URI for DRAWN
+    typedName: str | None = None          # required for TYPED
+    designation: str | None = None
+
+
+async def _advance(
+    db: AsyncSession, user: User, run_id: str, stage: str, body: SignOffBody | None,
+) -> dict[str, Any]:
     tpl, run, asset = await _load_run(db, run_id)
-    await _require(db, user, _WRITE, plant_id=run.siteId)
+    await _require(db, user, _STAGE_PERMISSION[stage], plant_id=run.siteId)
+    body = body or SignOffBody()
     try:
-        await svc.advance(db, tpl, run, stage, actor_id=user.id)
+        _run, outcome = await svc.advance(
+            db, tpl, run, stage, actor_id=user.id,
+            # The signer is the authenticated user, resolved here where the row is
+            # fresh. There is deliberately no way to sign in someone else's name —
+            # that manufactures evidence.
+            signer=fire_signoff.signer_identity(user),
+            signature_kind=body.signatureKind,
+            signature_payload=body.signaturePayload,
+            typed_name=body.typedName,
+            designation=body.designation,
+        )
         await db.commit()
     except svc.ChecklistError as exc:
         await db.rollback()
         raise _domain(exc) from exc
     await db.refresh(run)
     resp = await svc.load_response(db, run)
-    return _with_names(
+    payload = _with_names(
         svc.run_out(tpl, run, resp, asset),
         await _names(db, [resp.completedBy, run.reviewedBy, run.approvedBy]),
     )
+    # What the transition actually created. An operator who just submitted a sheet
+    # with four failures has opened four CAPAs and needs telling, not a silent 200.
+    payload["outcome"] = outcome
+    payload["outcomeMessage"] = fire_capa.summarise(outcome)
+    return payload
 
 
 @router.post("/checklists/run/{run_id}/submit")
-async def submit_run(run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Prepared by — every mandatory item must be answered first."""
-    return await _advance(db, user, run_id, svc.STAGE_SUBMITTED)
+async def submit_run(
+    run_id: str, body: SignOffBody | None = None,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    """Prepared by — answers every mandatory item, then raises a CAPA per failure.
+
+    Every "No" becomes a tracked defect here, deduped to one open CAPA per
+    (asset, item) so a fault left unfixed for three weeks is one CAPA with 21
+    occurrences rather than 21 CAPAs. See services/fire_capa.py.
+    """
+    return await _advance(db, user, run_id, svc.STAGE_SUBMITTED, body)
 
 
 @router.post("/checklists/run/{run_id}/review")
-async def review_run(run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def review_run(
+    run_id: str, body: SignOffBody | None = None,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
     """Reviewed by — rejected unless the run is SUBMITTED."""
-    return await _advance(db, user, run_id, svc.STAGE_REVIEWED)
+    return await _advance(db, user, run_id, svc.STAGE_REVIEWED, body)
 
 
 @router.post("/checklists/run/{run_id}/approve")
-async def approve_run(run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def approve_run(
+    run_id: str, body: SignOffBody | None = None,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
     """Approved by — rejected unless the run is REVIEWED. Locks the record."""
-    return await _advance(db, user, run_id, svc.STAGE_APPROVED)
+    return await _advance(db, user, run_id, svc.STAGE_APPROVED, body)
+
+
+@router.get("/checklists/run/{run_id}/signoff")
+async def read_signoff(
+    run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """What is signed, what is outstanding, and whether a signature is required."""
+    tpl, run, _asset = await _load_run(db, run_id)
+    await _require(db, user, perm.READ, plant_id=run.siteId)
+    signed = fire_signoff.existing_roles(run)
+    return {
+        "runId": run.id,
+        "stage": svc.stage_of(run),
+        "signatureRequired": svc.signature_enforced(tpl),
+        "roles": [
+            {
+                "role": role,
+                "label": fire_signoff.ROLE_LABEL[role],
+                "statement": fire_signoff.STATEMENT[role],
+                "signed": role in signed,
+            }
+            for role in ("PREPARED_BY", "REVIEWED_BY", "APPROVED_BY")
+        ],
+        "signatures": fire_signoff.out(run),
+        "maxSignatureBytes": fire_signoff.MAX_SIGNATURE_BYTES,
+    }
+
+
+@router.get("/checklists/run/{run_id}/defects")
+async def run_defects(
+    run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The defects this record raised, with their CAPAs.
+
+    A failed check that leads nowhere visible is a failed check nobody acts on, so
+    the record links straight through to the CAPA rather than leaving the operator
+    to find it in the CAPA register.
+    """
+    from app.models.capa import Capa
+    from app.models.cams import CamsFinding
+
+    _tpl, run, _asset = await _load_run(db, run_id)
+    await _require(db, user, perm.READ, plant_id=run.siteId)
+    findings = (
+        await db.execute(select(CamsFinding).where(CamsFinding.engagementId == run.id))
+    ).scalars().all()
+    capa_ids = [f.capaId for f in findings if f.capaId]
+    capas: dict[str, Any] = {}
+    if capa_ids:
+        for c in (await db.execute(select(Capa).where(Capa.id.in_(capa_ids)))).scalars().all():
+            capas[c.id] = {"id": c.id, "capaNumber": c.capaNumber, "state": c.state}
+    return {
+        "runId": run.id,
+        "items": [
+            {
+                "findingId": f.id, "findingCode": f.findingCode, "title": f.title,
+                "severity": f.severity, "status": f.status,
+                "isRepeatFinding": f.isRepeatFinding,
+                "occurrences": (getattr(f, "sourceMetadata", None) or {}).get("occurrences", 1),
+                "capa": capas.get(f.capaId) if f.capaId else None,
+            }
+            for f in findings
+        ],
+        "total": len(findings),
+    }
 
 
 @router.get("/checklists/run/{run_id}/history")
@@ -351,7 +700,7 @@ async def run_history(
     already hash-chained.
     """
     _tpl, run, _asset = await _load_run(db, run_id)
-    await _require(db, user, _READ, plant_id=run.siteId)
+    await _require(db, user, perm.READ, plant_id=run.siteId)
 
     events: list[dict[str, Any]] = []
     try:
@@ -398,7 +747,7 @@ async def export_run_pdf(
     run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ) -> Response:
     tpl, run, asset = await _load_run(db, run_id)
-    await _require(db, user, _READ, plant_id=run.siteId)
+    await _require(db, user, perm.EXPORT, plant_id=run.siteId)
     resp = await svc.load_response(db, run)
     payload = _with_names(
         svc.run_out(tpl, run, resp, asset),
@@ -429,7 +778,7 @@ async def _grid(db: AsyncSession, user: User, template_code: str, asset_id: str,
                 "Use /api/fire/checklists/run for this sheet.", 409,
             )
         asset = await svc.resolve_asset(db, tpl, asset_id)
-        await _require(db, user, _READ, plant_id=asset.plantId)
+        await _require(db, user, perm.READ, plant_id=asset.plantId)
         window = window or svc.default_window(meta.get("layout", "DAY_GRID"))
         payload = await svc.grid_out(db, tpl, asset, window)
     except svc.ChecklistError as exc:
@@ -461,6 +810,7 @@ async def export_grid_pdf(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     payload = await _grid(db, user, templateCode, assetId, window)
+    await _require(db, user, perm.EXPORT, plant_id=payload.get("plantId"))
     pdf = pdfsvc.render_grid(payload)
     doc_no = (payload.get("document") or {}).get("documentNo", "checklist").replace("/", "-")
     return Response(
@@ -497,7 +847,7 @@ async def save_grid(
     try:
         tpl = await svc.load_template(db, template_code=body.templateCode)
         asset = await svc.resolve_asset(db, tpl, body.assetId)
-        await _require(db, user, _WRITE, plant_id=asset.plantId)
+        await _require(db, user, perm.EXECUTE, plant_id=asset.plantId)
 
         by_period: dict[str, list[dict[str, Any]]] = {}
         for c in body.cells:
@@ -545,8 +895,8 @@ async def read_register(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """The sixteen-column register, with computed due-date badges."""
-    await _require(db, user, _READ)
-    scope = await build_query_scope(db, user.id, _READ)
+    await _require(db, user, perm.READ)
+    scope = await build_query_scope(db, user.id, perm.READ)
     stmt = scope.apply(
         select(FireEquipment)
         .where(FireEquipment.isDeleted.is_(False))
@@ -613,7 +963,7 @@ async def create_register_row(
         raise HTTPException(400, "plantId is required.")
     if not body.location:
         raise HTTPException(400, "Location is required — the register is read by location.")
-    await _require(db, user, _WRITE, plant_id=body.plantId)
+    await _require(db, user, perm.CREATE, plant_id=body.plantId)
 
     code = body.equipmentCode
     if not code:
@@ -655,7 +1005,7 @@ async def update_register_row(
         raise HTTPException(404, "Extinguisher not found.")
     if e.type != regsvc.EXTINGUISHER:
         raise HTTPException(409, f"{e.equipmentCode} is not an extinguisher.")
-    await _require(db, user, _WRITE, plant_id=e.plantId)
+    await _require(db, user, perm.UPDATE, plant_id=e.plantId)
 
     sent = set(body.model_fields_set)
     _apply_register_fields(e, body, sent)
@@ -679,6 +1029,7 @@ async def export_register_pdf(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
+    await _require(db, user, perm.EXPORT)
     payload = await read_register(location=location, feType=None, badge=None, user=user, db=db)
     pdf = pdfsvc.render_register(payload)
     return Response(
@@ -696,7 +1047,7 @@ async def register_row_inspections(
     e = await db.get(FireEquipment, eid)
     if e is None or e.isDeleted:
         raise HTTPException(404, "Extinguisher not found.")
-    await _require(db, user, _READ, plant_id=e.plantId)
+    await _require(db, user, perm.READ, plant_id=e.plantId)
     return await _grid(db, user, "PIL-FE-INSPECTION", eid, str(year) if year else None)
 
 
@@ -710,7 +1061,7 @@ async def list_non_working_days(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await _require(db, user, _READ, plant_id=plantId)
+    await _require(db, user, perm.READ, plant_id=plantId)
     try:
         days = [date.fromisoformat(p) for p, _ in svc.grid_periods("DAY_GRID", "DAILY", window)]
     except svc.ChecklistError as exc:
@@ -734,7 +1085,7 @@ class NonWorkingDayIn(BaseModel):
 async def mark_non_working_day(
     body: NonWorkingDayIn, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    await _require(db, user, _WRITE, plant_id=body.plantId)
+    await _require(db, user, perm.CALENDAR, plant_id=body.plantId)
     day = datetime.combine(body.day, time.min, tzinfo=timezone.utc)
     existing = (
         await db.execute(
@@ -756,7 +1107,7 @@ async def unmark_non_working_day(
     plantId: str = Query(...), day: date = Query(...),
     user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ) -> Response:
-    await _require(db, user, _WRITE, plant_id=plantId)
+    await _require(db, user, perm.CALENDAR, plant_id=plantId)
     target = datetime.combine(day, time.min, tzinfo=timezone.utc)
     row = (
         await db.execute(

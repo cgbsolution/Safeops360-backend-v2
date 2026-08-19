@@ -39,16 +39,32 @@ page to save paper**. So the record is the occurrence — one `CamsEngagement` p
 
 `layout` below tells the UI and the PDF which way to pivot a set of those.
 
-FINDINGS ARE OFF BY DEFAULT
----------------------------
-`triggers_finding` defaults to False on every item here. The build spec's open
-item #2 defers failed-item -> CAPA to a later phase, and the daily grids make that
-the right default anyway: a month of daily alarm rounds at seven checks a day is
-217 chances to auto-raise a finding, and a findings register flooded by "power
-indicator lamp off, fixed same shift" is a findings register nobody reads. The
-flag is per item, so turning it on for the checks that genuinely warrant a CAPA
-is a one-line change here and needs no code. Exactly one item is seeded with it
-on today — see FE_INSPECTION `fe_06`.
+EVERY "NO" RAISES A CAPA
+------------------------
+`triggers_finding` defaults to **True**. A failed statutory check that leads
+nowhere is a failed check nobody acts on, so each "No" creates a CAMS finding and
+opens a CAPA against it.
+
+An earlier revision of this file defaulted the flag to False, reasoning that a
+daily grid at seven checks a day would flood the register with 217 chances a
+month to raise "power indicator lamp off". The arithmetic was right and the
+conclusion was wrong: the fix for "this raises the same CAPA thirty times" is not
+to raise none, it is to stop raising duplicates. `services/fire_capa.py` keeps
+exactly one open CAPA per (asset, item) — the first "No" opens it, every later
+"No" on the same item for the same asset increments an occurrence count on the
+same finding. A lamp dead for three weeks is one CAPA reading "observed 21
+times", which is more actionable than twenty-one tickets, not less.
+
+`nc_severity` says what a failure IS. Most routine checks are MINOR_NC: scuffed
+paint is not a major non-conformance, and grading everything major makes the
+field meaningless. The handful that genuinely are — no water in the hydrant tank,
+design pressure not held, an extinguisher past its refill date — carry MAJOR_NC,
+which is what makes the platform treat the CAPA as mandatory rather than
+advisory.
+
+`triggers_finding=False` stays available for the rows that are readings rather
+than judgements (a battery voltage, a detector serial number) and for the
+free-text closing fields, where there is no "No" to fail.
 """
 
 from __future__ import annotations
@@ -85,7 +101,29 @@ class Item:
     type: str = "YES_NO_NA"          # YES_NO_NA | NUMERIC | TEXT
     guidance: str | None = None
     mandatory: bool = True
-    triggers_finding: bool = False   # see module docstring
+    # A "No" here raises a finding and a CAPA. On by default — see the module
+    # docstring for why, and for how duplicates are prevented.
+    triggers_finding: bool = True
+    # What a failure of this specific check IS. MINOR_NC unless the check is one
+    # where a "No" means the system would not work in a fire.
+    nc_severity: str = "MINOR_NC"
+    # Why this item does NOT raise a finding, when it is a Yes/No/NA check.
+    # Required for any such exemption and asserted by the test suite: a pass/fail
+    # check quietly excluded from CAPA is the failure mode this whole feature
+    # exists to fix, so an exemption has to be argued in the data, not assumed.
+    # Readings (NUMERIC/TEXT) need no reason — there is no "No" to fail.
+    no_finding_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        # Only a Yes/No/NA item can be non-conforming: `_coerce` returns no
+        # conformance for a NUMERIC or TEXT answer, so a reading could never raise
+        # a finding however the flag were set. Forcing it False here keeps the
+        # data honest rather than leaving a flag that reads as enabled and is inert
+        # — and means the invariant lives in the type instead of in a hand-kept
+        # list of keys that drifts the first time an item is added.
+        if self.type != "YES_NO_NA":
+            object.__setattr__(self, "triggers_finding", False)
+            object.__setattr__(self, "nc_severity", "MINOR_NC")
 
 
 @dataclass(frozen=True)
@@ -147,13 +185,13 @@ FAS_DAILY = TemplateDef(
     sourceSheet="Daily",
     sections=[
         Section("Daily Attention", [
-            Item("fas_d_01", "Wheather the panel indicates normal operation"),
+            Item("fas_d_01", "Wheather the panel indicates normal operation", nc_severity="MAJOR_NC"),
             Item("fas_d_02", "FAS faults are updated in the register"),
-            Item("fas_d_03", "Fire alarm control unit is powered up."),
+            Item("fas_d_03", "Fire alarm control unit is powered up.", nc_severity="MAJOR_NC"),
             Item("fas_d_04", "Power indicator lamp is available."),
-            Item("fas_d_05", "Fire alarm zone lamps are working properly."),
+            Item("fas_d_05", "Fire alarm zone lamps are working properly.", nc_severity="MAJOR_NC"),
             Item("fas_d_06", "Other indicators are working properly."),
-            Item("fas_d_07", "Fire hooter in fire panel is working properly."),
+            Item("fas_d_07", "Fire hooter in fire panel is working properly.", nc_severity="MAJOR_NC"),
         ]),
     ],
     # The sheet carries an Electrician and a Safety Officer signature row per date
@@ -183,10 +221,10 @@ def _fas_monthly(variant: str, addressing: str, hooters: list[str], batteries: l
             Section("Monthly Attention", [
                 Item("fas_m_01", "Trigger device or end of line switch on one zone circuit has been operated "
                                  "to test the ability of the control & indicating equipment to receive a singal "
-                                 "& to sound the alarm & operate a signal warning devices."),
+                                 "& to sound the alarm & operate a signal warning devices.", nc_severity="MAJOR_NC"),
                 Item("fas_m_02", "Visual examination of the battery & connection has been made."),
                 Item("fas_m_03", "Action has been taken to correct the defects including low electrolyte level."),
-                Item("fas_m_04", "Manual call point is in working condition."),
+                Item("fas_m_04", "Manual call point is in working condition.", nc_severity="MAJOR_NC"),
             ]),
             Section("Battery Details", [
                 Item(f"fas_m_batt_{b.lower()}_vdc", f"Battery ({b}) = ______ VDC", type="NUMERIC", mandatory=False)
@@ -195,12 +233,12 @@ def _fas_monthly(variant: str, addressing: str, hooters: list[str], batteries: l
             Section("1. Triggered Device", [
                 # `addressing` is the ONLY structural difference between the two
                 # unit sheets: Zone Number on 21 A, Loop Number on 21 B.
-                Item("fas_m_trig_addr", f"{addressing} :", type="TEXT"),
-                Item("fas_m_trig_detector", "Smoke Detector Num / Resistor", type="TEXT"),
-                Item("fas_m_trig_detector_signal", "Is FAS Panel receiving signal & sounding alarm"),
-                Item("fas_m_trig_mcp", "MCP Num", type="TEXT"),
-                Item("fas_m_trig_mcp_signal", "Is FAS Panel receiving signal & sounding alarm (MCP)"),
-                Item("fas_m_trig_open_serial", "Serial num of Detector removed to check open fault", type="TEXT"),
+                Item("fas_m_trig_addr", f"{addressing} :", type="TEXT", triggers_finding=False),
+                Item("fas_m_trig_detector", "Smoke Detector Num / Resistor", type="TEXT", triggers_finding=False),
+                Item("fas_m_trig_detector_signal", "Is FAS Panel receiving signal & sounding alarm", nc_severity="MAJOR_NC"),
+                Item("fas_m_trig_mcp", "MCP Num", type="TEXT", triggers_finding=False),
+                Item("fas_m_trig_mcp_signal", "Is FAS Panel receiving signal & sounding alarm (MCP)", nc_severity="MAJOR_NC"),
+                Item("fas_m_trig_open_serial", "Serial num of Detector removed to check open fault", type="TEXT", triggers_finding=False),
                 Item("fas_m_trig_open_fault", "Open fault shown in the FAS Panel ( YES/NO )"),
             ]),
             Section("2. Visual Examination Of Battery", [
@@ -209,16 +247,20 @@ def _fas_monthly(variant: str, addressing: str, hooters: list[str], batteries: l
                 Item("fas_m_batt_wires", "Are wires free from damage ?"),
                 Item("fas_m_batt_leak", "Are Batteries free from leakage ?"),
                 Item("fas_m_batt_corrosion", "Are batteries free from corrossion ?"),
-                Item("fas_m_batt_voltage", "What is the measured voltage ?", type="NUMERIC"),
+                Item("fas_m_batt_voltage", "What is the measured voltage ?", type="NUMERIC", triggers_finding=False),
             ]),
             Section("Hooter Location - Audible to all areas (YES / NO)", [
                 Item(f"fas_m_hooter_{i:02d}", loc)
                 for i, loc in enumerate(hooters, start=1)
             ]),
             Section("Additional Hooters", [
-                Item("fas_m_hooter_addl_required", "Is additional hooters required ?"),
-                Item("fas_m_hooter_addl_location", "If required, for which location ?", type="TEXT", mandatory=False),
-                Item("fas_m_hooter_addl_count", "How many hooters are required ?", type="NUMERIC", mandatory=False),
+                Item("fas_m_hooter_addl_required", "Is additional hooters required ?", triggers_finding=False,
+                     no_finding_reason=(
+                         'Inverted polarity: "No" means no extra hooters are needed, which is '
+                         'the healthy answer here. A CAPA raised on "No" would be backwards.'
+                     )),
+                Item("fas_m_hooter_addl_location", "If required, for which location ?", type="TEXT", mandatory=False, triggers_finding=False),
+                Item("fas_m_hooter_addl_count", "How many hooters are required ?", type="NUMERIC", mandatory=False, triggers_finding=False),
             ]),
         ],
     )
@@ -272,11 +314,11 @@ FAS_QUARTERLY = TemplateDef(
             )
         ]),
         Section("Battery Endurance Test", [
-            Item("fas_q_cutoff_at", "Raw power cut off at (time / date)", type="TEXT", mandatory=False),
+            Item("fas_q_cutoff_at", "Raw power cut off at (time / date)", type="TEXT", mandatory=False, triggers_finding=False),
             Item("fas_q_supported_till", "After raw power cutoff, fully charged battery supported the system "
-                                         "till (time / date)", type="TEXT", mandatory=False),
+                                         "till (time / date)", type="TEXT", mandatory=False, triggers_finding=False),
             Item("fas_q_alarm_minutes", "Minutes battery sustained on sounding the alarm",
-                 type="NUMERIC", mandatory=False),
+                 type="NUMERIC", mandatory=False, triggers_finding=False),
         ]),
         Section("Sound from hooters is 80dB(A) at all locations (Yes/No)", [
             Item("fas_q_db_warping", "Warping"),
@@ -286,13 +328,17 @@ FAS_QUARTERLY = TemplateDef(
             Item("fas_q_db_etp", "ETP"),
         ]),
         Section("Additional Hooters", [
-            Item("fas_q_hooter_addl_required", "Is additional hooters required ?"),
-            Item("fas_q_hooter_addl_location", "If required, for which location ?", type="TEXT", mandatory=False),
-            Item("fas_q_hooter_addl_count", "How many hooters are required ?", type="NUMERIC", mandatory=False),
+            Item("fas_q_hooter_addl_required", "Is additional hooters required ?", triggers_finding=False,
+                     no_finding_reason=(
+                         'Inverted polarity: "No" means no extra hooters are needed, which is '
+                         'the healthy answer here. A CAPA raised on "No" would be backwards.'
+                     )),
+            Item("fas_q_hooter_addl_location", "If required, for which location ?", type="TEXT", mandatory=False, triggers_finding=False),
+            Item("fas_q_hooter_addl_count", "How many hooters are required ?", type="NUMERIC", mandatory=False, triggers_finding=False),
         ]),
         Section("Closing", [
-            Item("fas_q_deviations", "Description of Deviations (if any):", type="TEXT", mandatory=False),
-            Item("fas_q_inspected_by", "Inspected By (Name)", type="TEXT", mandatory=False),
+            Item("fas_q_deviations", "Description of Deviations (if any):", type="TEXT", mandatory=False, triggers_finding=False),
+            Item("fas_q_inspected_by", "Inspected By (Name)", type="TEXT", mandatory=False, triggers_finding=False),
         ]),
     ],
 )
@@ -320,9 +366,9 @@ FAS_ANNUAL = TemplateDef(
             "Detector Sample",
             [
                 Item("fas_a_total_detectors", "Total detectors in the installation",
-                     type="NUMERIC", mandatory=False),
+                     type="NUMERIC", mandatory=False, triggers_finding=False),
                 Item("fas_a_sample_size", "20 % - No's of detectors to be checked annually",
-                     type="NUMERIC", mandatory=False),
+                     type="NUMERIC", mandatory=False, triggers_finding=False),
             ],
             note="20 % of ______ Detectors = ______ No's of detectors to be checked annually",
         ),
@@ -338,8 +384,8 @@ FAS_ANNUAL = TemplateDef(
             )
         ]),
         Section("Closing", [
-            Item("fas_a_deviations", "Description of Deviations (if any):", type="TEXT", mandatory=False),
-            Item("fas_a_inspected_by", "Inspected By (Name)", type="TEXT", mandatory=False),
+            Item("fas_a_deviations", "Description of Deviations (if any):", type="TEXT", mandatory=False, triggers_finding=False),
+            Item("fas_a_inspected_by", "Inspected By (Name)", type="TEXT", mandatory=False, triggers_finding=False),
         ]),
     ],
 )
@@ -354,9 +400,9 @@ FAS_BEAM_DAILY = TemplateDef(
     sourceSheet="Beam Detector",
     sections=[
         Section("Daily Attention", [
-            Item("beam_d_01", "Detector securly fastened to the beam."),
+            Item("beam_d_01", "Detector securly fastened to the beam.", nc_severity="MAJOR_NC"),
             Item("beam_d_02", "Free from physical damage, dust and dirt accumulation."),
-            Item("beam_d_03", "Power Cables connected properly."),
+            Item("beam_d_03", "Power Cables connected properly.", nc_severity="MAJOR_NC"),
             Item("beam_d_04", "If any obstructions indication light working properly."),
             Item("beam_d_05", "Reflectiors are in deserved place and free from damages."),
         ]),
@@ -382,12 +428,12 @@ FHS_DAILY = TemplateDef(
     sections=[
         Section("Descriptions", [
             Item("fhs_d_01", "No leakages found in System."),
-            Item("fhs_d_02", "Design pressure is maintained in the system"),
-            Item("fhs_d_03", "Discharge valve is open ."),
-            Item("fhs_d_04", "Pumps are set in auto mode"),
+            Item("fhs_d_02", "Design pressure is maintained in the system", nc_severity="MAJOR_NC"),
+            Item("fhs_d_03", "Discharge valve is open .", nc_severity="MAJOR_NC"),
+            Item("fhs_d_04", "Pumps are set in auto mode", nc_severity="MAJOR_NC"),
             Item("fhs_d_05", "Power indicator lamp on the panel is in working condition"),
             Item("fhs_d_06", "Pumps are tested in auto mode by reducing the pressure using test line"),
-            Item("fhs_d_07", "Water level in FHS tank (Minimum 95%)"),
+            Item("fhs_d_07", "Water level in FHS tank (Minimum 95%)", nc_severity="MAJOR_NC"),
             Item("fhs_d_08", "Check the pump glands, packing's, etc., and replace the damaged gland for packing "
                              "whenever found damaged or worn out .",
                  guidance="Leakage from glands at specified OEM rate  is allowable"),
@@ -418,14 +464,14 @@ FHS_MONTHLY = TemplateDef(
             Item("fhs_m_v5", "Spindle and lugs move freely."),
         ]),
         Section("Hydrant Box:", [
-            Item("fhs_m_h1", "All hydrant boxes are equipped with hoses and nozzles."),
+            Item("fhs_m_h1", "All hydrant boxes are equipped with hoses and nozzles.", nc_severity="MAJOR_NC"),
             Item("fhs_m_h2", "Nozzles are in good condition"),
             Item("fhs_m_h3", "Hose boxes are in good condition"),
             Item("fhs_m_h4", "Hydrant points and hose boxes are easily accessible and free from obstruction"),
             Item("fhs_m_h5", "The hose box key is present, available, and readily accessible"),
         ]),
         Section("Pump Room:", [
-            Item("fhs_m_p1", "Check water level in FHS sump/OHT"),
+            Item("fhs_m_p1", "Check water level in FHS sump/OHT", nc_severity="MAJOR_NC"),
             Item("fhs_m_p2", "Coupling and shaft is guarded"),
             Item("fhs_m_p3", "Check alignment of pump motors, nuts, bolts, couplings etc."),
             Item("fhs_m_p4", "Quantity of fuel in day tank is at desired level"),
@@ -457,13 +503,13 @@ FHS_QUARTERLY = TemplateDef(
     sourceSheet="Quarterly",
     sections=[
         Section("Quarterly attention", [
-            Item("fhs_q_01", "Hydrant mains are tested at system design pressure (Farthest point)"),
+            Item("fhs_q_01", "Hydrant mains are tested at system design pressure (Farthest point)", nc_severity="MAJOR_NC"),
             Item("fhs_q_02", "All first aid hose reels and RRL are in good condition "
                              "(Check 25% of hose reels each quarter)"),
         ]),
         Section("Closing", [
-            Item("fhs_q_inspected_by", "Inspected By", type="TEXT", mandatory=False),
-            Item("fhs_q_observation", "Any Observation if.?", type="TEXT", mandatory=False),
+            Item("fhs_q_inspected_by", "Inspected By", type="TEXT", mandatory=False, triggers_finding=False),
+            Item("fhs_q_observation", "Any Observation if.?", type="TEXT", mandatory=False, triggers_finding=False),
         ]),
     ],
 )
@@ -481,8 +527,8 @@ FHS_YEARLY = TemplateDef(
             Item("fhs_y_01", "Check the insulation resistance of pump motor circuit"),
         ]),
         Section("Closing", [
-            Item("fhs_y_inspected_by", "Inspected By", type="TEXT", mandatory=False),
-            Item("fhs_y_observation", "Any Observation (If):", type="TEXT", mandatory=False),
+            Item("fhs_y_inspected_by", "Inspected By", type="TEXT", mandatory=False, triggers_finding=False),
+            Item("fhs_y_observation", "Any Observation (If):", type="TEXT", mandatory=False, triggers_finding=False),
         ]),
     ],
     footnotes=[
@@ -519,7 +565,7 @@ FE_INSPECTION = TemplateDef(
             # The one check on this sheet that is a compliance breach rather than
             # a housekeeping defect: an over-due extinguisher is not a working
             # extinguisher. The single item seeded to raise a CAMS finding.
-            Item("fe_06", "Fire Extinguisher refilled within due date", triggers_finding=True),
+            Item("fe_06", "Fire Extinguisher refilled within due date", triggers_finding=True, nc_severity="MAJOR_NC"),
             Item("fe_07", "Fire Extinguisher clear of blockages"),
             Item("fe_08", "Fire Extinguisher is easily accessible"),
             Item("fe_09", "Safety pin / clip properly fixed"),
@@ -527,7 +573,7 @@ FE_INSPECTION = TemplateDef(
             Item("fe_11", "Inspection tag in place."),
             Item("fe_12", "Plunger & piercer free movement."),
             Item("fe_13", "Squeeze lever / Knob is in good condition"),
-            Item("fe_14", "Pressure guage in good condition & needle in green zone"),
+            Item("fe_14", "Pressure guage in good condition & needle in green zone", nc_severity="MAJOR_NC"),
             Item("fe_15", "Fire Extinguisher Trolley / Stand is in good condition"),
             Item("fe_16", "Visibility markings are available"),
             Item("fe_17", "Fire extinguishers Signage boards are displayed"),

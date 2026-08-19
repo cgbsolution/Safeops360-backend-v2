@@ -81,11 +81,50 @@ def test_fe_inspection_has_the_twenty_one_checks_in_sheet_order():
     assert t.items[-1].text.startswith("Operation instructions sticker")
 
 
-def test_only_the_refill_due_check_raises_a_finding():
-    # Spec open item #2 defers failed-item -> CAPA. The daily grids make that the
-    # right default anyway: a month of daily rounds is 217 chances to auto-raise.
-    raising = [(t.code, i.key) for t in ALL_TEMPLATES for i in t.items if i.triggers_finding]
-    assert raising == [("PIL-FE-INSPECTION", "fe_06")]
+def test_every_pass_fail_check_raises_a_finding():
+    """A "No" on a judgement check must lead somewhere. Readings must not.
+
+    The exemptions are the point of this test: a battery voltage or a detector
+    serial number has no "No" to fail, so raising a finding from one would be
+    noise. Everything that is genuinely a pass/fail judgement raises.
+    """
+    # A Yes/No/NA check may be exempt, but only with a stated reason. An exemption
+    # nobody had to justify is how the whole feature quietly reverts.
+    unjustified = [
+        (t.code, i.key)
+        for t in ALL_TEMPLATES
+        for i in t.items
+        if not i.triggers_finding and i.type == "YES_NO_NA" and not i.no_finding_reason
+    ]
+    assert unjustified == [], f"pass/fail checks exempt from CAPA with no reason given: {unjustified}"
+
+    # The only exemptions today are the inverted-polarity ones, where "No" is the
+    # healthy answer and a CAPA on it would be backwards.
+    justified = {
+        i.key for t in ALL_TEMPLATES for i in t.items
+        if not i.triggers_finding and i.type == "YES_NO_NA"
+    }
+    assert justified == {"fas_m_hooter_addl_required", "fas_q_hooter_addl_required"}
+
+    raising = [i for t in ALL_TEMPLATES for i in t.items if i.triggers_finding]
+    assert all(i.type == "YES_NO_NA" for i in raising)
+    assert len(raising) > 100, "the bulk of the checks should raise"
+
+
+def test_severity_is_reserved_for_checks_that_mean_the_system_is_dead():
+    """MAJOR_NC has to stay scarce or it stops meaning anything."""
+    majors = {i.key for t in ALL_TEMPLATES for i in t.items if i.nc_severity == "MAJOR_NC"}
+    # The ones a fire officer would stop the line for.
+    for key in ("fas_d_03", "fas_d_07", "fhs_d_02", "fhs_d_07", "fe_06", "fe_14"):
+        assert key in majors, f"{key} should be MAJOR_NC — a 'No' means it will not work in a fire"
+    # And the ones that are housekeeping must NOT be.
+    minors = {i.key: i.nc_severity for t in ALL_TEMPLATES for i in t.items}
+    assert minors["fe_02"] == "MINOR_NC", "paint condition is not a major non-conformance"
+    assert minors["fe_17"] == "MINOR_NC", "a missing signage board is not a major non-conformance"
+    total = sum(1 for t in ALL_TEMPLATES for i in t.items if i.triggers_finding)
+    assert len(majors) < total * 0.25, (
+        f"{len(majors)} of {total} raising checks are MAJOR_NC — severity is losing its meaning"
+    )
 
 
 def test_the_two_unit_monthly_sheets_differ_only_in_addressing_and_hooters():
