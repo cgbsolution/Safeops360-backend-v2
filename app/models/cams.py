@@ -121,6 +121,45 @@ class CamsEngagement(Base, IdMixin):
     sourceEntityId: Mapped[str | None] = mapped_column(String)  # entity this engagement inspects (e.g. FireEquipment.id)
     recurrenceId: Mapped[str | None] = mapped_column(String)
 
+    # ── Periodic-record support (Fire & Life Safety checklists) ──────────────
+    #
+    # A controlled EHS checklist is a *periodic* record: exactly one Daily Fire
+    # Alarm sheet exists for panel P on 19 Aug 2026, and touching that screen
+    # twice must find the same record, not make a second one. `plannedDate`
+    # cannot carry that identity — it is a timestamp, so "same day" is a range
+    # query and two clients racing the first touch both see nothing and both
+    # insert.
+    #
+    # `periodLabel` is the occurrence key, granularity-encoded so one column
+    # serves every cadence:
+    #
+    #     DAILY      "2026-08-19"      MONTHLY  "2026-08"
+    #     QUARTERLY  "2026-Q3"         ANNUAL   "2026"
+    #
+    # Uniqueness is enforced in the database by a PARTIAL unique index
+    # (templateId, sourceEntityId, periodLabel) scoped to rows that set it — see
+    # prisma/apply-firechecklists-ddl.ts. Partial, because every CAMS engagement
+    # predating this build has periodLabel NULL and a plain unique index would
+    # be fine on NULLs but would also silently start constraining ad-hoc audits
+    # the day someone set the column for an unrelated reason.
+    periodLabel: Mapped[str | None] = mapped_column(String)
+
+    # Prepared / Reviewed / Approved — the sign-off block printed at the foot of
+    # every Page Industries checklist. "Prepared by" already exists as
+    # `CamsResponse.completedBy/completedAt` (the person who filled the sheet),
+    # so only the two later stages are new here.
+    #
+    # These are stamps, not signatures: userId + timestamp, the same evidence
+    # every other approval on this platform records. No e-signature capture
+    # exists anywhere in the codebase (checked), so inventing one for this module
+    # alone would have been a second mechanism, not a reused one. Stage ORDER is
+    # enforced by the existing `_TRANSITIONS` state machine, not by these
+    # columns — they record who, the state machine decides whether they may.
+    reviewedBy: Mapped[str | None] = mapped_column(String)
+    reviewedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approvedBy: Mapped[str | None] = mapped_column(String)
+    approvedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     responses: Mapped[list["CamsResponse"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")
     findings: Mapped[list["CamsFinding"]] = relationship(back_populates="engagement", cascade="all, delete-orphan")
 
@@ -138,6 +177,11 @@ class CamsEngagement(Base, IdMixin):
         Index("ix_CamsEngagement_planned", "plannedDate"),
         Index("ix_CamsEngagement_source", "sourceModule"),
         Index("ix_CamsEngagement_auditType", "auditTypeId"),
+        # The grid screens ask "every period of template T for asset A" on every
+        # render — a month of daily rows is 31 of these, a year of the FE sheet
+        # is 12. Without this it is a seq-scan of the whole engagement table per
+        # page view.
+        Index("ix_CamsEngagement_period", "sourceEntityId", "templateId", "periodLabel"),
     )
 
 
@@ -184,6 +228,26 @@ class CamsTemplate(Base, IdMixin):
     ownerId: Mapped[str] = mapped_column(String, nullable=False)
     isGlobal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     siteId: Mapped[str | None] = mapped_column(String)
+
+    # ── Controlled-document provenance ───────────────────────────────────────
+    #
+    # A template that reproduces a client's controlled document has to carry that
+    # document's own identity — number, revision, supersedes, effective/review
+    # dates, source sheet — because the auditor's first question is "which
+    # revision is this?" and the answer must come off the record, not off a
+    # developer's memory of which XLSX was imported.
+    #
+    # `version` above is the platform's edit counter; it is NOT the client's
+    # revision. PIL/EHSD/CL/026-R2 is R2 whether this is the first import or the
+    # fifth re-seed of it, so conflating the two would misreport the document.
+    #
+    # JSON rather than eight columns because the shape is document-family
+    # specific (a Page Industries sheet has "supersedesNo"; an ISO 45001
+    # checklist would not) and nothing queries inside it — it is read whole, by
+    # the screen header and the PDF header. Also carries `layout`, which tells
+    # the renderer how to pivot a set of periodic engagements into the grid the
+    # paper original prints. Empty {} on every pre-existing template.
+    documentMeta: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
     sections: Mapped[list["CamsTemplateSection"]] = relationship(
         back_populates="template", cascade="all, delete-orphan"

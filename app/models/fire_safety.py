@@ -102,6 +102,41 @@ class FireEquipment(Base, IdMixin, SoftDeleteMixin):
     statusOverriddenBy: Mapped[str | None] = mapped_column(String)
     statusOverriddenAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # ── Register of Fire Extinguishers — PIL/EHSD/CL/028-R1 ──────────────────
+    #
+    # The client's FE register is a sixteen-column sheet. Twelve of those columns
+    # already existed here (serial, type, capacity, make, location, ...), so this
+    # is the remainder — not a second register model. A `FireExtinguisherAsset`
+    # table alongside `FireEquipment` would have split the extinguisher estate in
+    # two: the fire dashboard, the zone/hot-work guard and the CAMS inspection
+    # link all read `FireEquipment`, and none of them would have seen it.
+    #
+    # `allottedSerialNo` is the client's own asset tag (sheet column "Alloted
+    # Serial No."), distinct from the manufacturer's `serialNo` and the
+    # platform's `equipmentCode`. It is what is stencilled on the cylinder and
+    # what the inspector reads off it, so it is the field the FE Inspection
+    # screen searches on.
+    allottedSerialNo: Mapped[str | None] = mapped_column(String)
+    yearOfManufacture: Mapped[int | None] = mapped_column(Integer)
+    # Cylinder life expiry — the sheet's "Expiry Date", e.g. manufactured 2021,
+    # expires 2031. NOT the refill or hydrostatic-test due date: those are
+    # certificate lifecycles and live on FireAssetCertificate (see below).
+    expiryDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dateOfDischarge: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    weightKg: Mapped[float | None] = mapped_column(Float)
+    registerRemarks: Mapped[str | None] = mapped_column(Text)
+
+    # DELIBERATELY ABSENT: hpTestedOn / hpTestDueDate / refilledOn /
+    # dueForRefilling. The sheet prints them as four flat columns, but each pair
+    # is the issue and expiry of a *certificate*, and `FireAssetCertificate`
+    # already models exactly that — with HYDROSTATIC_TEST and REFILL types, a
+    # computed VALID/EXPIRING_SOON/EXPIRED status, escalation tiers and the
+    # attached document. Duplicating them here would give the register two
+    # sources of truth for "is this cylinder due", which is the failure mode the
+    # certificate table was added to prevent. The register API projects the four
+    # columns from the latest certificate of each type; see
+    # services/fire_register.py.
+
     createdAt: Mapped[datetime] = _c()
     createdBy: Mapped[str | None] = mapped_column(String)
     updatedAt: Mapped[datetime] = _u()
@@ -115,6 +150,11 @@ class FireEquipment(Base, IdMixin, SoftDeleteMixin):
         # must not seq-scan the register.
         Index("ix_FireEquipment_zone_status", "zoneId", "status"),
         Index("ix_FireEquipment_amc", "amcContractId"),
+        # The FE Inspection screen's asset picker searches on the tag stencilled
+        # on the cylinder, not on the platform code.
+        Index("ix_FireEquipment_allotted", "plantId", "allottedSerialNo"),
+        # The register's cylinder-life badge sorts and filters on this.
+        Index("ix_FireEquipment_expiry", "expiryDate"),
     )
 
 
@@ -415,9 +455,49 @@ class FireFalseAlarmLog(Base, IdMixin):
     )
 
 
+# ── Non-working days (temporary — see the class docstring) ───────────────────
+class PlantNonWorkingDay(Base, IdMixin):
+    """A date the plant does not run, greyed out on the daily checklist grids.
+
+    THIS IS A DOCUMENTED STOPGAP, not a design. The client's daily sheets
+    pre-print SUNDAY and HOLIDAY across the date columns, so the grid has to know
+    which days are excluded or a compliance report reads "8 missed inspections"
+    for a week that contained a factory shutdown.
+
+    The build spec's first open item asks whether a platform holiday calendar
+    already exists to wire into. It does not — there is no holiday, calendar-of-
+    non-working-days or shutdown model anywhere in the backend or the Prisma
+    schema (searched). So this is the spec's own stated fallback: a manual
+    per-date flag, scoped to a plant.
+
+    Two consequences worth being explicit about:
+
+      • Sundays are NOT stored here. A Sunday is derivable from the date, and
+        writing 52 rows a year per plant to record something `weekday() == 6`
+        already knows would be a calendar that can drift out of step with the
+        actual calendar. `services/fire_checklists.non_working_days` computes
+        Sundays and unions them with the rows in this table.
+
+      • When a real platform holiday calendar lands (Facilities is the natural
+        home), this table should be READ-migrated into it and dropped, not kept
+        in parallel. It is deliberately minimal — plant, date, label — so that
+        migration is a straight copy with nothing to reconcile.
+    """
+
+    __tablename__ = "PlantNonWorkingDay"
+    plantId: Mapped[str] = mapped_column(String, nullable=False)
+    # Date only. Stored as a timestamp for consistency with every other date on
+    # this platform; normalised to midnight UTC on write so equality works.
+    day: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False, default="HOLIDAY")
+    createdAt: Mapped[datetime] = _c()
+    createdBy: Mapped[str | None] = mapped_column(String)
+    __table_args__ = (Index("ix_PlantNonWorkingDay_plant_day", "plantId", "day", unique=True),)
+
+
 __all__ = [
     "FireEquipment", "AssemblyPoint", "FireEmergencyPlan",
     "FireDrill", "FireDrillFinding", "FireIncidentLink",
     "FireZone", "InspectionFrequencyMaster", "FireAmcContract",
-    "FireAssetCertificate", "FireFalseAlarmLog",
+    "FireAssetCertificate", "FireFalseAlarmLog", "PlantNonWorkingDay",
 ]

@@ -54,6 +54,7 @@ from app.routers import (
     epc_workers,
     factory,
     factory_ext,
+    fire_checklists,
     fire_safety,
     plants,
     programme,
@@ -176,6 +177,12 @@ _ROUTERS = {
     # module IS registered in the licensing model (registry/editions) — add
     # "fire_safety": "FIRE" to ROUTER_MODULE once a FIRE-inclusive licence is issued.
     "fire_safety": fire_safety,
+    # The Page Industries controlled checklists (PIL/EHS/CL 025-028) and the
+    # Register of Fire Extinguishers. Same /api/fire prefix and the same
+    # INCIDENT.READ/UPDATE gating as fire_safety — split into its own module only
+    # to keep that router from growing past 1,500 lines. Adds no tables: the
+    # checklists run on the CAMS engine.
+    "fire_checklists": fire_checklists,
     # Guided Field Capture (CAPTURE module) — same dev-licence situation as
     # fire_safety: registered in the licensing model, mounted ungated until a
     # CAPTURE-inclusive licence is issued ("capture": "CAPTURE" in ROUTER_MODULE).
