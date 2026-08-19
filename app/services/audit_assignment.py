@@ -125,7 +125,11 @@ async def assignable_users(db: AsyncSession, *, plant_id: str) -> dict[str, Any]
         user_plants = set(role_plants.get(u.id, set()))
         if u.plantId:
             user_plants.add(u.plantId)
-        dto = {"id": u.id, "name": u.name, "role": u.role, "department": u.department or ""}
+        # Email is here so the scheduler's pickers can be SEARCHED and so two
+        # people with the same display name can be told apart — a 65-person
+        # auditee list is unusable by scrolling alone.
+        dto = {"id": u.id, "name": u.name, "email": u.email or "",
+               "role": u.role, "department": u.department or ""}
         for slot, code in SLOT_PERMISSION.items():
             if _scope_covers_plant(perms[u.id].get(code, set()), plant_id, user_plants):
                 slots[slot].append(dto)
