@@ -1271,7 +1271,15 @@ async def list_audits(
     stmt = select(ComplianceAudit).order_by(
         ComplianceAudit.createdAt.desc(), ComplianceAudit.id.desc()
     )
-    if accessible_plants is not None:
+    # A party-filtered reader (an auditee) is bounded by the records they are
+    # NAMED ON, which is strictly narrower than any plant scope — so the plant
+    # bound is redundant for them, and actively wrong: `get_accessible_plants_for`
+    # widens an OWN_RECORDS grant to the user's HOME plant set, which hid every
+    # audit they were seated on at another site. An auditee assigned to an audit
+    # at Tiptur could not see it from Hassan, though `can()` would have let them
+    # open it, because OWN_RECORDS is evaluated on record membership and never
+    # on plant.
+    if accessible_plants is not None and party_user_id is None:
         stmt = stmt.where(ComplianceAudit.plantId.in_(accessible_plants))
     rows = (await db.execute(stmt)).scalars().all()
 
