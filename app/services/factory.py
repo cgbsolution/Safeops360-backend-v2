@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.factory import Building, FactoryProfile, WorkforceComposition
 from app.models.plant import Plant
+from app.models.user import UserRole
+from app.services.permissions import invalidate_user_permissions
 
 # Re-use the CAMS batch name helper — same DB, same Plant table.
 from app.services.cams import plant_name_map  # noqa: F401  (re-exported for the router)
@@ -34,7 +36,10 @@ async def next_factory_code(db: AsyncSession) -> str:
 def _slug_code(source: str) -> str:
     """A Plant.code-safe token from a factory code/name (A-Z0-9 and dashes)."""
     token = re.sub(r"[^A-Za-z0-9]+", "-", source).strip("-").upper()
-    return (token or "SITE")[:20]
+    # Strip AFTER the truncation too: cutting at 20 can land mid-separator and
+    # leave a trailing dash ("(Unit-1)_Bommanahalli_Blr" -> "UNIT-1-BOMMANAHALLI-"),
+    # which then shows up verbatim in every site dropdown.
+    return (token[:20].strip("-") or "SITE")
 
 
 async def _unique_plant_code(db: AsyncSession, base: str) -> str:
@@ -90,6 +95,92 @@ async def ensure_site_for_profile(
     db.add(plant)
     await db.flush()  # assign plant.id
     return plant.id
+
+
+async def grant_site_access(db: AsyncSession, *, plant_id: str, created_by: str) -> int:
+    """Give a freshly-provisioned Site to the people who must be able to see it.
+
+    Provisioning a Plant row is only half of "the factory exists". Every
+    plant-scoped surface on the platform — the audit Owning-site dropdown, the
+    plant switcher, the registers — resolves through `UserRole(scopeType='PLANT')`
+    plus `User.plantId`, and a brand-new Plant is on nobody's list. Before this,
+    an HSE Manager could add a factory, land back on the Facilities dashboard
+    seeing it, and then find it absent from the Owning-site dropdown one click
+    later — because `AUDIT_COMPLIANCE.READ` is OWN_PLANT for that role and the
+    new site was in no one's plant set. The site was real and invisible.
+
+    Two grants are written, both narrow on purpose:
+
+      * the creator, under each role they already hold. This widens *reach*, not
+        *authority* — they keep exactly the permissions that role already
+        carried, now applicable to the site they just created.
+      * anyone who already holds a PLANT grant on EVERY pre-existing site. That
+        is the platform's existing way of spelling "this user covers the whole
+        estate" (the RBAC seed writes one row per plant rather than an
+        ALL_PLANTS scope), so a new site joining the estate must join their set
+        too or their coverage silently develops a hole.
+
+    A user with ALL_PLANTS needs nothing — `get_accessible_plants_for` returns
+    None for them and the new site is already included.
+
+    Returns the number of UserRole rows written.
+    """
+    # Every other site — "covers the whole estate" is measured against these.
+    other_sites = {
+        r[0] for r in (await db.execute(select(Plant.id).where(Plant.id != plant_id))).all()
+    }
+
+    existing = (
+        await db.execute(
+            select(UserRole.userId, UserRole.roleId).where(
+                UserRole.scopeType == "PLANT", UserRole.scopeValue == plant_id
+            )
+        )
+    ).all()
+    already = {(u, r) for u, r in existing}
+
+    # (userId, roleId) pairs to grant. The creator first.
+    wanted: set[tuple[str, str]] = {
+        (created_by, r[0])
+        for r in (
+            await db.execute(select(UserRole.roleId).where(UserRole.userId == created_by))
+        ).all()
+    }
+
+    # Then the estate-wide users. Group each user's PLANT grants by role and
+    # keep the (user, role) pairs whose plant set already covers every other
+    # site — a partial-coverage role is a deliberate subset and is left alone.
+    if other_sites:
+        rows = (
+            await db.execute(
+                select(UserRole.userId, UserRole.roleId, UserRole.scopeValue).where(
+                    UserRole.scopeType == "PLANT", UserRole.scopeValue.is_not(None)
+                )
+            )
+        ).all()
+        coverage: dict[tuple[str, str], set[str]] = {}
+        for user_id, role_id, site in rows:
+            coverage.setdefault((user_id, role_id), set()).add(site)
+        wanted |= {pair for pair, sites in coverage.items() if other_sites <= sites}
+
+    written = 0
+    for user_id, role_id in sorted(wanted - already):
+        db.add(
+            UserRole(
+                userId=user_id,
+                roleId=role_id,
+                scopeType="PLANT",
+                scopeValue=plant_id,
+                assignedById=created_by,
+            )
+        )
+        written += 1
+        # The permission snapshot is cached for 5 minutes; without this the
+        # creator would not see their own new site until it expired.
+        invalidate_user_permissions(user_id)
+    if written:
+        await db.flush()
+    return written
 
 
 # ── buildingCount sync ───────────────────────────────────────────────────────

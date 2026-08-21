@@ -3347,6 +3347,34 @@ async def _fork_template_with_checkpoint(
     return fork
 
 
+async def _assert_may_act_at_plant(db: AsyncSession, audit, user_id: str, slot: str) -> None:
+    """Can this person hold `slot` on this audit's plant?
+
+    Delegates to the SAME predicate that builds the assignment pickers
+    (`audit_assignment.assert_assignable`), and that is the entire point.
+
+    This guard used to be `user.plantId != audit.plantId` — the person's HOME
+    plant. `audit_assignment` documents itself as having deliberately abandoned
+    exactly that test, because RBAC grants plant reach two other ways: an
+    ALL_PLANTS scope, and a PLANT-scoped UserRole on a site that is not your
+    home site. Both are ordinary: a corporate auditor covers every plant, and a
+    site auditor is routinely given a neighbouring unit so audits stay
+    independent.
+
+    So the picker offered someone, the team screen seated them as lead auditor
+    or auditee, and then per-checkpoint allocation refused them with "belongs to
+    a different plant" — a message that was not even true. One feature, two
+    definitions of "belongs to this plant", and the stale one had the veto.
+
+    Raises ValueError; the router renders it as the toast the user sees.
+    """
+    from app.services import audit_assignment as _assign  # local: avoids an import cycle
+
+    await _assign.assert_assignable(
+        db, plant_id=audit.plantId, assignments={slot: [user_id]}
+    )
+
+
 async def allocate_checkpoints(
     db: AsyncSession, *, user: User, audit_id: str,
     owner_id: str | None = None, auditor_id: str | None = None,
@@ -3396,8 +3424,7 @@ async def allocate_checkpoints(
             au = await db.get(User, auditor_id)
             if au is None:
                 raise ValueError("Auditor not found")
-            if au.plantId and au.plantId != audit.plantId:
-                raise ValueError("Auditor belongs to a different plant")
+            await _assert_may_act_at_plant(db, audit, auditor_id, "coAuditor")
             # Conducting a checkpoint is an auditor act, so the person doing it
             # must not be an auditee on this same engagement. Without this,
             # per-checkpoint allocation would be a way around the segregation
@@ -3427,8 +3454,7 @@ async def allocate_checkpoints(
         u = await db.get(User, owner_id)
         if u is None:
             raise ValueError("Owner not found")
-        if u.plantId and u.plantId != audit.plantId:
-            raise ValueError("Owner belongs to a different plant")
+        await _assert_may_act_at_plant(db, audit, owner_id, "auditee")
         owner_name = u.name
 
         # Independence rule 2 — same-engagement exclusivity (docs/cams/09 §2.1.5).

@@ -408,6 +408,13 @@ async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
+    if not body.siteId:
+        # A Site was just provisioned, so it is on nobody's plant list. Without
+        # this the factory is created, the dashboard shows it, and the audit
+        # Owning-site dropdown does not — plant-scoped roles resolve sites
+        # through UserRole(scopeType='PLANT'), and a new Plant has no rows.
+        await svc.grant_site_access(db, plant_id=site_id, created_by=user.id)
+
     p = FactoryProfile(
         siteId=site_id,
         factoryCode=factory_code,
