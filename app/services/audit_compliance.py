@@ -1539,6 +1539,39 @@ async def _discipline_rollup(db: AsyncSession, audit_id: str) -> list[dict[str, 
         for r in rows
     ]
     out.sort(key=lambda c: c["categoryName"])
+
+    # ── Who currently holds each discipline, read from the ROWS ────────────
+    #
+    # The rows are the truth about allocation. `audit.coAuditors[].disciplineIds`
+    # and `audit.auditees[].responsibleCategories` are the SEATING intent
+    # recorded when the audit was scheduled or the team last edited —
+    # `allocate_checkpoints` writes `assignedAuditorId` / `assignedOwnerId` on
+    # the rows and never writes back to that JSON. The two then disagree, and
+    # the team panel (which reads the JSON) went on saying "No disciplines
+    # assigned" for a co-auditor who had just been given a whole discipline.
+    #
+    # Reported per discipline as a single holder, or None when the rows
+    # genuinely disagree — per-checkpoint allocation is supported, so "mixed" is
+    # a real state and must not be flattened to whichever id sorted first.
+    holders = (
+        await db.execute(
+            select(R.categoryId, R.assignedOwnerId, R.assignedAuditorId)
+            .where(R.auditId == audit_id)
+            .group_by(R.categoryId, R.assignedOwnerId, R.assignedAuditorId)
+        )
+    ).all()
+    owners: dict[str, set[str | None]] = {}
+    auditors: dict[str, set[str | None]] = {}
+    for cat, owner, auditor in holders:
+        owners.setdefault(cat, set()).add(owner)
+        auditors.setdefault(cat, set()).add(auditor)
+    for c in out:
+        o = owners.get(c["categoryId"], set())
+        a = auditors.get(c["categoryId"], set())
+        c["auditeeUserId"] = next(iter(o)) if len(o) == 1 else None
+        c["auditeeMixed"] = len(o) > 1
+        c["auditorUserId"] = next(iter(a)) if len(a) == 1 else None
+        c["auditorMixed"] = len(a) > 1
     return out
 
 
