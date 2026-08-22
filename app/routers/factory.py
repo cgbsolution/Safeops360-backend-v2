@@ -372,11 +372,22 @@ async def list_profiles(
 @router.post("/profiles", response_model=S.FactoryProfileDetail, status_code=201)
 async def create_profile(body: S.FactoryProfileCreate, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     await _require(db, user, "FACILITY.CREATE", plant_id=body.siteId)
-    if not body.siteId:
-        # Leaving the Site blank provisions one. `can()` is permissive when no
-        # plant_id is supplied, so without this a plant-scoped user could mint
-        # Sites outside their scope — creating the Site link is exactly what
-        # FACILITY.SITE_LINK governs.
+    if body.siteId:
+        # Attaching to an EXISTING Site is the supplier case: the factory is
+        # being placed under a Site someone else already maintains, and that
+        # mapping is what FACILITY.SITE_LINK governs. Only the compliance /
+        # supplier lead auditor holds it, and the Add Factory wizard hides the
+        # Site picker from everyone else — this is the boundary behind it, since
+        # a hidden field stops nobody from posting a siteId by hand.
+        #
+        # This guard used to sit on the OPPOSITE branch, requiring SITE_LINK to
+        # leave the Site blank, on the reasoning that `can()` is permissive with
+        # no plant_id so a plant-scoped user could mint Sites outside their
+        # scope. That made auto-provisioning the privileged act and attaching the
+        # ordinary one — the reverse of how the two are actually used. A
+        # provisioned Site is built from this factory's own name and location and
+        # is reachable only through the profile that created it, so an ordinary
+        # creator making one is just what "create a factory" means here.
         await _require(db, user, "FACILITY.SITE_LINK")
 
     if body.siteId:
