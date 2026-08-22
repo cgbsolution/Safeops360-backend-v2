@@ -4282,6 +4282,47 @@ async def submit_audit(db: AsyncSession, *, user: User, audit_id: str) -> dict[s
     if audit.status not in ("scheduled", "in_progress"):
         raise ValueError(f"Audit cannot be submitted from status '{audit.status}'")
 
+    # ── Every discipline must be finished, by whoever holds it ─────────────
+    #
+    # Submit ends fieldwork for the WHOLE audit — one button, one status flip,
+    # for every auditor at once. There is no per-auditor submit, so without this
+    # gate any one co-auditor could end the audit while two others were still
+    # working, and the score would freeze over whatever happened to be graded:
+    # a 206-checkpoint IMS audit reporting 100% compliance on the strength of
+    # two answered checkpoints, with 204 recorded as "not assessed".
+    #
+    # N/A is a grade, not an omission — marking a checkpoint Not Applicable
+    # satisfies this. What it refuses is a checkpoint nobody looked at.
+    ungraded = [r for r in audit.responses if r.assessmentStatus == "NOT_ASSESSED"]
+    if ungraded:
+        by_disc: dict[str, dict[str, Any]] = {}
+        for r in ungraded:
+            d = by_disc.setdefault(
+                r.categoryId,
+                {"name": r.categoryName or r.categoryId, "n": 0, "auditors": set()},
+            )
+            d["n"] += 1
+            if r.assignedAuditorId:
+                d["auditors"].add(r.assignedAuditorId)
+        # Name the person, not the id — "who still owes work" is the whole point
+        # of the message, and a cuid answers nobody's question.
+        holder_ids = {u for d in by_disc.values() for u in d["auditors"]}
+        holder_names = {
+            u.id: u.name
+            for u in (
+                await db.execute(select(User).where(User.id.in_(holder_ids)))
+            ).scalars().all()
+        } if holder_ids else {}
+        parts = []
+        for d in sorted(by_disc.values(), key=lambda x: x["name"]):
+            who = ", ".join(sorted(holder_names.get(u, u) for u in d["auditors"])) or "unallocated"
+            parts.append(f"{d['name']} — {d['n']} remaining ({who})")
+        raise ValueError(
+            f"{len(ungraded)} checkpoint(s) across {len(by_disc)} discipline(s) are not "
+            f"graded yet, so the audit cannot be submitted: " + "; ".join(parts)
+            + ". Every checkpoint needs a grade — mark it Not Applicable if it does not apply."
+        )
+
     # Enforce the "observation/evidence required on fail/partial" rule the
     # carousel shows — every fail/partial needs an observation, and a photo
     # where the checkpoint demands it. Otherwise the finding (and any auto-CAPA)
