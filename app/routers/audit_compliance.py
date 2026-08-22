@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1013,6 +1013,7 @@ async def get_report_register(
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_audit(
     body: CreateAuditBody,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -1045,7 +1046,19 @@ async def create_audit(
     # Read BEFORE refresh: the links hang off the in-memory instance and are not
     # a column, so `db.refresh` would discard them.
     links = getattr(audit, "_issuedPortalLinks", []) or []
+    # Read BEFORE refresh for the same reason as the links above — neither is a
+    # column, and `db.refresh` reloads the mapped state over the instance.
+    is_duplicate = bool(getattr(audit, "_wasExistingDuplicate", False))
     await db.refresh(audit)
+    # Calendar bookings + the fan-out to the cast, AFTER the response. Both are
+    # network-bound and best-effort, and holding the scheduler's request open
+    # for them is what made a large audit time out at the proxy. Queued rather
+    # than awaited, so this endpoint costs one transaction and nothing else.
+    #
+    # Skipped when the service recognised this as a retry of an audit that
+    # already exists — the cast was told about it the first time round.
+    if not is_duplicate:
+        background_tasks.add_task(svc.run_post_schedule_side_effects, audit.id, user.id)
     return {
         "id": audit.id,
         "auditNumber": audit.auditNumber,
@@ -1081,9 +1094,16 @@ async def allocate_checkpoints(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Plant Head / Lead Auditor allocates checkpoints to owners (A-04)."""
+    """Plant Head / Lead Auditor allocates checkpoints to owners (A-04).
+
+    Gated on ALLOCATE, not UPDATE. The record below reads as though it limits
+    this to the lead / reviewer / scheduler, but `can()` only consults a record
+    for an OWN_RECORDS grant — and AUDITEE holds UPDATE at ALL_PLANTS, which
+    satisfies the check outright. The audited party could reallocate the
+    disciplines being audited. ALLOCATE is held by the governance roles only.
+    """
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+    await _require(db, user, "AUDIT_COMPLIANCE.ALLOCATE", plant_id=audit.plantId,
                    record={"leadAuditorUserId": audit.leadAuditorUserId,
                            "plantManagerUserId": audit.plantManagerUserId,
                            "createdByUserId": audit.createdByUserId},
@@ -1127,7 +1147,9 @@ async def update_audit_team(
     could only be cast a week in advance was being cast with guesses.
     """
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.UPDATE", plant_id=audit.plantId,
+    # ALLOCATE, for the same reason as /allocate above — re-seating the team IS
+    # allocation, and on UPDATE an auditee could recast the audit they are under.
+    await _require(db, user, "AUDIT_COMPLIANCE.ALLOCATE", plant_id=audit.plantId,
                    record={"leadAuditorUserId": audit.leadAuditorUserId,
                            "plantManagerUserId": audit.plantManagerUserId,
                            "createdByUserId": audit.createdByUserId},

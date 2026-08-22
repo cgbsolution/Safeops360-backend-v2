@@ -1586,10 +1586,28 @@ def _score_from_rollup(rollup: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-async def _allocation_summary(db: AsyncSession, audit_id: str) -> dict[str, int]:
-    """assigned / unassigned counts via aggregate (assigned = an effective owner
-    by explicit allocation OR discipline routing)."""
+async def _allocation_summary(db: AsyncSession, audit) -> dict[str, int]:
+    """Who holds what, on BOTH axes — via aggregates, never a row load.
+
+    A checkpoint has two owners and they are allocated separately: the AUDITEE
+    who answers it if it fails, and the AUDITOR who conducts it.
+
+    **Auditee axis** (`assigned` / `unassigned`): an effective owner by explicit
+    allocation OR discipline routing. A null here is a real gap — nobody answers
+    that checkpoint.
+
+    **Auditor axis** (`leadConducting` / `idleCoAuditors`): reported as a
+    distribution, because a null is not expressible.
+    `_route_auditor_for_category` FALLS BACK to the lead when no co-auditor holds
+    the discipline, so `assignedAuditorId` is never null and the auditee axis's
+    "0 unassigned" says nothing about it. That is exactly how an audit reaches
+    the conduct screen with the lead holding all 206 checkpoints and two seated
+    co-auditors holding none — every count on the old summary read healthy. The
+    number that tells the truth is how many co-auditors were seated and then
+    given nothing.
+    """
     R = AuditCheckpointResponse
+    audit_id = audit.id
     total = (await db.execute(select(func.count(R.id)).where(R.auditId == audit_id))).scalar_one() or 0
     assigned = (
         await db.execute(
@@ -1599,7 +1617,28 @@ async def _allocation_summary(db: AsyncSession, audit_id: str) -> dict[str, int]
             )
         )
     ).scalar_one() or 0
-    return {"assigned": assigned, "unassigned": total - assigned, "total": total}
+
+    by_auditor = {
+        uid: n
+        for uid, n in (
+            await db.execute(
+                select(R.assignedAuditorId, func.count(R.id))
+                .where(R.auditId == audit_id)
+                .group_by(R.assignedAuditorId)
+            )
+        ).all()
+        if uid
+    }
+    co_ids = _coauditor_ids(audit.coAuditors)
+
+    return {
+        "assigned": assigned,
+        "unassigned": total - assigned,
+        "total": total,
+        "leadConducting": by_auditor.get(audit.leadAuditorUserId, 0),
+        "coAuditorCount": len(co_ids),
+        "idleCoAuditors": sum(1 for uid in co_ids if by_auditor.get(uid, 0) == 0),
+    }
 
 
 def _review_clause():
@@ -2104,7 +2143,7 @@ async def get_audit(db: AsyncSession, audit_id: str) -> dict[str, Any] | None:
     d["disciplineRollup"] = rollup
     d["progress"] = _progress_from_rollup(rollup)
     d["finalizability"] = await _finalizability_db(db, audit)
-    d["allocationSummary"] = await _allocation_summary(db, audit_id)
+    d["allocationSummary"] = await _allocation_summary(db, audit)
     # Empty for every audit outside the department-segregated libraries, which
     # is what tells the client there is one report here rather than two.
     d["streamRollup"] = await stream_rollup(db, audit_id)
@@ -2547,7 +2586,84 @@ def validate_audit_title(title: str | None) -> str:
     return t
 
 
+# How recently an identical audit must have been created for a second attempt to
+# be treated as a retry rather than a deliberate second audit. Generous next to
+# the 25s proxy ceiling, because the duplicate arrives on a HUMAN retry: they
+# read the error, re-checked the form, clicked again. Short enough that
+# genuinely scheduling the same audit twice in an afternoon is unaffected.
+_DUPLICATE_WINDOW_MINUTES = 5
+
+
+async def _recent_identical_audit(
+    db: AsyncSession, *, title: str, plant_id: str, scheduled_date: Any, lead_id: str | None
+) -> ComplianceAudit | None:
+    """The same audit, created moments ago — or None.
+
+    Exists because a POST that TIMES OUT at the proxy is not a POST that failed.
+    The backend keeps going, commits, and the caller is shown an error for an
+    audit that now exists; clicking again is the only reasonable response to
+    that message, and it produced AUD-...-0050/0051/0052 — three identical
+    206-checkpoint audits from one intent.
+
+    Matched on the four fields that make an audit that audit: title, site, the
+    date it is scheduled for, and who leads it. Not on the discipline selection
+    — a retry re-posts the form unchanged, and requiring a deeper match would
+    let a duplicate through on any field the user idly touched before clicking
+    again.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_DUPLICATE_WINDOW_MINUTES)
+    stmt = (
+        select(ComplianceAudit)
+        .where(
+            ComplianceAudit.title == title,
+            ComplianceAudit.plantId == plant_id,
+            ComplianceAudit.scheduledDate == scheduled_date,
+            ComplianceAudit.createdAt >= cutoff,
+            ComplianceAudit.isDeleted.is_(False),
+        )
+        .order_by(ComplianceAudit.createdAt.desc())
+    )
+    if lead_id:
+        stmt = stmt.where(ComplianceAudit.leadAuditorUserId == lead_id)
+    return (await db.execute(stmt)).scalars().first()
+
+
 async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) -> ComplianceAudit:
+    # ---- Retry guard, before any work -------------------------------------
+    #
+    # Deliberately returns the existing audit rather than raising: the caller is
+    # a scheduler who wanted this audit to exist, and it does. Raising would
+    # show a second error for a second success, and they would click a third
+    # time. The router's response then navigates them to the real audit, which
+    # is what they were trying to reach.
+    #
+    # A title too short to be valid is left for `validate_audit_title` below to
+    # reject with its own message — this guard must not turn a validation error
+    # into a lookup miss.
+    _title = (data.get("title") or "").strip()
+    if _title and data.get("plantId") and data.get("scheduledDate"):
+        _existing = await _recent_identical_audit(
+            db,
+            title=_title,
+            plant_id=data["plantId"],
+            scheduled_date=data["scheduledDate"],
+            lead_id=data.get("leadAuditorUserId") or user.id,
+        )
+        if _existing is not None:
+            # Tells the router NOT to queue the post-schedule side effects again.
+            # `sync_engagement` would no-op on its own (unchanged fingerprint
+            # sends nothing), but `notify_audit_scheduled` has no such guard and
+            # would re-email the entire cast — turning one suppressed duplicate
+            # into a second round of "you are the lead auditor" for an audit
+            # everyone was already told about.
+            _existing._wasExistingDuplicate = True  # type: ignore[attr-defined]
+            print(
+                f"[audit_compliance] duplicate create suppressed — returning "
+                f"{_existing.auditNumber} ({_existing.id}) created at {_existing.createdAt}",
+                file=sys.stderr,
+            )
+            return _existing
+
     industry_code = data.get("industryCode")
     # `None` here, not the generic default: the fallback is applied AFTER the
     # library is resolved, so an audit whose checklist belongs to a category can
@@ -2962,39 +3078,73 @@ async def create_audit(db: AsyncSession, *, user: User, data: dict[str, Any]) ->
         )
     await db.flush()
 
-    # ── The moment the audit is set, the time is claimed ──────────────────
-    #
-    # Scheduling an audit used to produce a date in this table and nothing in
-    # anybody's calendar, so the first the auditee heard of it was often the
-    # auditor arriving. This books the fieldwork window plus the opening and
-    # closing meetings for whoever is named so far — usually just the lead
-    # auditor at this point, which is correct: `update_audit_team` re-syncs and
-    # picks up the auditees when they are actually identified.
-    #
-    # Best-effort by contract (`sync_engagement` never raises). An unreachable
-    # Exchange leaves the bookings PENDING for the retry job; it must not be
-    # able to fail the creation of the audit itself.
+    # The calendar bookings and the fan-out to the cast are DEFERRED, not
+    # skipped — see `run_post_schedule_side_effects` below and the
+    # `background_tasks.add_task` in routers/audit_compliance.py. Both are
+    # network-bound (Graph/Exchange, then one SMTP send per seat, serially),
+    # both are best-effort by contract, and running them here put seconds of
+    # third-party latency inside the caller's HTTP request — with a Postgres
+    # transaction held open across all of it. On a 206-checkpoint audit with a
+    # full cast that reliably exceeded the 30s proxy/function ceiling, and the
+    # scheduler saw "Couldn't schedule audit" for an audit that HAD been
+    # created. Nothing here needs their result, so they belong after the
+    # response.
+    return audit
+
+
+async def run_post_schedule_side_effects(audit_id: str, actor_id: str | None = None) -> None:
+    """Calendar bookings + the scheduled-audit fan-out, off the request path.
+
+    A FastAPI BackgroundTask entry point, so it owns its session: the
+    request-scoped one is committed and closed before background tasks run
+    (FastAPI exits `yield` dependencies first, since 0.106), and reusing it
+    would be a use-after-close.
+
+    Ordering is preserved from when these ran inline — calendar first, then the
+    notifications, because the invite is what the email's "when" refers to.
+
+    Catches everything. A BackgroundTask has no observer, so an escaping
+    exception would be logged by the worker and understood by nobody; both
+    callees are already best-effort and record their own failures (bookings
+    land PENDING for the retry job, the fan-out prints and returns ok=False).
+    """
+    from app.core.db import AsyncSessionLocal
     from app.services import calendar_booking as _cal
-
-    await _cal.sync_engagement(
-        db, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=user.id
-    )
-
-    # ── And the moment the time is claimed, the people are told ───────────
-    #
-    # The calendar invite says WHEN. It does not say what the audit is, which
-    # disciplines are yours, or what you are expected to do — and a calendar
-    # invite from a system address is routinely accepted unread. Every seat now
-    # also gets an in-app notification and an email carrying a role-specific
-    # deep link into the audit.
-    #
-    # Best-effort by contract (`notify_audit_scheduled` swallows its own
-    # exceptions), for the same reason as the calendar sync above: an audit must
-    # not fail to be created because SMTP was down.
     from app.services import cams_audit_notifications as _camsnotif
 
-    await _camsnotif.notify_audit_scheduled(db, audit=audit, actor_id=user.id)
-    return audit
+    async with AsyncSessionLocal() as session:
+        try:
+            audit = await session.get(ComplianceAudit, audit_id)
+            if audit is None:
+                # Created and then deleted inside the same second, or the commit
+                # rolled back after the task was queued. Nothing to announce.
+                return
+
+            # Scheduling an audit used to produce a date in this table and
+            # nothing in anybody's calendar, so the first the auditee heard of it
+            # was often the auditor arriving. This books the fieldwork window
+            # plus the opening and closing meetings for whoever is named so far
+            # — usually just the lead auditor at this point, which is correct:
+            # `update_audit_team` re-syncs and picks up the auditees when they
+            # are actually identified.
+            await _cal.sync_engagement(
+                session, engagement_kind="AUDIT", engagement_id=audit.id, actor_id=actor_id
+            )
+
+            # The calendar invite says WHEN. It does not say what the audit is,
+            # which disciplines are yours, or what you are expected to do — and
+            # an invite from a system address is routinely accepted unread. Every
+            # seat also gets an in-app notification and an email carrying a
+            # role-specific deep link into the audit.
+            await _camsnotif.notify_audit_scheduled(session, audit=audit, actor_id=actor_id)
+
+            await session.commit()
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            await session.rollback()
+            print(
+                f"[audit_compliance] post-schedule side effects failed for {audit_id}: {e}",
+                file=sys.stderr,
+            )
 
 
 async def add_disciplines(
