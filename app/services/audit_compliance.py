@@ -1834,7 +1834,7 @@ async def get_checkpoint_interactions(db: AsyncSession, *, audit_id: str, checkp
 async def bulk_save_response(
     db: AsyncSession, *, user: User, audit_id: str, value: str,
     checkpoint_ids: list[str] | None = None, discipline_id: str | None = None,
-    only_unanswered: bool = True,
+    only_unanswered: bool = True, enforce_allocation: bool = False,
 ) -> dict[str, Any]:
     """Mark a set of checkpoints (explicit ids OR a whole discipline) as pass/na
     in one call — the "mark discipline compliant" fast path for large audits.
@@ -1853,6 +1853,13 @@ async def bulk_save_response(
 
     R = AuditCheckpointResponse
     conds = [R.auditId == audit_id]
+    if enforce_allocation:
+        # NARROWS rather than rejects. "Mark this discipline compliant" from a
+        # co-auditor means their share of it — refusing the whole call because
+        # one row belongs to someone else would make the fast path unusable on
+        # any discipline that happens to be split. Rows they do not hold are
+        # simply not theirs to mark, and are left alone.
+        conds.append(R.assignedAuditorId == user.id)
     ids = set(checkpoint_ids or [])
     if ids:
         conds.append(R.id.in_(ids))
@@ -3600,6 +3607,78 @@ async def allocate_checkpoints(
     if not targets:
         raise ValueError("No matching checkpoints to allocate")
 
+    # Who held these rows BEFORE anything moves, on both axes, plus the display
+    # names for every id involved. Captured here because the loops below
+    # overwrite the columns in place — after them the previous holder is
+    # unrecoverable, and "reassigned" with no from-whom is not an audit trail.
+    _prev_auditors = {r.assignedAuditorId for r in targets if r.assignedAuditorId}
+    _prev_owners = {r.assignedOwnerId for r in targets if r.assignedOwnerId}
+    _names = {
+        u.id: u.name
+        for u in (
+            await db.execute(
+                select(User).where(
+                    User.id.in_(
+                        (_prev_auditors | _prev_owners
+                         | {auditor_id, owner_id, audit.leadAuditorUserId}) - {None}
+                    )
+                )
+            )
+        ).scalars().all()
+    }
+
+    def _who(uid: str | None, fallback: str) -> str:
+        return _names.get(uid, uid) if uid else fallback
+
+    def _who_set(ids: set, fallback: str) -> str:
+        return ", ".join(sorted(_who(i, fallback) for i in ids)) if ids else fallback
+
+    async def _record_allocation_event(auditor_n: int, owner_n: int) -> None:
+        """One tamper-evident entry per allocation CALL, on the audit's own hash
+        chain — not one per checkpoint.
+
+        `AuditCheckpointResponse` is deliberately not a registered-audited model:
+        ORM capture there would mint a hash-chained row for every verdict save,
+        which on a 1,500-checkpoint audit is the wrong trade. But allocation now
+        decides who is PERMITTED to grade a row, so it belongs in the trail a
+        certification body reads. Recording it against the ComplianceAudit gives
+        it the same tamper-evidence as the audit's other governed changes, at one
+        row per Update click.
+
+        Best-effort: the allocation is the business change and is already
+        committed by the caller. An audit-write failure must not undo it — the
+        same contract `drain_audit` has in `get_db`.
+        """
+        if not auditor_n and not owner_n:
+            return  # nothing actually moved
+        scope = (
+            f"discipline “{targets[0].categoryName or discipline_id}”"
+            if discipline_id else f"{len(targets)} checkpoint(s)"
+        )
+        before: dict[str, Any] = {}
+        after: dict[str, Any] = {"scope": scope}
+        if set_auditor:
+            before["conductingAuditor"] = _who_set(_prev_auditors, "unallocated")
+            after["conductingAuditor"] = _who(auditor_id, "unallocated — falls back to the lead auditor")
+            after["checkpointsReassigned"] = auditor_n
+        if set_owner:
+            before["responsibleAuditee"] = _who_set(_prev_owners, "unassigned")
+            after["responsibleAuditee"] = _who(owner_id, "unassigned")
+            after["checkpointsRerouted"] = owner_n
+        try:
+            from app.services import audit_log as _alog
+
+            await _alog.record_event(
+                db, entity_type="ComplianceAudit", entity_id=audit.id,
+                entity_code=audit.auditNumber, plant_id=audit.plantId,
+                action="ALLOCATION_CHANGED", before=before, after=after,
+            )
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            print(
+                f"[audit_compliance] allocation audit entry failed for {audit.id}: {e}",
+                file=sys.stderr,
+            )
+
     # ── Auditor axis ─────────────────────────────────────────────────────
     auditor_changed = 0
     if set_auditor:
@@ -3623,9 +3702,32 @@ async def allocate_checkpoints(
             # assigned — leaving it null would strand the row with no conductor.
             new_auditor = auditor_id or audit.leadAuditorUserId
             if r.assignedAuditorId != new_auditor:
+                prev_auditor = r.assignedAuditorId
                 r.assignedAuditorId = new_auditor
                 auditor_changed += 1
+                # Logged, where it deliberately was not before.
+                #
+                # The old reasoning — "an auditor change is a work split with no
+                # thread state" — held while `assignedAuditorId` was advisory: it
+                # steered the navigator and the "My disciplines" filter, and
+                # anyone on the team could grade anything regardless. It now
+                # GOVERNS who may grade the row, so moving it silently changes
+                # who was permitted to answer a checkpoint with nothing on the
+                # record saying so. ISO 19011 asks who conducted what; that
+                # answer cannot live only in the current value of a column.
+                await _log_interaction(
+                    db, instance=r, audit_id=audit.id, actor_id=user.id,
+                    actor_role=_actor_role_for(user, audit), action="REASSIGNED_AUDITOR",
+                    resulting_state=r.workflowState,
+                    comment=(
+                        f"Conducting auditor changed from "
+                        f"{_names.get(prev_auditor, 'unassigned') if prev_auditor else 'unassigned'} "
+                        f"to {_names.get(new_auditor, new_auditor)}"
+                        + ("" if auditor_id else " (unallocated — falls back to the lead auditor)")
+                    ),
+                )
         if not set_owner:
+            await _record_allocation_event(auditor_changed, 0)
             await db.flush()
             return {
                 "ok": True, "updated": auditor_changed, "auditorId": auditor_id,
@@ -3689,6 +3791,7 @@ async def allocate_checkpoints(
         )
         updated += 1
 
+    await _record_allocation_event(auditor_changed, updated)
     await db.flush()
     return {
         "ok": True, "updated": updated, "ownerId": owner_id,
@@ -4019,7 +4122,17 @@ _SAVE_KEY_MAP = {
 }
 
 
-async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_response(
+    db: AsyncSession, *, user: User, audit_id: str, payload: dict[str, Any],
+    enforce_allocation: bool = False,
+) -> dict[str, Any]:
+    """Save one auditor verdict.
+
+    `enforce_allocation` is set by the router for a caller who does NOT hold
+    AUDIT_COMPLIANCE.ALLOCATE — a plain co-auditor. It holds them to the
+    disciplines actually allocated to them. Defaults off so internal callers and
+    the governance roles are unaffected.
+    """
     audit = await _load_audit(db, audit_id)
     if audit is None:
         raise ValueError("Audit not found")
@@ -4036,6 +4149,10 @@ async def save_response(db: AsyncSession, *, user: User, audit_id: str, payload:
     ).scalar_one_or_none()
     if resp is None:
         raise ValueError(f"Checkpoint {code} not found on this audit")
+    if enforce_allocation:
+        blocked = checkpoint_conduct_block_reason(audit, resp, user.id)
+        if blocked:
+            raise PermissionError(blocked)
 
     now = _utcnow()
     # MERGE only the fields the client actually sent (the router passes
@@ -4667,6 +4784,64 @@ _ACTION_FROM = {
     "PM_SEND_BACK": {"ESCALATED_PM"},
     "REOPEN": {"PASSED"},
 }
+
+
+def conduct_party_block_reason(audit, user_id: str) -> str | None:
+    """Why `user_id` may not conduct ANY part of this audit, or None.
+
+    Sibling of `pm_decision_block_reason`, and it exists for the same reason: a
+    permission cannot say "someone who is actually on this audit".
+
+    AUDITOR and LEAD_AUDITOR hold AUDIT_COMPLIANCE.EXECUTE at ALL_PLANTS —
+    deliberately, because audit independence routinely seats an auditor at a
+    site that is not their own and a scope decides which plants they may be
+    SEATED at. The seed comment claimed the `_auditor_record` passed by the
+    conduct endpoints then narrowed EXECUTE to audits they are on. It does not:
+    `can()` returns allowed on the first ALL_PLANTS grant and never reads the
+    record. So every holder of the auditor roles could grade, and submit, any
+    audit at any plant.
+
+    Callers that hold AUDIT_COMPLIANCE.ALLOCATE skip this check — whoever
+    decides who conducts what may also conduct.
+    """
+    party = {
+        audit.leadAuditorUserId,
+        audit.createdByUserId,
+        *_coauditor_ids(audit.coAuditors),
+    } - {None}
+    if user_id in party:
+        return None
+    return (
+        "You are not on this audit's team, so you cannot conduct it. Ask the lead "
+        "auditor or an audit manager to add you as a co-auditor."
+    )
+
+
+def checkpoint_conduct_block_reason(audit, response, user_id: str) -> str | None:
+    """Why `user_id` may not grade THIS checkpoint, or None.
+
+    The allocation rule, actually enforced. `assignedAuditorId` is what the
+    conduct navigator routes on and what "My disciplines" filters by, but until
+    now it was only ever a filter: the grading endpoints checked EXECUTE and
+    nothing else, so any co-auditor could answer every discipline including the
+    ones explicitly allocated to someone else.
+
+    A co-auditor with NOTHING allocated conducts nothing, which is the rule read
+    literally — the lead absorbs every unallocated discipline, so an empty
+    allocation means the work is the lead's, not everyone's.
+
+    Callers holding AUDIT_COMPLIANCE.ALLOCATE skip this, which is also what
+    keeps the lead auditor working: they hold it through LEAD_AUDITOR or
+    HSE_MANAGER, and they conduct every discipline not given to a co-auditor.
+    """
+    holder = getattr(response, "assignedAuditorId", None)
+    if holder is None or holder == user_id:
+        return None
+    return (
+        f"“{response.categoryName or response.categoryId}” is allocated to another "
+        "auditor, so you cannot grade this checkpoint. Ask for it to be "
+        "reallocated if it should be yours."
+    )
 
 
 def pm_decision_block_reason(audit, user_id: str) -> str | None:

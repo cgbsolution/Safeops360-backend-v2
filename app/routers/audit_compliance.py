@@ -70,6 +70,35 @@ async def _require(db: AsyncSession, user: User, code: str, *, plant_id: str | N
         raise HTTPException(status.HTTP_403_FORBIDDEN, res.reason or f"Missing permission {code}")
 
 
+async def _require_conduct(db: AsyncSession, user: User, audit) -> bool:
+    """EXECUTE + actually being on this audit. Returns whether the caller must
+    ALSO be held to their allocated disciplines.
+
+    Holders of AUDIT_COMPLIANCE.ALLOCATE — the governance roles, and the lead
+    auditor through LEAD_AUDITOR / HSE_MANAGER — are exempt from both checks:
+    whoever decides who conducts what may conduct. Everyone else must be on the
+    team, and may only grade what is allocated to them.
+
+    Neither check can be expressed as a permission scope, which is why they are
+    here. AUDITOR holds EXECUTE at ALL_PLANTS by design (independence seats
+    auditors away from home), and an ALL_PLANTS grant satisfies `can()` before
+    it reads the record these endpoints pass — so scope alone let any auditor
+    grade any audit at any plant, in any discipline.
+    """
+    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
+                   record=_auditor_record(audit), record_id=audit.id)
+    may_allocate = (
+        await can(db, user.id, "AUDIT_COMPLIANCE.ALLOCATE",
+                  PermissionContext(plant_id=audit.plantId))
+    ).allowed
+    if may_allocate:
+        return False
+    blocked = svc.conduct_party_block_reason(audit, user.id)
+    if blocked:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, blocked)
+    return True
+
+
 async def _load_or_404(db: AsyncSession, audit_id: str):
     audit = await svc._load_audit(db, audit_id)
     if audit is None:
@@ -1193,9 +1222,7 @@ async def add_adhoc_checkpoint(
 ) -> dict[str, Any]:
     """Auditor adds an ad-hoc custom checkpoint to this audit (carousel "+")."""
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
-                   record=_auditor_record(audit),
-                   record_id=audit.id)
+    await _require_conduct(db, user, audit)
     try:
         return await svc.add_adhoc_checkpoint(db, user=user, audit_id=audit_id, payload=body.model_dump())
     except ValueError as e:
@@ -1210,13 +1237,16 @@ async def save_response(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
-                   record=_auditor_record(audit),
-                   record_id=audit.id)
+    enforce = await _require_conduct(db, user, audit)
     try:
         # exclude_unset → only the fields the client actually sent are merged,
         # so an observation-only save never wipes a previously-saved value.
-        return await svc.save_response(db, user=user, audit_id=audit_id, payload=body.model_dump(exclude_unset=True))
+        return await svc.save_response(
+            db, user=user, audit_id=audit_id, payload=body.model_dump(exclude_unset=True),
+            enforce_allocation=enforce,
+        )
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e)) from e
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
 
@@ -1231,14 +1261,12 @@ async def bulk_save_response(
     """Mark a set / whole-discipline as pass|na in one call (large-audit fast
     path). Never clobbers fail/partial verdicts or in-flight findings."""
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
-                   record=_auditor_record(audit),
-                   record_id=audit.id)
+    enforce = await _require_conduct(db, user, audit)
     try:
         return await svc.bulk_save_response(
             db, user=user, audit_id=audit_id, value=body.value,
             checkpoint_ids=body.checkpointIds, discipline_id=body.disciplineId,
-            only_unanswered=body.onlyUnanswered,
+            only_unanswered=body.onlyUnanswered, enforce_allocation=enforce,
         )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from e
@@ -1281,9 +1309,18 @@ async def replicate_response(
     already-graded department unless `overwrite` says so.
     """
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
-                   record=_auditor_record(audit),
-                   record_id=audit.id)
+    if await _require_conduct(db, user, audit):
+        # Replication writes the same verdict into OTHER departments by design,
+        # which is exactly what an allocation-restricted auditor must not do:
+        # every target row outside their own disciplines would be a write they
+        # could not make one at a time. Refused wholesale rather than silently
+        # narrowed, because a "replicated to 5 departments" result that quietly
+        # wrote 1 is worse than a clear no.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Replication writes into departments beyond the ones allocated to you. "
+            "Grade your own checkpoints, or ask the lead auditor to replicate.",
+        )
     try:
         return await svc.replicate_response(
             db, user=user, audit_id=audit_id, checkpoint_code=body.checkpointCode,
@@ -1301,9 +1338,7 @@ async def submit_audit(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     audit = await _load_or_404(db, audit_id)
-    await _require(db, user, "AUDIT_COMPLIANCE.EXECUTE", plant_id=audit.plantId,
-                   record=_auditor_record(audit),
-                   record_id=audit.id)
+    await _require_conduct(db, user, audit)
     try:
         return await svc.submit_audit(db, user=user, audit_id=audit_id)
     except ValueError as e:
