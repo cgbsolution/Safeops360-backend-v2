@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Extension-layer Out schemas embedded in FactoryProfileDetail (one-way import —
 # factory_ext does not import this module, so there is no cycle).
@@ -578,9 +578,36 @@ class FactoryProfileCreate(BaseModel):
     buildingCount: int | None = None  # manual when no Building rows entered
     primaryIndustry: str = "Garments / Textile"
     # Quick-add child records from the wizard (all optional — can be added later).
+    # Buildings stay optional: the building register is genuinely incremental,
+    # and no completeness rule depends on it.
     buildings: list[BuildingCreate] = []
-    workforce: WorkforceCompositionCreate | None = None  # initial composition
+    # Workforce is REQUIRED, and must carry a real headcount.
+    #
+    # It used to be optional, and the result was a profile that saved cleanly
+    # and then sat at DRAFT forever — because `compute_profile_status` needs one
+    # current workforce record above zero before it will say ACTIVE. The gap
+    # only surfaced later, on a different screen, as a badge contradicting a
+    # completed lifecycle workflow. Collecting it at creation is the one moment
+    # the person entering the factory has the number to hand.
+    workforce: WorkforceCompositionCreate
     processes: list[ProductionProcessCreate] = []
+
+    @model_validator(mode="after")
+    def _require_headcount(self):
+        """`totalCount` is the sum of the employment-type counts, so an all-zero
+        record passes every field-level rule and still fails the ACTIVE check.
+        Reject it here rather than storing a record that cannot do its job.
+
+        Scoped to profile CREATION on purpose — `WorkforceCompositionCreate` is
+        shared with the standalone workforce endpoint, where correcting a site
+        down to zero is a legitimate thing to record."""
+        w = self.workforce
+        if w.permanentCount + w.contractCount + w.apprenticeTraineeCount <= 0:
+            raise ValueError(
+                "Workforce headcount is required — permanent, contract or "
+                "apprentice must be above zero."
+            )
+        return self
 
 
 class FactoryProfileUpdate(BaseModel):
