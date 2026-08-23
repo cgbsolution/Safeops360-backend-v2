@@ -545,15 +545,31 @@ class FactoryProfileCreate(BaseModel):
     factoryCode: str | None = None  # auto-generated when omitted
     status: FactoryStatusLit = "OPERATIONAL"
     ownershipType: OwnershipTypeLit = "OWNED"
-    addressLine: str = ""
+    # ── Statutory identity: required on CREATE ────────────────────────────
+    #
+    # These were all optional-with-a-blank-default, which is how profiles
+    # arrived carrying no address, no state and no licence. The cost is not
+    # cosmetic: `state` drives the India map and every regional rollup, and the
+    # licence pair drives the compliance register's renewal alerts — a profile
+    # missing them is counted as compliant because there is nothing to check.
+    #
+    # Enforced here rather than only in the wizard, so "required" survives a
+    # request that does not come from that form. FactoryProfileUpdate keeps
+    # every field optional on purpose: the ~19 profiles created before this
+    # must stay editable field-by-field rather than being held hostage to data
+    # their author never had.
+    addressLine: str = Field(min_length=1)
     city: str = ""
-    state: str = ""
-    pincode: str = ""
+    state: str = Field(min_length=1)
+    # Six digits, never leading zero — the Indian PIN format.
+    pincode: str = Field(pattern=r"^[1-9]\d{5}$")
     latitude: float | None = None
     longitude: float | None = None
-    establishedYear: int | None = None
-    factoryLicenseNo: str | None = None
-    factoryLicenseValidUntil: datetime | None = None
+    # Upper bound is deliberately generous: a plant commissioning next year is
+    # a real thing to record, a 6-digit typo is not.
+    establishedYear: int = Field(ge=1800, le=2100)
+    factoryLicenseNo: str = Field(min_length=1)
+    factoryLicenseValidUntil: datetime
     registrationNos: list[RegistrationNo] = []
     applicableActs: list[str] = []
     pollutionControlBoard: str | None = None
