@@ -44,6 +44,27 @@ async def _require(db: AsyncSession, user: User, code: str, *, plant_id=None) ->
         raise HTTPException(status.HTTP_403_FORBIDDEN, res.reason or f"Missing permission {code}")
 
 
+async def _require_signoff_access(
+    db: AsyncSession, user: User, audit: ComplianceAudit
+) -> None:
+    """Who may record or withdraw a sign-off on this audit.
+
+    Entitlement comes from the audit's own team first: if you are named on it,
+    you may sign the seat you hold (which seat, `signoff.record_signoff`
+    enforces). Only someone NOT on the team - a CAMS admin, an external
+    observer - falls through to the module-level CAMS.EXECUTE grant.
+
+    This is deliberately not `CAMS.EXECUTE` for everyone. AUDITEE is a
+    read-only role in CAMS so that an auditee can never conduct an audit, but
+    the auditee owner is one of the two signatures that gate closure. Requiring
+    EXECUTE here made that signature unobtainable and left every audit stuck
+    short of Closed.
+    """
+    if signoff_svc.is_named_on_audit(audit, user.id):
+        return
+    await _require(db, user, "CAMS.EXECUTE", plant_id=audit.plantId)
+
+
 async def _scope(
     db: AsyncSession, kind: str, engagement_id: str
 ) -> tuple[ind.EngagementScope, str | None]:
@@ -797,7 +818,7 @@ async def create_signoff(
     audit = await db.get(ComplianceAudit, audit_id)
     if audit is None or audit.isDeleted:
         raise HTTPException(404, "Audit not found")
-    await _require(db, user, "CAMS.EXECUTE", plant_id=audit.plantId)
+    await _require_signoff_access(db, user, audit)
     try:
         out = await signoff_svc.record_signoff(
             db,
@@ -828,7 +849,7 @@ async def delete_signoff(
     audit = await db.get(ComplianceAudit, audit_id)
     if audit is None or audit.isDeleted:
         raise HTTPException(404, "Audit not found")
-    await _require(db, user, "CAMS.EXECUTE", plant_id=audit.plantId)
+    await _require_signoff_access(db, user, audit)
     try:
         out = await signoff_svc.revoke_signoff(
             db, audit=audit, user=user, role=role, discipline_code=disciplineCode

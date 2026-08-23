@@ -44,6 +44,15 @@ SIGNOFF_ROLES = (
 # The two that gate closure. Everything else is supplementary.
 REQUIRED_FOR_CLOSURE = ("LEAD_AUDITOR", "AUDITEE_OWNER")
 
+# Human wording for the seat, used in the error a signer actually reads.
+SEAT_LABEL = {
+    "LEAD_AUDITOR": "lead auditor",
+    "AUDITEE_OWNER": "auditee owner",
+    "DISCIPLINE_AUDITOR": "discipline auditor",
+    "PLANT_MANAGER": "plant manager",
+    "EXTERNAL_OBSERVER": "external observer",
+}
+
 SIGNATURE_KINDS = ("DRAWN", "TYPED")
 
 # A drawn signature is a PNG data URI. Cap it so a pathological canvas cannot
@@ -53,6 +62,37 @@ MAX_SIGNATURE_BYTES = 256 * 1024
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def seat_holders(audit: ComplianceAudit) -> dict[str, set[str]]:
+    """Who is named on this audit, keyed by the sign-off seat they may fill.
+
+    The audit already records its own team, so entitlement to sign is a property
+    of the record rather than of a module-wide grant. That matters most for the
+    auditee: AUDITEE is a read-only role in CAMS by design - it must not be able
+    to conduct audits - yet the auditee owner is one of the two signatures that
+    gate closure. Deriving the right to sign from being named on the audit is
+    what lets both of those be true at once.
+
+    EXTERNAL_OBSERVER has no seat here: an observer is by definition not on the
+    team, so that signature stays behind the module-level CAMS.EXECUTE grant.
+    """
+    lead = {audit.leadAuditorUserId} - {None}
+    pm = {audit.plantManagerUserId} - {None}
+    co = {c.get("userId") for c in (audit.coAuditors or []) if c.get("userId")}
+    auditees = {a.get("userId") for a in (audit.auditees or []) if a.get("userId")}
+    return {
+        "LEAD_AUDITOR": lead,
+        "AUDITEE_OWNER": auditees,
+        "DISCIPLINE_AUDITOR": lead | co,
+        "PLANT_MANAGER": pm,
+        "EXTERNAL_OBSERVER": set(),
+    }
+
+
+def is_named_on_audit(audit: ComplianceAudit, user_id: str) -> bool:
+    """True when this user occupies any seat on the audit's team."""
+    return any(user_id in holders for holders in seat_holders(audit).values())
 
 
 def validate_signature(kind: str, payload: str | None, typed_name: str | None) -> None:
@@ -153,10 +193,16 @@ async def record_signoff(
 
     validate_signature(signature_kind, signature_payload, typed_name)
 
-    # The lead auditor's sign-off must come from the lead auditor. Anything else
-    # is a signature in someone else's name, which is worse than no signature.
-    if role == "LEAD_AUDITOR" and user.id != audit.leadAuditorUserId:
-        raise ValueError("Only the assigned lead auditor can record the lead auditor sign-off.")
+    # A seat is signed by the person who holds it. Anything else is a signature
+    # in someone else's name, which is worse than no signature. EXTERNAL_OBSERVER
+    # is exempt because an observer is not on the team by definition.
+    if role != "EXTERNAL_OBSERVER":
+        holders = seat_holders(audit)[role]
+        if user.id not in holders:
+            raise ValueError(
+                f"Only the {SEAT_LABEL[role]} named on this audit can record the "
+                f"{SEAT_LABEL[role]} sign-off."
+            )
 
     entry = {
         "role": role,
@@ -215,7 +261,10 @@ async def revoke_signoff(
 __all__ = [
     "SIGNOFF_ROLES",
     "REQUIRED_FOR_CLOSURE",
+    "SEAT_LABEL",
     "SIGNATURE_KINDS",
+    "seat_holders",
+    "is_named_on_audit",
     "validate_signature",
     "signoff_status",
     "record_signoff",
