@@ -44,6 +44,7 @@ from app.services import fire_checklists as svc
 from app.services import fire_register as regsvc
 from app.services import fire_signoff
 from app.services import fire_permissions as perm
+from app.services import fire_qr as qrsvc
 from app.services.access_scope import build_query_scope
 
 router = APIRouter(prefix="/api/fire", tags=["fire-safety"])
@@ -89,6 +90,184 @@ def _with_names(payload: dict[str, Any], names: dict[str, str]) -> dict[str, Any
 # ═══════════════════════════════════════════════════════════════════════════
 # Templates + asset pickers
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# QR stickers
+# ═══════════════════════════════════════════════════════════════════════════
+@router.get("/assets/{asset_id}/qr.png")
+async def asset_qr_png(
+    asset_id: str,
+    scale: int = Query(8, ge=2, le=20),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The asset's QR as a PNG — for on-screen preview and quick printing."""
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(404, "Asset not found in the fire register.")
+    await _require(db, user, perm.READ, plant_id=asset.plantId)
+    png = qrsvc.render_png(qrsvc.payload_for(asset.id), scale=scale)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{asset.equipmentCode}-qr.png"'},
+    )
+
+
+@router.get("/assets/{asset_id}/qr.svg")
+async def asset_qr_svg(
+    asset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The asset's QR as SVG — the format to actually print from.
+
+    Vector, so it stays sharp at any label size. A 25 mm sticker printed from a
+    screen-resolution PNG is a sticker that does not scan.
+    """
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(404, "Asset not found in the fire register.")
+    await _require(db, user, perm.READ, plant_id=asset.plantId)
+    return Response(
+        content=qrsvc.render_svg(qrsvc.payload_for(asset.id)),
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{asset.equipmentCode}-qr.svg"'},
+    )
+
+
+@router.get("/assets/qr-sheet.pdf")
+async def asset_qr_sheet(
+    ids: str | None = Query(None, description="comma-separated asset ids; omit for all in scope"),
+    assetType: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """A print-ready sheet of QR labels — 24 per A4 page on Avery L7160 pitch.
+
+    The realistic flow is not "print one sticker": it is registering twenty
+    cylinders and wanting one sheet to run off, cut and apply. Each label carries
+    the code, tag and location in text as well, so whoever applies them knows
+    which cylinder each belongs on without scanning every one.
+    """
+    await _require(db, user, perm.EXPORT)
+    scope = await build_query_scope(db, user.id, perm.READ)
+    stmt = scope.apply(
+        select(FireEquipment).where(FireEquipment.isDeleted.is_(False)), FireEquipment,
+    )
+    if ids:
+        wanted = [i for i in (s.strip() for s in ids.split(",")) if i]
+        if not wanted:
+            raise HTTPException(400, "No asset ids supplied.")
+        stmt = stmt.where(FireEquipment.id.in_(wanted))
+    if assetType:
+        stmt = stmt.where(FireEquipment.type == assetType)
+    rows = (await db.execute(stmt)).scalars().all()
+    if not rows:
+        raise HTTPException(404, "No assets matched — nothing to print.")
+    rows.sort(key=lambda e: (e.location or "", e.equipmentCode))
+    pdf = qrsvc.sticker_sheet_pdf(
+        [
+            {"id": e.id, "equipmentCode": e.equipmentCode,
+             "allottedSerialNo": e.allottedSerialNo, "location": e.location}
+            for e in rows
+        ]
+    )
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="fire-asset-qr-labels.pdf"'},
+    )
+
+
+@router.get("/assets/{asset_id}/scan-target")
+async def asset_scan_target(
+    asset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Where a scanned sticker should land: this asset's checklists, this period.
+
+    Returns every checklist that applies to the asset's type with the CURRENT
+    period already resolved, and marks one `primary`. The scan page sends the
+    inspector straight through when there is only one — the extinguisher case,
+    which is the common one — and offers a short list when the asset carries
+    several cadences, as a fire alarm panel does (daily, monthly, quarterly,
+    annual). Guessing between four would land them on the wrong sheet three
+    times out of four.
+
+    Deliberately does NOT return a frontend route. Which URL renders a hydrant
+    checklist is the frontend's business; this returns the asset and its
+    templates, and the scan page maps them.
+    """
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(404, "That sticker refers to an asset that is not in the fire register.")
+    await _require(db, user, perm.READ, plant_id=asset.plantId)
+
+    today = _now().date()
+    options: list[dict[str, Any]] = []
+    for tpl in await admin.list_templates(db):
+        meta = tpl.documentMeta or {}
+        if meta.get("assetType") != asset.type or tpl.status != "APPROVED":
+            continue
+        # A unit-variant sheet only applies to a panel with that addressing.
+        # Offering the Unit-21 B Loop sheet for a Zone panel is offering the
+        # wrong controlled document, and an inspector filling it in would record
+        # loop numbers against a panel that has zones.
+        variant = meta.get("siteVariant")
+        if variant and asset.assetSubtype and not _variant_matches(variant, asset.assetSubtype):
+            continue
+        frequency = meta.get("frequency", "MONTHLY")
+        period = svc.period_label(frequency, today)
+        run = await svc.find_run(db, tpl, asset.id, period)
+        options.append({
+            "templateId": tpl.id,
+            "templateCode": tpl.templateCode,
+            "name": tpl.name,
+            "documentNo": meta.get("documentNo"),
+            "frequency": frequency,
+            "layout": meta.get("layout"),
+            "siteVariant": variant,
+            "periodLabel": period,
+            "existingRunId": run.id if run else None,
+            "stage": svc.stage_of(run) if run else None,
+            # What the inspector actually wants to know: is this period done?
+            "outstanding": run is None or svc.stage_of(run) != svc.STAGE_APPROVED,
+        })
+
+    # Frequency order, then the first still outstanding is the one to open.
+    order = {"DAILY": 0, "MONTHLY": 1, "QUARTERLY": 2, "ANNUAL": 3}
+    options.sort(key=lambda o: order.get(o["frequency"], 9))
+    primary = next((o for o in options if o["outstanding"]), options[0] if options else None)
+
+    return {
+        "asset": {
+            "id": asset.id, "equipmentCode": asset.equipmentCode, "type": asset.type,
+            "assetSubtype": asset.assetSubtype, "location": asset.location,
+            "allottedSerialNo": asset.allottedSerialNo, "capacitySpec": asset.capacitySpec,
+            "status": asset.status, "plantId": asset.plantId,
+            "nextInspectionDueDate": asset.nextInspectionDueDate.isoformat()
+            if asset.nextInspectionDueDate else None,
+        },
+        "options": options,
+        "primaryTemplateCode": primary["templateCode"] if primary else None,
+        "qrToken": qrsvc.token_for(asset.id),
+    }
+
+
+def _variant_matches(site_variant: str, subtype: str) -> bool:
+    """Does a template's unit variant apply to this asset's addressing?
+
+    The two Fire Alarm monthly sheets differ only by ZONE vs LOOP addressing, and
+    the variant names encode the unit (`UNIT_21_A`) rather than the addressing.
+    Matching on the addressing the panel actually reports is what keeps a Zone
+    panel off the Loop sheet.
+    """
+    v = site_variant.upper()
+    s = (subtype or "").upper()
+    if "21_A" in v or "21A" in v:
+        return s in ("", "ZONE")
+    if "21_B" in v or "21B" in v:
+        return s in ("", "LOOP")
+    return True
+
+
 @router.get("/checklists/capabilities")
 async def read_capabilities(
     plantId: str | None = Query(None),
