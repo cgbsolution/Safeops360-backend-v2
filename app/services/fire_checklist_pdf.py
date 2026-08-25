@@ -592,4 +592,93 @@ def render_register(payload: dict[str, Any]) -> bytes:
     return _out(pdf)
 
 
-__all__ = ["render_grid", "render_form", "render_register"]
+# ═══════════════════════════════════════════════════════════════════════════
+# render_assets — the "All other fire assets" tab
+# ═══════════════════════════════════════════════════════════════════════════
+# Panels, hydrants, hose reels, detectors, emergency lights: the asset types the
+# controlled sixteen-column sheet does not cover. Not a client sheet, so there is
+# no document number to reproduce — the header carries the platform's own.
+_ASSET_COLS: list[tuple[str, str, float]] = [
+    ("equipmentCode", "Code", 26), ("type", "Type", 30), ("assetSubtype", "Subtype", 20),
+    ("location", "Location", 50), ("capacitySpec", "Capacity", 22),
+    ("make", "Make", 22), ("serialNo", "Serial no.", 24),
+    ("lastInspectionDate", "Last inspected", 22), ("nextInspectionDueDate", "Next due", 22),
+    ("status", "Status", 26),
+]
+
+_STATUS_INK = {
+    "ACTIVE": GREEN, "DUE_INSPECTION": AMBER, "OVERDUE": RED,
+    "NON_COMPLIANT": RED, "OUT_OF_SERVICE": GREY, "DECOMMISSIONED": GREY,
+}
+
+
+def render_assets(rows: list[dict[str, Any]], *, title: str = "FIRE ASSET REGISTER") -> bytes:
+    """The register tab that had no export at all — the one view of the fire
+    asset master an engineer could not take off the screen."""
+    doc = {"department": "EHS", "documentNo": "SafeOps360 / Fire asset register"}
+    pdf = _Sheet("L", doc, title)
+    pdf.alias_nb_pages()
+    pdf.add_page()
+
+    total_w = pdf.w - 16
+    scale = total_w / sum(c[2] for c in _ASSET_COLS)
+    widths = [c[2] * scale for c in _ASSET_COLS]
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        s = str(r.get("status") or "")
+        counts[s] = counts.get(s, 0) + 1
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_text_color(*INK)
+    pdf.cell(
+        total_w, 5.5,
+        _s(f"{len(rows)} asset(s)   |   " + "   |   ".join(
+            f"{k.replace('_', ' ').title()}: {v}" for k, v in sorted(counts.items()))),
+        border=1, new_x="LMARGIN", new_y="NEXT",
+    )
+
+    def head() -> None:
+        pdf.set_font("Helvetica", "B", 6.5)
+        pdf.set_fill_color(*ICE)
+        pdf.set_text_color(*NAVY)
+        for (_key, label, _w), w in zip(_ASSET_COLS, widths):
+            pdf.cell(w, 7, _s(label), border=1, align="C", fill=True)
+        pdf.ln(7)
+
+    head()
+    for r in rows:
+        if pdf.get_y() > pdf.h - 30:
+            pdf.add_page()
+            head()
+        for (key, _label, _w), w in zip(_ASSET_COLS, widths):
+            val = r.get(key)
+            if key in ("lastInspectionDate", "nextInspectionDueDate"):
+                text = _date(val)
+            elif key in ("type", "status"):
+                text = str(val or "").replace("_", " ")
+            else:
+                text = "" if val is None else str(val)
+
+            if key == "status":
+                pdf.set_text_color(*_STATUS_INK.get(str(r.get("status") or ""), INK))
+                pdf.set_font("Helvetica", "B", 6.0)
+            else:
+                pdf.set_text_color(*INK)
+                pdf.set_font("Helvetica", "", 6.0)
+
+            # Truncate rather than wrap — a register row that wraps stops being a
+            # row, and the full text is on the screen this was printed from.
+            while text and pdf.get_string_width(_s(text)) > (w - 2):
+                text = text[:-1]
+            pdf.cell(w, 5, _s(text), border=1, align="L" if key == "location" else "C")
+        pdf.ln(5)
+
+    pdf.set_text_color(*INK)
+    _footnotes(pdf, [
+        "Status is computed nightly from each asset's inspection due date. Overrides, "
+        "out-of-service and frequency changes live on the asset detail page.",
+    ])
+    return _out(pdf)
+
+
+__all__ = ["render_grid", "render_form", "render_register", "render_assets"]

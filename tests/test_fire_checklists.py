@@ -25,6 +25,7 @@ import pytest
 
 from app.models.cams import CamsEngagement, CamsTemplate, CamsTemplateQuestion, CamsTemplateSection
 from app.services import fire_checklist_pdf as pdfsvc
+from app.services import fire_checklist_xlsx as xlsxsvc
 from app.services import fire_checklists as svc
 from app.services import fire_register as regsvc
 from app.services.fire_checklist_templates import (
@@ -493,3 +494,129 @@ def test_register_renders_when_empty():
     payload = {"document": FE_REGISTER_DOC,
                "summary": {"total": 0, "overdue": 0, "dueSoon": 0, "notRecorded": 0}, "rows": []}
     assert pdfsvc.render_register(payload).startswith(b"%PDF")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. The Excel export
+# ═══════════════════════════════════════════════════════════════════════════
+# The workbook is the working copy, not a second controlled document, so what is
+# worth asserting is different from the PDF's "it rendered": that it OPENS, that
+# it keeps one row per check and one column per period, and — the thing that
+# would regress silently — that a due date arrives as a real date Excel can sort
+# and a missing one still says "not recorded" rather than going blank.
+def _load(data: bytes):
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    assert data.startswith(b"PK"), "an .xlsx is a zip; anything else Excel will refuse"
+    return load_workbook(BytesIO(data)).active
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"shutdown": True}, {"empty": True}],
+    ids=["filled", "shutdown-week", "never-inspected"],
+)
+def test_day_grid_xlsx_opens_with_a_column_per_day(kwargs):
+    payload = _grid_payload(31, **kwargs)
+    ws = _load(xlsxsvc.render_grid(payload))
+    # Sl. + wording + 31 days. A column silently dropped from a month page is the
+    # failure an inspector only finds when the 31st has nowhere to go.
+    assert ws.max_column == 2 + 31
+    assert ws.freeze_panes  # the wording must stay put when scrolling to the 31st
+
+
+def test_form_xlsx_keeps_every_item_and_its_note():
+    payload = {
+        "document": {**DOC, "documentNo": "PIL/EHS/CL/025-R1 (B)"},
+        "templateName": "AFDAS Monthly (Unit-21 A)", "assetCode": "FIRE-P1-FAS-A",
+        "assetLocation": "Unit-21 A", "periodLabel": "2026-08", "stage": "SUBMITTED",
+        "signOff": {
+            "preparedByName": "R Kumar", "preparedAt": "2026-08-31T05:00:00+00:00",
+            "reviewedByName": None, "reviewedAt": None,
+            "approvedByName": None, "approvedAt": None, "roles": DOC["signOffRoles"],
+        },
+        "sections": [
+            {"title": "Monthly Attention", "note": None, "items": [
+                {"text": "Manual call point is in working condition.", "type": "YES_NO_NA",
+                 "guidance": None, "value": "NO", "note": "MCP-4 lens cracked"},
+            ]},
+        ],
+    }
+    ws = _load(xlsxsvc.render_form(payload))
+    flat = [str(v) for row in ws.iter_rows(values_only=True) for v in row if v is not None]
+    assert any("Manual call point" in v for v in flat)
+    # The observation and the inspector's note both have to survive — a "NO" with
+    # its reason stripped is the half of the record that matters.
+    assert "NO" in flat and any("MCP-4 lens cracked" in v for v in flat)
+
+
+def test_register_xlsx_writes_real_dates_and_keeps_not_recorded():
+    from datetime import date as _date
+
+    def row(n, life, hp, refill, refill_on=None, refill_due=None):
+        return {
+            "slNo": n, "serialNo": f"MFR-{n}", "type": "CO2", "capacity": "2KG",
+            "yearOfManufacture": 2021, "expiryDate": "2031-04-27T00:00:00+00:00",
+            "make": "SAFETECH", "allottedSerialNo": str(36770 + n),
+            "location": "Admin - Reception", "hpTestedOn": "2021-04-27T00:00:00+00:00",
+            "hpTestDueDate": "2026-07-30T00:00:00+00:00", "dateOfDischarge": None,
+            "refilledOn": refill_on, "dueForRefilling": refill_due,
+            "weightKg": 2.0, "remarks": None,
+            "badges": {"cylinderLife": {"status": life}, "hpTest": {"status": hp},
+                       "refill": {"status": refill}},
+            "worstBadge": hp,
+        }
+
+    payload = {
+        "document": FE_REGISTER_DOC,
+        "summary": {"total": 2, "overdue": 1, "dueSoon": 0, "notRecorded": 1},
+        "rows": [
+            row(1, "OK", "OVERDUE", "OK", "2025-04-11T00:00:00+00:00", "2028-04-10T00:00:00+00:00"),
+            row(2, "OK", "OVERDUE", "NOT_RECORDED"),
+        ],
+    }
+    ws = _load(xlsxsvc.render_register(payload))
+    values = [c.value for r in ws.iter_rows() for c in r]
+    # A real date, not "10.04.2028" as text — the register is read by due date, and
+    # a string column sorts 01.02.2031 above 27.04.2026. openpyxl reads a date cell
+    # back as a datetime, so compare on the date part.
+    dates = {v.date() if isinstance(v, datetime) else v for v in values if isinstance(v, (_date, datetime))}
+    assert _date(2028, 4, 10) in dates
+    # A cylinder with no refill date on file is a register GAP. Blank would read
+    # as "nothing due", which is the one thing this column must never say.
+    assert "not recorded" in values
+    assert ws.auto_filter.ref, "the filter is the reason this is a workbook and not a second PDF"
+
+
+def test_register_xlsx_opens_when_empty():
+    payload = {"document": FE_REGISTER_DOC,
+               "summary": {"total": 0, "overdue": 0, "dueSoon": 0, "notRecorded": 0}, "rows": []}
+    assert _load(xlsxsvc.render_register(payload)) is not None
+
+
+def test_asset_register_xlsx_and_pdf_render():
+    """The 'All other fire assets' tab — panels, hydrants, detectors."""
+    rows = [
+        {"equipmentCode": "FE-AGB-0006", "type": "FIRE_ALARM_PANEL", "assetSubtype": None,
+         "location": "Admin - Lobby", "capacitySpec": None, "make": None, "model": None,
+         "serialNo": None, "maintenanceContractor": "SafeFire Services Pvt Ltd",
+         "lastInspectionDate": "2026-06-15T19:08:30+00:00",
+         "nextInspectionDueDate": "2026-07-15T19:08:30+00:00", "status": "OVERDUE"},
+        {"equipmentCode": "FIRE-ACS-FHS-01", "type": "FIRE_HYDRANT_SYSTEM", "assetSubtype": None,
+         "location": "Fire Pump House - Main Yard", "capacitySpec": "Hydrant & Sprinkler System",
+         "make": None, "model": None, "serialNo": None, "maintenanceContractor": None,
+         "lastInspectionDate": None, "nextInspectionDueDate": None, "status": "DUE_INSPECTION"},
+    ]
+    ws = _load(xlsxsvc.render_assets(rows))
+    flat = [c.value for r in ws.iter_rows() for c in r]
+    assert "FE-AGB-0006" in flat and "FIRE-ACS-FHS-01" in flat
+    # An asset that has never been inspected must still render — it is precisely
+    # the row someone is looking for.
+    assert pdfsvc.render_assets(rows).startswith(b"%PDF")
+
+
+def test_asset_register_renders_when_empty():
+    assert _load(xlsxsvc.render_assets([])) is not None
+    assert pdfsvc.render_assets([]).startswith(b"%PDF")

@@ -39,6 +39,7 @@ from app.models.user import User
 from app.services import fire_capa
 from app.services import fire_checklist_admin as admin
 from app.services import fire_checklist_pdf as pdfsvc
+from app.services import fire_checklist_xlsx as xlsxsvc
 from app.services import fire_checklists as svc
 from app.services import fire_register as regsvc
 from app.services import fire_signoff
@@ -761,6 +762,25 @@ async def export_run_pdf(
     )
 
 
+@router.get("/checklists/run/{run_id}/export.xlsx")
+async def export_run_xlsx(
+    run_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> Response:
+    """One filled sheet as a workbook — the Excel twin of export.pdf."""
+    tpl, run, asset = await _load_run(db, run_id)
+    await _require(db, user, perm.EXPORT, plant_id=run.siteId)
+    resp = await svc.load_response(db, run)
+    payload = _with_names(
+        svc.run_out(tpl, run, resp, asset),
+        await _names(db, [resp.completedBy, run.reviewedBy, run.approvedBy]),
+    )
+    doc_no = (payload.get("document") or {}).get("documentNo", "checklist").replace("/", "-")
+    return Response(
+        content=xlsxsvc.render_form(payload), media_type=xlsxsvc.MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{doc_no}-{run.periodLabel}.xlsx"'},
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Grid — the printed page
 # ═══════════════════════════════════════════════════════════════════════════
@@ -816,6 +836,29 @@ async def export_grid_pdf(
     return Response(
         content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{doc_no}-{payload["window"]}.pdf"'},
+    )
+
+
+@router.get("/checklists/grid/export.xlsx")
+async def export_grid_xlsx(
+    templateCode: str = Query(...),
+    assetId: str = Query(...),
+    window: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The same page as export.pdf, as a workbook.
+
+    Same payload, same gate, different artefact: the PDF is the controlled
+    document an auditor is handed, this is the copy an engineer sorts and pastes
+    into a report. Building both from `_grid` is what stops them disagreeing.
+    """
+    payload = await _grid(db, user, templateCode, assetId, window)
+    await _require(db, user, perm.EXPORT, plant_id=payload.get("plantId"))
+    doc_no = (payload.get("document") or {}).get("documentNo", "checklist").replace("/", "-")
+    return Response(
+        content=xlsxsvc.render_grid(payload), media_type=xlsxsvc.MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{doc_no}-{payload["window"]}.xlsx"'},
     )
 
 
@@ -1035,6 +1078,26 @@ async def export_register_pdf(
     return Response(
         content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": 'inline; filename="PIL-EHSD-CL-028-R1-register.pdf"'},
+    )
+
+
+@router.get("/register/extinguishers/export.xlsx")
+async def export_register_xlsx(
+    location: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The sixteen-column register as a workbook, with an autofilter.
+
+    The reason this exists next to the PDF rather than instead of it: "show me
+    every cylinder overdue on refill" is the register's most-asked question, and
+    in a PDF the answer is to re-run the export with a filter. Here it is a click.
+    """
+    await _require(db, user, perm.EXPORT)
+    payload = await read_register(location=location, feType=None, badge=None, user=user, db=db)
+    return Response(
+        content=xlsxsvc.render_register(payload), media_type=xlsxsvc.MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="PIL-EHSD-CL-028-R1-register.xlsx"'},
     )
 
 

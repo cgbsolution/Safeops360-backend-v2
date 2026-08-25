@@ -84,6 +84,25 @@ EXTRA_PERMISSIONS = [
     {"code": "EPC.INDUCTION_CONDUCT", "module": "EPC", "action": "INDUCTION_CONDUCT", "description": "Conduct and record site inductions"},
     {"code": "EPC.MOBILIZATION_APPROVE", "module": "EPC", "action": "MOBILIZATION_APPROVE", "description": "Approve worker mobilization to a site"},
     {"code": "EPC.PREQUALIFY", "module": "EPC", "action": "PREQUALIFY", "description": "Approve or reject contractor company pre-qualification"},
+    # FIRE — Fire & Life Safety. Not folded into OPERATIONAL_MODULES because the
+    # module carries three authorities the generic CRUD set has no name for, and
+    # because the blanket `for m in OPERATIONAL_MODULES` grants further down would
+    # then hand every one of them to roles this matrix never reviewed for fire.
+    # The catalogue is restated here so a fresh database gets the codes even if
+    # prisma/seed-rbac.ts has not run; upsert_permission is idempotent, so on a
+    # database that already has them this is a no-op.
+    {"code": "FIRE.CREATE", "module": "FIRE", "action": "CREATE", "description": "Register a fire asset / add a register row"},
+    {"code": "FIRE.READ", "module": "FIRE", "action": "READ", "description": "Read the fire register, checklists and inspection records"},
+    {"code": "FIRE.UPDATE", "module": "FIRE", "action": "UPDATE", "description": "Edit a fire asset or register row"},
+    {"code": "FIRE.DELETE", "module": "FIRE", "action": "DELETE", "description": "Remove a fire asset or checklist (soft delete / retire)"},
+    {"code": "FIRE.EXECUTE", "module": "FIRE", "action": "EXECUTE", "description": "Fill a fire checklist — 'Prepared by: Person In-charge'"},
+    {"code": "FIRE.VERIFY", "module": "FIRE", "action": "VERIFY", "description": "Review a filled checklist — 'Reviewed by: Intermediatory Head'"},
+    {"code": "FIRE.APPROVE", "module": "FIRE", "action": "APPROVE", "description": "Approve and lock a checklist — 'Approved by: HOD'"},
+    {"code": "FIRE.CLOSE", "module": "FIRE", "action": "CLOSE", "description": "Close a fire defect / finding"},
+    {"code": "FIRE.EXPORT", "module": "FIRE", "action": "EXPORT", "description": "Export fire checklists and registers to PDF / Excel"},
+    {"code": "FIRE.TEMPLATE_AUTHOR", "module": "FIRE", "action": "TEMPLATE_AUTHOR", "description": "Create / edit / clone fire checklist templates"},
+    {"code": "FIRE.TEMPLATE_APPROVE", "module": "FIRE", "action": "TEMPLATE_APPROVE", "description": "Publish or retire a fire checklist revision"},
+    {"code": "FIRE.CALENDAR", "module": "FIRE", "action": "CALENDAR", "description": "Mark plant non-working days on the daily checklist grids"},
 ]
 
 
@@ -179,6 +198,12 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PPE", "actions": list(OPERATIONAL_ACTIONS) + ["ISSUE", "INSPECT", "CATALOG_MANAGE", "RETIRE_APPROVE", "RECALL_MANAGE"], "scope": "OWN_PLANT"},
         {"module": "EPC", "actions": ["CREATE", "READ", "UPDATE", "MOBILIZATION_APPROVE", "GATE_OVERRIDE", "INDUCTION_CONDUCT", "PREQUALIFY"], "scope": "OWN_PLANT"},
         {"module": "AUDIT_COMPLIANCE", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "OWN_PLANT"},
+        # Fire & Life Safety, ALL_PLANTS on every action — see the same block in
+        # prisma/seed-rbac.ts for why. Restated here because step 3 of this
+        # seeder wipes RolePermission wholesale before rebuilding it from this
+        # matrix: without the FIRE rows the HSE Manager's fire authority is
+        # silently deleted the next time anyone runs `python -m app.seed.seed_rbac`.
+        {"module": "FIRE", "actions": ["READ", "CREATE", "UPDATE", "DELETE", "EXECUTE", "VERIFY", "APPROVE", "CLOSE", "EXPORT", "TEMPLATE_AUTHOR", "TEMPLATE_APPROVE", "CALENDAR"], "scope": "ALL_PLANTS"},
     ],
     "PLANT_HEAD": [
         {"module": m, "actions": list(OPERATIONAL_ACTIONS), "scope": "OWN_PLANT"} for m in ["OBSERVATION", "NEAR_MISS", "INCIDENT"]

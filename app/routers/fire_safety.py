@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,8 @@ from app.models.fire_safety import (
 )
 from app.models.user import User
 from app.services import fire_certificates as certsvc
+from app.services import fire_checklist_pdf as firepdf
+from app.services import fire_checklist_xlsx as firexlsx
 from app.services import fire_defects as defectsvc
 from app.services import fire_frequency as freqsvc
 from app.services import fire_permissions as perm
@@ -200,6 +202,54 @@ async def create_equipment(body: EquipmentCreate, user: User = Depends(get_curre
     await db.commit()
     await db.refresh(e)
     return {**_eq(e), "frequency": freq.as_dict() if freq else None}
+
+
+# ── register exports ────────────────────────────────────────────────────────
+# Declared ABOVE /equipment/{eid}: FastAPI matches in declaration order, and a
+# literal path registered after a path-parameter route of the same shape is
+# unreachable — "export.pdf" would arrive as an equipment id and 404.
+async def _export_rows(db: AsyncSession, user: User, etype: str | None) -> list[dict[str, Any]]:
+    """The rows the register screen shows, through the same scope filter.
+
+    Extinguishers are excluded by default because they have their own controlled
+    sixteen-column export (PIL/EHSD/CL/028-R1) — putting them in both is the
+    duplication the consolidated register exists to remove.
+    """
+    await _require(db, user, perm.EXPORT)
+    scope = await build_query_scope(db, user.id, _READ)
+    stmt = scope.apply(select(FireEquipment).where(FireEquipment.isDeleted.is_(False)), FireEquipment)
+    if etype:
+        stmt = stmt.where(FireEquipment.type == etype)
+    else:
+        stmt = stmt.where(FireEquipment.type != "FIRE_EXTINGUISHER")
+    rows = (await db.execute(stmt.order_by(FireEquipment.location.asc(), FireEquipment.equipmentCode.asc()))).scalars().all()
+    return [_eq(e) for e in rows]
+
+
+@router.get("/equipment/export.pdf")
+async def export_equipment_pdf(
+    etype: str | None = Query(None, alias="type"),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The 'All other fire assets' tab as a controlled-looking printout."""
+    rows = await _export_rows(db, user, etype)
+    return Response(
+        content=firepdf.render_assets(rows), media_type="application/pdf",
+        headers={"Content-Disposition": 'inline; filename="fire-asset-register.pdf"'},
+    )
+
+
+@router.get("/equipment/export.xlsx")
+async def export_equipment_xlsx(
+    etype: str | None = Query(None, alias="type"),
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The same rows as a workbook, with an autofilter on status and due date."""
+    rows = await _export_rows(db, user, etype)
+    return Response(
+        content=firexlsx.render_assets(rows), media_type=firexlsx.MEDIA_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="fire-asset-register.xlsx"'},
+    )
 
 
 @router.get("/equipment/{eid}")
