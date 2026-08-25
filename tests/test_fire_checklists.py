@@ -259,6 +259,35 @@ def test_each_stage_requires_its_exact_predecessor():
     assert svc.STAGE_DRAFT not in svc._STAGE_STEP
 
 
+def test_run_payload_reports_whether_a_signature_is_required():
+    """`signatureRequired` must carry the template's real answer, not None.
+
+    It shipped as a hardcoded None and every caller reads it as `!== false`, so a
+    DAILY sheet — which `signature_enforced` deliberately exempts, because 31 drawn
+    signatures a month gets the tablet handed round — still demanded one on screen.
+    """
+    monthly = _template(("a", "Panel normal", True))
+    assert svc.signature_enforced(monthly) is True
+
+    daily = _template(("a", "Panel normal", True))
+    daily.documentMeta = {**daily.documentMeta, "frequency": "DAILY", "layout": "DAY_GRID"}
+    assert svc.signature_enforced(daily) is False
+
+    run = _run("IN_PROGRESS")
+    run.id = "r1"
+    run.periodLabel = "2026-08"
+    run.siteId = "p1"
+    run.engagementCode = "INS-1"
+    run.sourceEntityId = None
+    run.areaOrAssetRef = "FE-1"
+    run.reviewedBy = run.approvedBy = run.reviewedAt = run.approvedAt = None
+    run.scorePercent = run.overallResult = None
+
+    for tpl, expected in ((monthly, True), (daily, False)):
+        payload = svc.run_out(tpl, run, None, None)
+        assert payload["signOff"]["signatureRequired"] is expected
+
+
 def test_approval_stops_at_report_issued_not_closed():
     """Approving the sheet must not close out the defects it raised.
 
@@ -525,6 +554,40 @@ def test_day_grid_xlsx_opens_with_a_column_per_day(kwargs):
     # failure an inspector only finds when the 31st has nowhere to go.
     assert ws.max_column == 2 + 31
     assert ws.freeze_panes  # the wording must stay put when scrolling to the 31st
+
+
+def test_grid_exports_carry_the_remark_that_explains_a_no():
+    """A "No" in a grid cell is a question; the remark is the answer.
+
+    The cell is eight millimetres wide and the source sheet's own footnote sends
+    the inspector to "the back side of this page" for exactly this reason. Both
+    exports have to reproduce that back page, or a NO prints as the bare word and
+    whoever reads it knows an item failed but not what was seen.
+    """
+    remark = "Number plate painted over during last repaint."
+    payload = _grid_payload(31)
+    first = payload["rows"][0]
+    period = payload["columns"][0]["periodLabel"]
+    first["cells"][period] = {"value": "NO", "conformance": "NC", "note": remark}
+
+    ws = _load(xlsxsvc.render_grid(payload))
+    flat = [str(v) for row in ws.iter_rows(values_only=True) for v in row if v is not None]
+    assert any(remark in v for v in flat), "the Remarks block must list it"
+    comments = [c.comment.text for r in ws.iter_rows() for c in r if c.comment]
+    assert any(remark in t for t in comments), "and the cell itself must carry it"
+
+    # The PDF grows: the remarks block is rendered, not silently dropped.
+    with_remark = pdfsvc.render_grid(payload)
+    first["cells"][period] = {"value": "NO", "conformance": "NC", "note": ""}
+    without = pdfsvc.render_grid(payload)
+    assert with_remark.startswith(b"%PDF") and len(with_remark) > len(without)
+
+
+def test_grid_export_has_no_remarks_block_when_nothing_was_written():
+    """An empty Remarks heading on a clean month reads as a missing comment."""
+    ws = _load(xlsxsvc.render_grid(_grid_payload(31)))
+    flat = [str(v) for row in ws.iter_rows(values_only=True) for v in row if v is not None]
+    assert not any(v == "Remarks" for v in flat)
 
 
 def test_form_xlsx_keeps_every_item_and_its_note():

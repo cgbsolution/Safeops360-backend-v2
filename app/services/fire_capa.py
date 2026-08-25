@@ -200,10 +200,15 @@ async def sync_failures(
                 existing.observedPeriods = observed
                 existing.occurrenceCount = (existing.occurrenceCount or 1) + 1
                 existing.lastObservedAt = _now()
+                remark = (ans.get("note") or "").strip()
                 existing.description = (
                     f"{existing.description or existing.title}\n\n"
                     f"Observed again in {period_label} ({run.engagementCode}). "
                     f"Occurrences: {existing.occurrenceCount}."
+                    # A recurrence with a fresh remark is the useful kind — it is
+                    # how "still not fixed" is told apart from "worse than last
+                    # month" on a defect that has been open for three periods.
+                    + (f"\nObserved: {remark}" if remark else "")
                 )[:8000]
             ans["findingId"] = existing.id
             if existing.capaId:
@@ -225,11 +230,18 @@ async def sync_failures(
             engagementId=run.id,
             sourceQuestionId=item_key,
             title=f"{asset_code}: {q.text}"[:200],
+            # The inspector's own remark leads, when there is one. Without it the
+            # defect said only that an item was marked "No" — so whoever picks up
+            # the CAPA learns that the identification number is unreadable but not
+            # that it is painted over, which is the half that decides the fix. The
+            # sheet's own footnote tells the inspector to "write comments"; this is
+            # where those comments have to end up.
             description=(
-                f'Checklist "{run.title}" recorded "No" for: {q.text}\n'
-                f"Asset: {asset_code}\nPeriod: {period_label}\n"
-                f"Record: {run.engagementCode}"
-            ),
+                (f"Observed: {(ans.get('note') or '').strip()}\n\n" if (ans.get("note") or "").strip() else "")
+                + f'Checklist "{run.title}" recorded "No" for: {q.text}\n'
+                + f"Asset: {asset_code}\nPeriod: {period_label}\n"
+                + f"Record: {run.engagementCode}"
+            )[:8000],
             severity=severity,
             standardClauseRef=q.standardClauseRef,
             siteId=run.siteId,

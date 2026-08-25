@@ -40,6 +40,7 @@ from io import BytesIO
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -272,11 +273,19 @@ def render_grid(payload: dict[str, Any]) -> bytes:
 
         cells = r.get("cells") or {}
         for j, col in enumerate(cols, start=3):
-            value = (cells.get(col.get("periodLabel")) or {}).get("value")
+            cell_data = cells.get(col.get("periodLabel")) or {}
+            value = cell_data.get("value")
             key = str(value).upper() if value else None
             c = ws.cell(row=row, column=j, value=_clean(value) if value else "")
             c.alignment = Alignment(horizontal="center", vertical="center")
             c.border = BORDER
+            # The remark, attached to the cell it belongs to. Excel shows it on
+            # hover and flags the cell, so the grid keeps its one-glance shape and
+            # the comment is still one hover away rather than only in the block
+            # at the foot of the sheet.
+            note = (cell_data.get("note") or "").strip()
+            if note:
+                c.comment = Comment(note, "SafeOps360")
             if key in ANSWER_FILL:
                 c.fill = PatternFill("solid", fgColor=ANSWER_FILL[key])
                 c.font = Font(bold=key == "NO", size=8, color=ANSWER_INK[key])
@@ -300,6 +309,34 @@ def render_grid(payload: dict[str, Any]) -> bytes:
         c.fill = PatternFill("solid", fgColor=ICE)
         c.border = BORDER
     row += 2
+
+    # "Comments on the back side of this page" — the sheet's own footnote. A grid
+    # cell cannot hold the remark that explains a "No", and on the paper original
+    # it does not; this is the back of the page. A cell that carries one is also
+    # marked in place, so the two are findable from each other.
+    remarks: list[tuple[str, str, str]] = []
+    header_by_period = {c.get("periodLabel"): str(c.get("header", c.get("periodLabel", ""))) for c in cols}
+    for n, r in enumerate(rows, start=1):
+        for period, cell in (r.get("cells") or {}).items():
+            note = (cell or {}).get("note")
+            if note and str(note).strip():
+                remarks.append((header_by_period.get(period, period), f"{n}. {r.get('text', '')}", str(note).strip()))
+
+    if remarks:
+        rh = ws.cell(row=row, column=1, value="Remarks")
+        rh.font = Font(bold=True, size=9, color=NAVY)
+        rh.fill = PatternFill("solid", fgColor=ICE)
+        row += 1
+        _header_row(ws, row, ["Period", "Check", "Remark"] + [""] * max(0, width - 3))
+        row += 1
+        for period, item, note in remarks:
+            for i, v in enumerate((period, item, note), start=1):
+                c = ws.cell(row=row, column=i, value=_clean(v))
+                c.font = Font(size=8, color=NAVY if i == 1 else INK)
+                c.alignment = Alignment(wrap_text=i > 1, vertical="top")
+                c.border = BORDER
+            row += 1
+        row += 1
 
     row = _footnotes(ws, row, doc.get("footnotes"), width)
     _sign_off_rows(ws, row, doc, None)

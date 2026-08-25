@@ -460,11 +460,16 @@ async def save_answers(
             raise ChecklistError(f"Unknown checklist item '{a.get('itemKey') or qid}'.", 400)
         value, conformance = _coerce(q, a.get("value"))
         prev = merged.get(q.id, {})
+        # None means "not sent" and keeps what is stored; "" means "clear it".
+        # `or` collapsed those two, so a remark could be written but never
+        # deleted — an inspector who typed the wrong cylinder number was stuck
+        # with it on a controlled record, which is the one place that matters.
+        incoming_note = a.get("note")
         merged[q.id] = {
             "questionId": q.id,
             "value": value,
             "conformance": conformance,
-            "note": (a.get("note") or prev.get("note") or ""),
+            "note": (prev.get("note") or "") if incoming_note is None else incoming_note,
             "evidenceAttachmentIds": a.get("evidenceAttachmentIds") or prev.get("evidenceAttachmentIds") or [],
             "ncSeverity": a.get("ncSeverity") or prev.get("ncSeverity"),
             "findingId": prev.get("findingId"),
@@ -688,7 +693,12 @@ def run_out(tpl: CamsTemplate, run: CamsEngagement, resp: CamsResponse | None,
             # Grid responses use fire_signoff.summary() instead, which strips the
             # images: 31 daily records x 3 signatures would be ~23 MB of base64.
             "signatures": fire_signoff.out(run),
-            "signatureRequired": None,
+            # The real answer, not None. This shipped as None and every caller
+            # read it as `!== false` — so a DAILY sheet, which `signature_enforced`
+            # deliberately exempts, still demanded a drawn signature in the UI and
+            # got one tablet handed round the shift. The template already knows;
+            # say so.
+            "signatureRequired": signature_enforced(tpl),
         },
         "sections": sections,
     }

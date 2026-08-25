@@ -414,12 +414,55 @@ def render_grid(payload: dict[str, Any]) -> bytes:
         pdf.cell(per_w, 5, _s(stage), border=1, align="C")
     pdf.ln(5)
 
+    _remarks_block(pdf, rows, cols, total_w)
     _footnotes(pdf, doc.get("footnotes"))
     # The Prepared/Reviewed/Approved block is printed blank on a grid page: the
     # paper sheet's block is signed once for the whole month, and the per-period
     # stamps are in the strip above.
     _sign_off_block(pdf, None, doc.get("signOffRoles"))
     return _out(pdf)
+
+
+def _remarks_block(pdf: _Sheet, rows: list[dict[str, Any]], cols: list[dict[str, Any]], total_w: float) -> None:
+    """"Comments on the back side of this page" — the sheet's own instruction.
+
+    A grid cell is eight millimetres wide; the remark that explains a "No" cannot
+    live in it, and on the paper original it does not — the footnote sends the
+    inspector to the back of the page. This is the back of the page. Without it
+    a cell reading NO exports as the bare word, and whoever reads the printout
+    knows an item failed but not what was seen.
+    """
+    entries: list[tuple[str, str, str]] = []  # (period header, item, remark)
+    header_by_period = {c.get("periodLabel"): str(c.get("header", c.get("periodLabel", ""))) for c in cols}
+    for n, r in enumerate(rows, start=1):
+        for period, cell in (r.get("cells") or {}).items():
+            note = (cell or {}).get("note")
+            if note and str(note).strip():
+                entries.append((header_by_period.get(period, period), f"{n}. {r.get('text', '')}", str(note).strip()))
+    if not entries:
+        return
+
+    if pdf.get_y() > pdf.h - 55:
+        pdf.add_page()
+    pdf.ln(1.5)
+    pdf.set_font("Helvetica", "B", 7)
+    pdf.set_fill_color(*ICE)
+    pdf.set_text_color(*NAVY)
+    pdf.cell(total_w, 5, _s("Remarks"), border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+
+    w_period, w_item = 22.0, min(90.0, total_w * 0.38)
+    w_note = total_w - w_period - w_item
+    for period, item, note in entries:
+        if pdf.get_y() > pdf.h - 42:
+            pdf.add_page()
+        pdf.set_font("Helvetica", "B", 6.2)
+        pdf.set_text_color(*NAVY)
+        pdf.cell(w_period, 4.6, _s(period[:14]), border=1, align="C")
+        pdf.set_font("Helvetica", "", 6.2)
+        pdf.set_text_color(*INK)
+        pdf.cell(w_item, 4.6, _s(item[:70]), border=1)
+        pdf.cell(w_note, 4.6, _s(note[:160]), border=1, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*INK)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
