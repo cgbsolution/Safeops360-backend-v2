@@ -83,6 +83,15 @@ def _eq(e: FireEquipment) -> dict[str, Any]:
         "statusOverride": e.statusOverride, "statusOverrideReason": e.statusOverrideReason,
         "statusOverriddenBy": e.statusOverriddenBy,
         "statusOverriddenAt": e.statusOverriddenAt.isoformat() if e.statusOverriddenAt else None,
+        # Register of Fire Extinguishers columns. Absent from this serialiser
+        # until now, so the asset detail page could not show the tag stencilled
+        # on the cylinder — the number an inspector actually reads off it.
+        "allottedSerialNo": e.allottedSerialNo,
+        "yearOfManufacture": e.yearOfManufacture,
+        "expiryDate": e.expiryDate.isoformat() if e.expiryDate else None,
+        "dateOfDischarge": e.dateOfDischarge.isoformat() if e.dateOfDischarge else None,
+        "weightKg": e.weightKg,
+        "registerRemarks": e.registerRemarks,
     }
 
 
