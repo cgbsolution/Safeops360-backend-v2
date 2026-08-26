@@ -128,11 +128,19 @@ def main(commit: bool) -> None:
             home_code = plant_code or FALLBACK_PLANT_CODE
             parked = "  + cross-plant" if role_code in CROSS_PLANT_ROLES else ""
 
+            # Store the address lower-cased. `/api/auth/login` lower-cases the
+            # typed email and then compares with a case-SENSITIVE `==` against
+            # the stored column, and `User_email_key` is a plain btree, so a
+            # mixed-case row is unreachable: the lookup 404s "User not found"
+            # and the unique index does not even catch the duplicate. Every
+            # pre-existing @jockeyindia.com row is lower-case for this reason.
+            email = email.lower()
+
             existing = conn.execute(
-                text('SELECT id FROM "User" WHERE lower(email) = lower(:e)'), {"e": email}
+                text('SELECT id FROM "User" WHERE lower(email) = :e'), {"e": email}
             ).first()
             params = {"n": name, "r": role_code, "p": home_id, "h": pw_hash,
-                      "d": dept, "g": designation}
+                      "d": dept, "g": designation, "e": email}
 
             if existing:
                 user_id = existing[0]
@@ -141,9 +149,9 @@ def main(commit: bool) -> None:
                 if commit:
                     conn.execute(
                         text(
-                            'UPDATE "User" SET name = :n, role = :r, "plantId" = :p, '
-                            '"passwordHash" = :h, department = :d, designation = :g, '
-                            "\"rosterStatus\" = 'active' WHERE id = :i"
+                            'UPDATE "User" SET name = :n, email = :e, role = :r, '
+                            '"plantId" = :p, "passwordHash" = :h, department = :d, '
+                            "designation = :g, \"rosterStatus\" = 'active' WHERE id = :i"
                         ),
                         {**params, "i": user_id},
                     )
@@ -158,7 +166,7 @@ def main(commit: bool) -> None:
                             '"passwordHash", department, designation, "rosterStatus", "createdAt") '
                             "VALUES (:i, :n, :e, :r, :p, :h, :d, :g, 'active', now())"
                         ),
-                        {**params, "i": user_id, "e": email},
+                        {**params, "i": user_id},
                     )
 
             if not commit:
