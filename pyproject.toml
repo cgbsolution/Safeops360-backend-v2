@@ -22,7 +22,13 @@ dependencies = [
   "email-validator>=2.2.0",
   "anthropic>=0.40.0",
   "fpdf2>=2.7.0",       # ERM report PDF export (§10f)
-  "openpyxl>=3.1.0"     # ERM report Excel (.xlsx) export (§10f)
+  "openpyxl>=3.1.0",    # ERM report Excel (.xlsx) export (§10f)
+  # Both of these were declared only in requirements.txt, which the container
+  # never reads — Dockerfile and nixpacks.toml both install from this file.
+  # segno is a module-level import in services/fire_qr.py, so its absence
+  # crashed uvicorn at boot and left the old image serving traffic.
+  "segno==1.6.6",       # QR encoding for fire-asset stickers (services/fire_qr.py)
+  "tzdata>=2024.1"      # no tz database on slim images — IST timestamps fall back to UTC
 ]
 
 [project.optional-dependencies]
