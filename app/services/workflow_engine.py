@@ -1426,6 +1426,21 @@ async def approve(
         )
         await db.flush()
 
+    # INCIDENT closure: the definition makes a closing remark mandatory, and the
+    # remark is what the record shows as the reason the incident was closed.
+    # Nothing captured it, so `closingRemark` stayed null on every closed
+    # incident and the approver's words lived only in the workflow history.
+    if task.module == "INCIDENT" and current_step.stepType == StepType.CLOSURE.value:
+        if not (comments and comments.strip()):
+            raise WorkflowError("A closing remark is required to close an incident.")
+        from app.models.incident import Incident as _IncClose
+
+        inc_row = await db.get(_IncClose, task.recordId)
+        if inc_row is not None:
+            inc_row.closingRemark = comments.strip()
+            inc_row.closedById = user_id
+            await db.flush()
+
     return await _advance(
         db,
         task=task,

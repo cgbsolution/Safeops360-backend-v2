@@ -141,6 +141,13 @@ class IncidentUpdate(BaseModel):
     costLegalRegulatory: float | None = None
     costOther: float | None = None
 
+    # Closure content. The workflow definition calls a closing remark and
+    # lessons learned mandatory at the closure step, but neither was writable:
+    # the update schema dropped them and the detail page had no editor, so the
+    # Lessons Learned section could never be anything but empty.
+    lessonsLearned: str | None = None
+    closingRemark: str | None = None
+
 
 class IncidentClassifyRequest(BaseModel):
     """HSE Manager Phase 2 classification submission. Refines type +
@@ -499,6 +506,76 @@ class IncidentOut(BaseModel):
     causeAnalysis: dict[str, Any] | None = None  # Feature 1 shared canvas model
     statutoryObligation: dict[str, Any] | None = None  # Feature 4
     costImpact: dict[str, Any] | None = None  # Feature 8
+
+    # ─── Phase 2 classification outcome ───
+    # These were written by /classify but never read back, so the detail page
+    # rendered a classified incident as though it had never been classified:
+    # the Cause Analysis, Cost, Statutory, Lessons Learned and Effectiveness
+    # Review sections were permanently empty, the statutory tab could not list
+    # the obligations it was gating closure on, and — worst — the page's
+    # "can this user manage the intelligence panels" test reads
+    # investigationTeamLead, so the appointed investigation LEAD was locked out
+    # of the cause-analysis canvas on their own investigation.
+    classifiedAt: datetime | None = None
+    classifiedById: str | None = None
+    classificationRationale: str | None = None
+    reportableUnder: list[str] | None = None
+    investigationTeamLead: str | None = None
+    investigationCharterDate: datetime | None = None
+    reporterRole: str | None = None
+    injuredPersonDesignation: str | None = None
+    rootCauseDetail: str | None = None
+
+    # ─── Phase 3 cause analysis ───
+    immediateCauses: list[str] | None = None
+    underlyingCauses: list[str] | None = None
+    rootCauses: list[str] | None = None
+    contributingFactors: list[str] | None = None
+
+    # ─── Cost breakdown ───
+    costMedical: float | None = None
+    costPropertyDamage: float | None = None
+    costLostProduction: float | None = None
+    costInsurance: float | None = None
+    costLegalRegulatory: float | None = None
+    costOther: float | None = None
+    costTotal: float | None = None
+
+    # ─── Statutory submissions ───
+    form18PreparedAt: datetime | None = None
+    form18PreparedById: str | None = None
+    form18Submitted: bool = False
+    form18SubmissionDate: datetime | None = None
+    form18SubmissionRef: str | None = None
+    dgfasliSubmitted: bool = False
+    dgfasliSubmissionDate: datetime | None = None
+    cpcbSubmitted: bool = False
+    cpcbSubmissionDate: datetime | None = None
+
+    # ─── Review, closure and post-closure ───
+    investigationReportSubmittedAt: datetime | None = None
+    hseManagerApprovedAt: datetime | None = None
+    hseManagerApprovedById: str | None = None
+    plantHeadApprovedAt: datetime | None = None
+    plantHeadApprovedById: str | None = None
+    corporateHseApprovedAt: datetime | None = None
+    corporateHseApprovedById: str | None = None
+    closingRemark: str | None = None
+    lessonsLearned: str | None = None
+    lessonsDistributedTo: list[str] | None = None
+    closedById: str | None = None
+    effectivenessReviewDueAt: datetime | None = None
+    effectivenessReviewedAt: datetime | None = None
+    effectivenessReviewedById: str | None = None
+    effectivenessRating: int | None = None
+    effectivenessNotes: str | None = None
+    linkedIncidentIds: list[str] | None = None
+    triggeredCapaIds: list[str] | None = None
+
+    # ─── SLA targets ───
+    classificationSlaTargetAt: datetime | None = None
+    investigationSlaTargetAt: datetime | None = None
+    capaSlaTargetAt: datetime | None = None
 
     model_config = {"from_attributes": True}
 

@@ -825,6 +825,14 @@ async def update_incident(
                         "costInsurance", "costLegalRegulatory", "costOther")
         )
 
+    # Closure content. Both were added to the update schema but had no
+    # application here, so the payload validated, returned 200 and changed
+    # nothing — the Lessons Learned panel reported success and saved nothing.
+    if payload.lessonsLearned is not None:
+        incident.lessonsLearned = payload.lessonsLearned or None
+    if payload.closingRemark is not None:
+        incident.closingRemark = payload.closingRemark or None
+
     if payload.investigationTeamIds is not None:
         # Replace team
         existing = (
@@ -931,7 +939,7 @@ async def classify_incident(
     if payload.isReportable and incident.occurredAt is not None:
         hours = _STATUTORY_DEADLINE_HOURS.get(payload.type)
         if hours is not None:
-            deadline = incident.occurredAt + timedelta(hours=hours)
+            deadline = _as_utc(incident.occurredAt) + timedelta(hours=hours)
 
     # Apply classification fields
     incident.type = payload.type
@@ -1055,6 +1063,21 @@ async def classify_incident(
 #  requires human acceptance; every AI/scoring action writes to the audit
 #  trail. AI endpoints are fail-soft (200 + null on provider failure).
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Attach UTC to a datetime read back from the database.
+
+    The timestamp columns are Prisma-generated and carry no zone, so SQLAlchemy
+    hands them back naive even though every writer stores UTC. Adding to a naive
+    value and writing the result back re-binds it as a zoned timestamp, which
+    Postgres then reads in the session zone — so a derived deadline came out
+    5h30m early on an Asia/Kolkata session. Normalising on the way in keeps
+    arithmetic on these columns honest.
+    """
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 async def _load_incident_for_update(
@@ -2103,7 +2126,7 @@ async def reclassify_incident(
     deadline_hours = _STATUTORY_DEADLINE_HOURS.get(payload.toType)
     new_deadline = None
     if deadline_hours is not None and incident.occurredAt is not None:
-        new_deadline = incident.occurredAt + timedelta(hours=deadline_hours)
+        new_deadline = _as_utc(incident.occurredAt) + timedelta(hours=deadline_hours)
 
     # Detect "urgent retroactive submission" — was-not-reportable, now-reportable,
     # and the deadline window has already elapsed since occurrence.
