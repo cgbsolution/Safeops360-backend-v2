@@ -19,6 +19,12 @@ _NORMALISE = {
     "TAPROOT": "TAPROOT",
     "Cause Map": "CAUSE_MAP",
     "CAUSE_MAP": "CAUSE_MAP",
+    # The CAPA module shipped its own spelling of three of these, so a CAPA
+    # saved as 5_WHY and an incident saved as FIVE_WHY were the same technique
+    # under two codes -- the CAPA one matched no template and no read view.
+    "5_WHY": "FIVE_WHY",
+    "FAULT_TREE": "FTA",
+    "TAP_ROOT": "TAPROOT",
     # NARRATIVE — structured narrative for reputational/external/strategic RCAs
     # where formal trees don't fit (added for the ERM cross-domain RCA module).
     "Narrative": "NARRATIVE",

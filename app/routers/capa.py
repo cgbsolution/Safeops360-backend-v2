@@ -72,6 +72,7 @@ from app.services.permissions import (
     get_accessible_plants_for,
 )
 from app.services import nc_rca_capa
+from app.services import rca as rca_service
 from app.services.capa_spawn import next_capa_number
 from app.services.user_directory import resolve_user_directory
 
@@ -969,11 +970,30 @@ async def submit_rca(
             f"releases the CAPA for action planning.",
         )
 
-    capa.rcaMethodology = payload.rcaMethodology
+    # One spelling per technique. The CAPA dropdown used to post 5_WHY /
+    # FAULT_TREE / TAP_ROOT where the rest of the product writes FIVE_WHY / FTA
+    # / TAPROOT; normalising on write keeps a CAPA's method matched to the
+    # template that produced it. Methods with no template (EIGHT_D, IS_IS_NOT,
+    # NONE_REQUIRED) normalise to None and are stored as sent.
+    method = rca_service.normalise_rca_method(payload.rcaMethodology) or payload.rcaMethodology
+    capa.rcaMethodology = method
     capa.rcaMethodologyRationale = payload.rcaMethodologyRationale
-    capa.rcaSummary = payload.rcaSummary
+    # A structured analysis is only meaningful against the method it was drawn
+    # with, so the two are written together or not at all.
+    capa.rcaAnalysisPayload = (
+        payload.rcaAnalysisPayload
+        if payload.rcaAnalysisPayload
+        and not rca_service.is_empty_rca_data(method, payload.rcaAnalysisPayload)
+        else None
+    )
+    # The submitter's own words win. Falling back to the generated summary means
+    # a filled-in template never lands with an empty conclusion on the register.
+    summary = (payload.rcaSummary or "").strip()
+    if not summary and capa.rcaAnalysisPayload is not None:
+        summary = rca_service.generate_rca_summary(method, capa.rcaAnalysisPayload) or ""
+    capa.rcaSummary = summary or payload.rcaSummary
     capa.contributingFactors = payload.contributingFactors
-    capa.rcaCompleted = payload.rcaMethodology != "NONE_REQUIRED"
+    capa.rcaCompleted = method != "NONE_REQUIRED"
     capa.rcaCompletedAt = datetime.now(timezone.utc) if capa.rcaCompleted else None
     capa.rcaCompletedByUserId = user.id if capa.rcaCompleted else None
 

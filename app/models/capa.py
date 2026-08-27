@@ -180,6 +180,13 @@ class Capa(Base, IdMixin, SoftDeleteMixin):
     rcaCompleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     rcaRecordId: Mapped[str | None] = mapped_column(String)
     rcaSummary: Mapped[str | None] = mapped_column(Text)
+    # The methodology-specific analysis itself, in the same shape the incident
+    # RCA editors read and write (src/lib/rca/types.ts). Keyed by rcaMethodology:
+    # FIVE_WHY -> {problemStatement, whys[], rootCause}, FISHBONE -> 6M grid, and
+    # so on. Null for a CAPA closed on a free-text summary alone, and for one
+    # whose analysis is governed by a RootCauseAnalysis row (rcaRecordId) --
+    # that record owns the payload and a second copy could disagree with it.
+    rcaAnalysisPayload: Mapped[dict | None] = mapped_column(JSON)
     contributingFactors: Mapped[list | None] = mapped_column(JSON)
     rcaCompletedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rcaCompletedByUserId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))

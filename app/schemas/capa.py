@@ -213,7 +213,13 @@ class CapaOut(BaseModel):
     rcaMethodology: str | None = None
     rcaMethodologyRationale: str | None = None
     rcaCompleted: bool
+    # Set when the analysis is owned by a governed RootCauseAnalysis row (today:
+    # every PIL/MR/F04-R1 internal-audit non-conformity). The CAPA screen keys
+    # its whole RCA tab off this -- without it in the response the screen offered
+    # a free-text RCA form that submit-rca answers with a 409, every time.
+    rcaRecordId: str | None = None
     rcaSummary: str | None = None
+    rcaAnalysisPayload: dict[str, Any] | None = None
     contributingFactors: list[Any] | None = None
     rcaCompletedAt: datetime | None = None
     rcaCompletedByUserId: str | None = None
@@ -294,11 +300,14 @@ class CapaUpdate(BaseModel):
 
 class CapaSubmitRcaRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    rcaMethodology: str = Field(description="5_WHY | FISHBONE | FAULT_TREE | BOWTIE | TAP_ROOT | CAUSE_MAP | EIGHT_D | IS_IS_NOT | NONE_REQUIRED")
+    rcaMethodology: str = Field(description="FIVE_WHY | FISHBONE | FTA | BOWTIE | TAPROOT | CAUSE_MAP | EIGHT_D | IS_IS_NOT | NONE_REQUIRED (legacy 5_WHY / FAULT_TREE / TAP_ROOT accepted and normalised)")
     rcaMethodologyRationale: str | None = None
     rcaSummary: str
     rootCauses: list[dict[str, Any]] = []  # [{description, category, confidence}]
     contributingFactors: list[str] | None = None
+    # Methodology-specific analysis, same shape as src/lib/rca/types.ts. Optional:
+    # EIGHT_D / IS_IS_NOT / NONE_REQUIRED have no template and post summary only.
+    rcaAnalysisPayload: dict[str, Any] | None = None
 
 
 class CapaActionCreateRequest(BaseModel):
