@@ -682,7 +682,13 @@ async def get_near_miss(
         db, user.id, "NEAR_MISS.READ",
         PermissionContext(record_id=nm.id, plant_id=nm.plantId, record=record),
     )
-    if not result.allowed:
+    # Workflow assignees must be able to open the record they were picked to
+    # act on. Every child endpoint below already allows this (attachments,
+    # CAPAs, actions); the parent read was the one place that did not, which
+    # 404'd the detail page for e.g. the DEPARTMENT_HEAD holding a Joint
+    # Review task whose NEAR_MISS.READ scope is OWN_DEPARTMENT. Mirrors the
+    # rule workflow_engine._rbac_triple_check already applies when they act.
+    if not result.allowed and not await _is_workflow_actor(db, user.id, nm_id):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
 
     out: dict[str, Any] = NearMissOut.model_validate(nm).model_dump()
@@ -734,6 +740,37 @@ async def get_near_miss(
         out["contractorCompany"] = (
             {"id": company.id, "name": company.name} if company else None
         )
+
+    # ── MasterItem-backed lookups ─────────────────────────────────────
+    # shiftId / activityBeingPerformed / hazardCategory / energySource all
+    # store a MasterItem id. Without the label the detail view printed the
+    # raw cuid ("Hazard cat: cmqgxcprj00...") or fell back to an em-dash.
+    mi_ids = {
+        x
+        for x in (
+            nm.shiftId,
+            nm.activityBeingPerformed,
+            nm.hazardCategory,
+            nm.energySource,
+        )
+        if x
+    }
+    mi_labels: dict[str, str] = {}
+    if mi_ids:
+        mi_labels = {
+            mid: label
+            for mid, label in (
+                await db.execute(
+                    select(MasterItem.id, MasterItem.label).where(MasterItem.id.in_(mi_ids))
+                )
+            ).all()
+        }
+    out["shift"] = (
+        {"id": nm.shiftId, "label": mi_labels.get(nm.shiftId)} if nm.shiftId else None
+    )
+    out["activityBeingPerformedLabel"] = mi_labels.get(nm.activityBeingPerformed)
+    out["hazardCategoryLabel"] = mi_labels.get(nm.hazardCategory)
+    out["energySourceLabel"] = mi_labels.get(nm.energySource)
 
     # ── Cross-module links ────────────────────────────────────────────
     out["activePermit"] = None

@@ -308,7 +308,27 @@ async def get_flra(
     flra = await db.get(FLRA, flra_id)
     if flra is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
-    record = {"leaderId": flra.leaderId}
+    # The crew belongs in the scope record, not just the leader. A crew member
+    # holding FLRA.READ at OWN_RECORDS is *required* to sign this FLRA before
+    # the linked permit can activate — leaving them out of the record meant
+    # `_matches_own_records` never matched and the page they must act on 403'd.
+    # (`_matches_own_records` already understands crewSignatures/teamMembers;
+    # this route just never handed them over.)
+    crew_ids = (
+        await db.execute(
+            select(FLRACrewSignature.userId).where(FLRACrewSignature.flraId == flra.id)
+        )
+    ).scalars().all()
+    team_ids = (
+        await db.execute(
+            select(FLRATeamMember.userId).where(FLRATeamMember.flraId == flra.id)
+        )
+    ).scalars().all()
+    record = {
+        "leaderId": flra.leaderId,
+        "crewSignatures": [{"userId": uid} for uid in crew_ids],
+        "teamMembers": [{"userId": uid} for uid in team_ids],
+    }
     result = await can(
         db,
         user.id,
@@ -349,6 +369,12 @@ async def get_flra(
                 "status": permit.status.value if hasattr(permit.status, "value") else permit.status,
                 "plant": {"id": permit_plant.id, "name": permit_plant.name} if permit_plant else None,
                 "area": {"id": area.id, "name": area.name} if area else None,
+                # The FLRA page's linked-permit banner renders location and the
+                # validity window; without these three it printed a bare
+                # "Validity — –" next to an empty location.
+                "location": permit.location,
+                "validFrom": permit.validFrom,
+                "validTo": permit.validTo,
             }
 
     # ── Crew, team, steps, declarations ───────────────────────────────

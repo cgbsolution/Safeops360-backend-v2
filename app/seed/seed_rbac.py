@@ -257,6 +257,10 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "PTW", "actions": ["READ"], "scope": "OWN_PLANT"},
         PTW_RECEIVER_EXECUTE,
         {"module": "PPE", "actions": ["READ"], "scope": "OWN_PLANT"},
+        # A Maintenance Head is routinely named the owner of a near-miss CAPA.
+        # Without READ they cannot open the record and without EXECUTE the
+        # workflow refuses the completion, so the task dead-ends.
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_PLANT"},
     ],
     "ENVIRONMENT_MANAGER": [
         {"module": "OBSERVATION", "actions": ["READ"], "scope": "OWN_PLANT"},

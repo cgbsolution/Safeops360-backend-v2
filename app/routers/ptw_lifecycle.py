@@ -99,25 +99,34 @@ _HANDBACK_ROLES = {"PERMIT_ISSUER", "SAFETY_OFFICER", "PLANT_HEAD"} | _PRIV_ROLE
 
 
 async def _load_permit_or_403(
-    db: AsyncSession, permit_id: str, user: User, op: str
+    db: AsyncSession, permit_id: str, user: User, op: str, alt_op: str | None = None
 ) -> Permit:
+    """`alt_op` is a second grant that also satisfies the gate.
+
+    The oversight-side lifecycle actions (handback inspection, isolation
+    verification) are explicitly meant for the Issuer / Safety Officer /
+    Plant Head, who are named on the permit as APPROVERS, not as
+    originator / issuer / receiver. Their PTW.UPDATE is scoped OWN_RECORDS,
+    so `_matches_own_records` never matches and they were 403'd off the very
+    step their route says is theirs — leaving no one able to record a
+    handback and no permit able to close. Same reasoning (and the same
+    fix) as POST /{id}/attachments, which already accepts UPDATE-or-APPROVE.
+    """
     permit = await db.get(Permit, permit_id)
     if permit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Permit not found")
-    result = await can(
-        db,
-        user.id,
-        op,
-        PermissionContext(
-            record_id=permit.id,
-            plant_id=permit.plantId,
-            record={
-                "originatorId": permit.originatorId,
-                "issuerId": permit.issuerId,
-                "receiverId": permit.receiverId,
-            },
-        ),
+    ctx = PermissionContext(
+        record_id=permit.id,
+        plant_id=permit.plantId,
+        record={
+            "originatorId": permit.originatorId,
+            "issuerId": permit.issuerId,
+            "receiverId": permit.receiverId,
+        },
     )
+    result = await can(db, user.id, op, ctx)
+    if not result.allowed and alt_op:
+        result = await can(db, user.id, alt_op, ctx)
     if not result.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     return permit
@@ -397,7 +406,9 @@ async def handback_inspection(
     """Issuer / Safety Officer / Plant Head walks the site after the
     Work Completed declaration and records the inspection checklist +
     photos + GPS + signature. Closure approval cannot proceed without it."""
-    permit = await _load_permit_or_403(db, permit_id, user, "PTW.UPDATE")
+    permit = await _load_permit_or_403(
+        db, permit_id, user, "PTW.UPDATE", alt_op="PTW.APPROVE"
+    )
     role_codes = await get_user_role_codes(db, user.id)
     if not any(r in _HANDBACK_ROLES for r in role_codes):
         raise HTTPException(
@@ -584,7 +595,9 @@ async def verify_isolation(
     the permit can go ACTIVE — this endpoint is what sets it (previously
     NOTHING wrote isolationVerifiedAt, so permits with isolations could
     never activate through the API)."""
-    permit = await _load_permit_or_403(db, permit_id, user, "PTW.UPDATE")
+    permit = await _load_permit_or_403(
+        db, permit_id, user, "PTW.UPDATE", alt_op="PTW.APPROVE"
+    )
     role_codes = await get_user_role_codes(db, user.id)
     if user.id != permit.receiverId and not any(
         r in _HANDBACK_ROLES for r in role_codes

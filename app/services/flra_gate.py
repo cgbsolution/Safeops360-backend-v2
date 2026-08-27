@@ -129,7 +129,21 @@ async def resolve_crew_for_flra(
 ) -> list[str]:
     """Returns the user-ids that should get FLRACrewSignature rows on creation."""
     if permit_id:
-        permit = await db.get(Permit, permit_id, options=[selectinload(Permit.workCrew)])
+        # populate_existing is load-bearing, not a tidy-up — same trap as
+        # ptw_activation_gate.can_ptw_transition_to_active. Session.get()
+        # returns the instance straight from the identity map when one is
+        # already there and silently DROPS the loader options, so workCrew
+        # stays unloaded and the read below fires a lazy load, which raises
+        # MissingGreenlet under asyncio. The only caller (POST /api/flra)
+        # always reaches here with the permit already in the session — it
+        # loads it a few lines earlier to validate the link — so without this
+        # flag EVERY permit-linked FLRA 500s on the common path.
+        permit = await db.get(
+            Permit,
+            permit_id,
+            options=[selectinload(Permit.workCrew)],
+            populate_existing=True,
+        )
         if permit:
             if permit.workCrew:
                 return list({c.userId for c in permit.workCrew})
