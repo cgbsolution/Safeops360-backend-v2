@@ -240,6 +240,10 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
     "LD_MANAGER": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "RECERT_CYCLE", "EXPORT", "COMPETENCY_CONFIGURE", "ROLE_DEF_CONFIGURE", "ASSESS", "CROSS_PERSON_VIEW", "VERSION_VIEW"], "scope": "ALL_PLANTS"},
         {"module": "TRAINING", "actions": ["CREATE", "READ", "UPDATE", "APPROVE", "EXECUTE", "VERIFY", "EXPORT"], "scope": "ALL_PLANTS"},
+        # Owns training-system CAPAs raised from incident investigations; the
+        # CAPA-execution step assigns them the task directly.
+        {"module": "INCIDENT", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["UPDATE", "EXECUTE"], "scope": "OWN_RECORDS"},
     ],
     "DEPARTMENT_HEAD": [
         {"module": "SKILL_MATRIX", "actions": ["READ", "ASSESS", "SUSPEND", "APPROVE_OVERRIDE"], "scope": "OWN_DEPARTMENT"},
@@ -261,6 +265,10 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         # Without READ they cannot open the record and without EXECUTE the
         # workflow refuses the completion, so the task dead-ends.
         {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "EXECUTE"], "scope": "OWN_PLANT"},
+        # Same for incidents: machine-guarding CAPAs from an investigation land
+        # on this role, and the fan-out step assigns the task to the owner.
+        {"module": "INCIDENT", "actions": ["READ", "EXPORT"], "scope": "OWN_PLANT"},
+        {"module": "INCIDENT", "actions": ["UPDATE", "EXECUTE"], "scope": "OWN_RECORDS"},
     ],
     "ENVIRONMENT_MANAGER": [
         {"module": "OBSERVATION", "actions": ["READ"], "scope": "OWN_PLANT"},

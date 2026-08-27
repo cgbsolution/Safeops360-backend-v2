@@ -21,7 +21,15 @@ from sqlalchemy.orm import selectinload
 
 from app.models.user import Role, RolePermission, User, UserRole
 
-PermissionScope = Literal["ALL_PLANTS", "OWN_PLANT", "OWN_DEPARTMENT", "OWN_RECORDS"]
+PermissionScope = Literal[
+    "ALL_PLANTS", "OWN_PLANT", "OWN_DEPARTMENT", "OWN_RECORDS", "WORKFLOW_ASSIGNEE"
+]
+
+# Read-only actions that a workflow assignee is always allowed on a record they
+# hold (or held) a task for. Deliberately NOT the write actions: approving,
+# executing and verifying are gated by workflow_engine._rbac_triple_check, which
+# proves the caller is the assignee for that specific step.
+_ASSIGNEE_READ_ACTIONS = frozenset({"READ", "EXPORT"})
 
 
 @dataclass
@@ -166,6 +174,14 @@ _OWNER_FIELDS = (
     "leaderId",
     "actionOwnerId",
     "responsiblePersonId",
+    # The incident investigation lead. The Phase-3 panel is one long series of
+    # writes -- cause analysis, CAPAs, timeline, witnesses, evidence, documents,
+    # cost, statutory -- and every one of them runs INCIDENT.UPDATE with the
+    # incident's record dict. A Safety Officer holds UPDATE at OWN_RECORDS, and
+    # without this field the lead the classification step just appointed was
+    # not an "owner" of the record they had been put in charge of: every write
+    # in the investigation they were assigned came back 403.
+    "investigationTeamLead",
     "issuerId",
     "receiverId",
     "inspectorId",
@@ -228,10 +244,45 @@ async def can(
             if not ctx.record_id:
                 return CanResult(allowed=True, matched_scope="OWN_RECORDS")
 
+    # ── Workflow-assignee fallback ────────────────────────────────────────
+    # The workflow can route a task to someone whose role holds this module
+    # only at a narrower scope — a DEPARTMENT_HEAD on Joint Review, a
+    # MAINTENANCE_HEAD owning a CAPA, a SUPERVISOR on a checker step. Denying
+    # the read then 404s the very record they were picked to act on. Being the
+    # assignee IS the authorisation for that one record, which is the same rule
+    # workflow_engine._rbac_triple_check already applies when they act on it.
+    # Read-only: writes stay with the engine's own check.
+    action = permission_code.rpartition(".")[2]
+    if ctx.record_id and action in _ASSIGNEE_READ_ACTIONS:
+        module = ctx.module or permission_code.rpartition(".")[0]
+        if module and await _is_workflow_assignee(db, user_id, module, ctx.record_id):
+            return CanResult(allowed=True, matched_scope="WORKFLOW_ASSIGNEE")
+
     return CanResult(
         allowed=False,
         reason=f"Permission '{permission_code}' present but scope does not include this record",
     )
+
+
+async def _is_workflow_assignee(
+    db: AsyncSession, user_id: str, module: str, record_id: str
+) -> bool:
+    """True when the user holds (or held) any WorkflowTask on this record.
+
+    Past tasks count too: a reviewer must still be able to open a record after
+    they have approved it, and an auditor reading the trail expects the actors
+    to retain visibility of what they signed.
+    """
+    from app.models.workflow import WorkflowTask
+
+    stmt = (
+        select(WorkflowTask.id)
+        .where(WorkflowTask.module == module)
+        .where(WorkflowTask.recordId == record_id)
+        .where(WorkflowTask.assignedToId == user_id)
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
 
 
 # Convenience wrappers — mirror the TS helpers

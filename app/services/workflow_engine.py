@@ -222,6 +222,26 @@ async def _enrich_record_data(
             if inc is not None:
                 merged.setdefault("reporterId", inc.reporterId)
                 merged.setdefault("plantId", inc.plantId)
+                # Condition inputs + assignee safety net. The incident
+                # definition gates four steps on `severity` (Plant Head
+                # review, Corporate HSE review, and BOTH closure steps) and
+                # one on `isReportable` (statutory submission), and resolves
+                # slaBySeverity from the same key. Only the classify endpoint
+                # ever sent them: the browser's approve / submit-execution
+                # calls carry {type, plantId, reporterId, lostDays} or nothing
+                # at all, so from the investigation step onwards every
+                # conditional step evaluated false — the workflow skipped
+                # Corporate HSE review, skipped the statutory step, and ran
+                # off the end of the definition with no CLOSURE step at all,
+                # completing the instance straight out of CAPA verification.
+                merged.setdefault(
+                    "type", inc.type.value if hasattr(inc.type, "value") else inc.type
+                )
+                merged.setdefault("severity", inc.severity)
+                merged.setdefault("isReportable", bool(inc.isReportable))
+                merged.setdefault("lostDays", inc.lostDays)
+                merged.setdefault("investigationTeamLead", inc.investigationTeamLead)
+                merged.setdefault("actionOwnerId", inc.investigationTeamLead)
         elif module == "NEAR_MISS":
             from app.models.near_miss import NearMiss
 
@@ -254,6 +274,107 @@ async def _enrich_record_data(
         # Enrichment is best-effort; never let it block task creation.
         pass
     return merged
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Incident CAPA lifecycle
+# ───────────────────────────────────────────────────────────────────────────
+
+INCIDENT_CAPA_EXECUTION_STEP = "CAPA Execution"
+INCIDENT_CAPA_VERIFY_STEP = "Safety Officer Verifies CAPAs"
+
+
+async def _sync_incident_capa_status(
+    db: AsyncSession,
+    *,
+    step_name: str,
+    action: str,
+    incident_id: str,
+    user_id: str,
+    comments: str | None,
+    attachments: list[str] | None,
+) -> None:
+    """Move IncidentCapa rows through PENDING → COMPLETED → VERIFIED as their
+    workflow tasks are submitted and verified.
+
+    Nothing wrote these columns before: rows were created by the investigation
+    step and read back by the detail page, so every CAPA on a fully closed
+    incident still displayed as PENDING with no completion date, no evidence
+    and no verifier — the CAPA lifecycle existed in the schema and in the
+    workflow but never in the data. NEAR_MISS does the same transitions from
+    its own PATCH /capas/{id} endpoint; the incident module has no such
+    endpoint, so the workflow act itself is the transition.
+
+    Best-effort: a failure here must never block the workflow.
+    """
+    from app.models.incident import IncidentCapa
+
+    now = datetime.now(timezone.utc)
+    try:
+        if step_name == INCIDENT_CAPA_EXECUTION_STEP and action == Action.EXECUTED.value:
+            # This owner's outstanding CAPAs on this incident are done. Rework
+            # rows sit at REJECTED, so they are picked up too.
+            rows = (
+                await db.execute(
+                    select(IncidentCapa)
+                    .where(IncidentCapa.incidentId == incident_id)
+                    .where(IncidentCapa.ownerId == user_id)
+                    .where(IncidentCapa.status.in_(["PENDING", "IN_PROGRESS", "REJECTED"]))
+                )
+            ).scalars().all()
+            for capa in rows:
+                capa.status = "COMPLETED"
+                capa.completedAt = now
+                if comments and comments.strip():
+                    capa.evidenceDescription = comments.strip()
+                if attachments:
+                    existing = list(capa.evidenceUrls or [])
+                    capa.evidenceUrls = existing + [a for a in attachments if a not in existing]
+
+        elif step_name == INCIDENT_CAPA_VERIFY_STEP and action == Action.VERIFIED.value:
+            rows = (
+                await db.execute(
+                    select(IncidentCapa)
+                    .where(IncidentCapa.incidentId == incident_id)
+                    .where(IncidentCapa.status == "COMPLETED")
+                )
+            ).scalars().all()
+            for capa in rows:
+                capa.status = "VERIFIED"
+                capa.verifiedById = user_id
+                capa.verifiedAt = now
+        await db.flush()
+    except Exception:  # noqa: BLE001
+        _wf_logger.exception(
+            "[incident-capa] %s: could not sync CAPA status for step %s",
+            incident_id,
+            step_name,
+        )
+
+
+async def _reject_incident_capas(db: AsyncSession, *, incident_id: str, reason: str | None) -> None:
+    """Verifier sent the CAPA step back — put the submitted rows into REJECTED
+    so their owners see the rework in the CAPA list, not a stale COMPLETED."""
+    from app.models.incident import IncidentCapa
+
+    try:
+        rows = (
+            await db.execute(
+                select(IncidentCapa)
+                .where(IncidentCapa.incidentId == incident_id)
+                .where(IncidentCapa.status == "COMPLETED")
+            )
+        ).scalars().all()
+        for capa in rows:
+            capa.status = "REJECTED"
+            capa.completedAt = None
+            if reason and reason.strip():
+                prior = (capa.evidenceDescription or "").strip()
+                note = "Returned for rework: " + reason.strip()
+                capa.evidenceDescription = (prior + chr(10) + chr(10) + note).strip() if prior else note
+        await db.flush()
+    except Exception:  # noqa: BLE001
+        _wf_logger.exception("[incident-capa] %s: could not return CAPAs for rework", incident_id)
 
 
 async def _resolve_assignee(
@@ -457,6 +578,7 @@ async def _sync_record_status(
     next_step_type: StepType | None,
     instance_completed: bool,
     actor_id: str | None = None,
+    next_step_name: str | None = None,
 ) -> None:
     """Mirror of TS syncRecordStatus(). Module-specific status mapping kept here
     to centralise the rules. Only PTW has a non-trivial status enum that the
@@ -601,6 +723,40 @@ async def _sync_record_status(
         except Exception as e:  # noqa: BLE001
             import sys
             print(f"[post-closure] NEAR_MISS {record_id}: {e}", file=sys.stderr)
+    elif module == "INCIDENT" and not instance_completed:
+        # Drive the register status alongside the workflow. Only REPORTED (on
+        # create) and CLOSED (below) were ever written, so the list page's
+        # Investigation / CAPA Assigned / Verified tabs could never match a
+        # row and every in-flight incident sat under "Reported" from the
+        # moment it was raised until the day it closed.
+        from app.models.incident import Incident as _Inc, IncidentStatus as _IncStatus
+
+        _NEXT_STEP_STATUS = {
+            "Investigation Team RCA + CAPA Definition": _IncStatus.INVESTIGATION,
+            "HSE Manager Reviews Investigation Report": _IncStatus.INVESTIGATION,
+            "Plant Head Approves Final Report": _IncStatus.INVESTIGATION,
+            "Corporate HSE Reviews": _IncStatus.INVESTIGATION,
+            "CAPA Execution": _IncStatus.CAPA_ASSIGNED,
+            "Safety Officer Verifies CAPAs": _IncStatus.CAPA_ASSIGNED,
+            "Statutory Forms Submission": _IncStatus.VERIFIED,
+            "Plant Head Final Close": _IncStatus.VERIFIED,
+            "Plant Head + Corporate HSE Joint Close": _IncStatus.VERIFIED,
+        }
+        target = _NEXT_STEP_STATUS.get(next_step_name or "")
+        if target is not None:
+            inc = await db.get(_Inc, record_id)
+            # Never walk a closed / reopened record backwards.
+            if inc is not None and inc.status != _IncStatus.CLOSED:
+                _ORDER = [
+                    _IncStatus.REPORTED,
+                    _IncStatus.INVESTIGATION,
+                    _IncStatus.CAPA_ASSIGNED,
+                    _IncStatus.VERIFIED,
+                ]
+                if _ORDER.index(target) >= _ORDER.index(inc.status):
+                    inc.status = target
+                    await db.flush()
+
     elif module == "INCIDENT" and instance_completed:
         # Mark the incident CLOSED + run the post-closure rules engine
         # (contractor score, observation cross-link, lessons distribution,
@@ -718,6 +874,9 @@ async def _create_tasks_for_step(
     strategy = step.parallelStrategy or None
 
     assignees: list[str] = []
+    # Optional per-assignee task title override (CAPA fan-out names the
+    # CAPAs each owner is being asked to execute).
+    per_assignee_title: dict[str, str] = {}
 
     if strategy == "JOINT_APPROVAL" and step.approverGroupRoles:
         # One task per role in the group, all must complete to advance.
@@ -749,6 +908,47 @@ async def _create_tasks_for_step(
             # No CAPAs defined — fall back to single task assigned to
             # the suggested action owner / initiator. The reviewer will
             # add CAPAs at the previous step normally.
+            assignees = [initiator_id]
+
+    elif strategy == "CAPA_FAN_OUT" and module == "INCIDENT":
+        # One EXECUTION task per IncidentCapa OWNER on this incident. The
+        # module argument used to be checked against "NEAR_MISS" only, so the
+        # incident definition's CAPA_FAN_OUT step fell through to the default
+        # single-task path, where approverField ACTION_OWNER resolves to
+        # nothing for an incident and the task landed on the FIRST RESPONDER
+        # who reported it — one task, wrong person, every CAPA owner idle.
+        #
+        # Deduped by owner rather than one task per row: a WorkflowTask has no
+        # column to carry which CAPA it belongs to, so two tasks for the same
+        # person on the same step would be indistinguishable in their inbox
+        # and their submissions ambiguous. One task per owner closes every
+        # CAPA that owner holds on this incident, and the task title names
+        # them. The parallel-step gate in _advance() still waits for all
+        # owners before the workflow moves to verification.
+        from app.models.incident import IncidentCapa
+
+        capa_rows = (
+            await db.execute(
+                select(IncidentCapa)
+                .where(IncidentCapa.incidentId == record_id)
+                .order_by(IncidentCapa.createdAt.asc())
+            )
+        ).scalars().all()
+        capa_titles: dict[str, list[str]] = {}
+        for capa in capa_rows:
+            if not capa.ownerId:
+                continue
+            if capa.ownerId not in capa_titles:
+                capa_titles[capa.ownerId] = []
+                assignees.append(capa.ownerId)
+            capa_titles[capa.ownerId].append(capa.capaNumber)
+        per_assignee_title = {
+            uid: f"{record_title} — {', '.join(nums)}" if record_title else ", ".join(nums)
+            for uid, nums in capa_titles.items()
+        }
+        if not assignees:
+            # No CAPAs defined — the investigation step should have blocked
+            # this, but never dead-end: route to the initiator.
             assignees = [initiator_id]
 
     elif strategy == "CAPA_ACTION_FAN_OUT" and module == "CAPA":
@@ -827,7 +1027,7 @@ async def _create_tasks_for_step(
             module=module,
             recordId=record_id,
             recordNumber=record_number,
-            recordTitle=record_title,
+            recordTitle=per_assignee_title.get(uid, record_title),
             assignedToId=uid,
             status=TaskStatus.PENDING.value,
             dueAt=due_at,
@@ -961,6 +1161,7 @@ async def initiate(
         next_step_type=next_step.stepType,
         instance_completed=False,
         actor_id=initiator_id,
+        next_step_name=next_step.name,
     )
     return instance
 
@@ -1032,6 +1233,20 @@ async def _advance(
     )
     await db.flush()
 
+    # Incident CAPA lifecycle — runs BEFORE the parallel-step gate so an owner
+    # who submits while other owners are still working still gets their own
+    # CAPAs stamped COMPLETED.
+    if task.module == "INCIDENT":
+        await _sync_incident_capa_status(
+            db,
+            step_name=current_step.name or "",
+            action=action,
+            incident_id=task.recordId,
+            user_id=user_id,
+            comments=comments,
+            attachments=attachments,
+        )
+
     # Parallel-step gate: if other PENDING tasks remain on the SAME step
     # (joint-approval reviewers still working, other CAPA owners not yet
     # done), don't advance the instance. Just record this completion and
@@ -1095,6 +1310,7 @@ async def _advance(
         next_step_type=next_step.stepType if next_step else None,
         instance_completed=next_step is None,
         actor_id=user_id,
+        next_step_name=next_step.name if next_step else None,
     )
 
     # Post-step hooks. Anything that needs to run AFTER a specific step
@@ -1406,6 +1622,9 @@ async def verify(
             )
         )
 
+        if task.module == "INCIDENT" and (current_step.name or "") == INCIDENT_CAPA_VERIFY_STEP:
+            await _reject_incident_capas(db, incident_id=task.recordId, reason=comments)
+
         rework_step = next(
             (
                 s
@@ -1528,5 +1747,6 @@ async def resubmit(
         next_step_type=next_step.stepType,
         instance_completed=False,
         actor_id=user_id,
+        next_step_name=next_step.name,
     )
     return {"ok": True, "sentTo": next_step.name}

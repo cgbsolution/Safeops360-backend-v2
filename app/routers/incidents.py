@@ -26,6 +26,7 @@ from app.models.incident import (
     IncidentType,
     IncidentWitnessStatement,
 )
+from app.models.masters import MasterItem
 from app.models.observation import Observation
 from app.models.permit import Permit
 from app.models.plant import Plant
@@ -335,10 +336,28 @@ async def create_incident(
     # Linked observations — "missed warnings" in the same area, last 90 days
     linked_observation_ids = await _detect_linked_observations(db, payload.plantId, payload.areaId)
 
-    last = (
-        await db.execute(select(func.count()).select_from(Incident).where(Incident.plantId == payload.plantId))
-    ).scalar_one()
-    number = f"INC-{occurred_at.year}-{plant.code}-{last + 1:04d}"
+    # Sequence from the highest number already issued for this plant and year,
+    # counting soft-deleted rows. Counting live rows instead meant that deleting
+    # any incident handed the next one a number that was already taken: the
+    # soft-delete loader filter hides the deleted row from the count but the
+    # UNIQUE constraint still sees it, so the very next report at that plant
+    # died on a duplicate key. Numbers are never reused — an audit trail with a
+    # recycled reference is worse than a gap.
+    prefix = f"INC-{occurred_at.year}-{plant.code}-"
+    issued = (
+        await db.execute(
+            select(Incident.number)
+            .where(Incident.plantId == payload.plantId)
+            .where(Incident.number.like(f"{prefix}%"))
+            .execution_options(include_deleted=True)
+        )
+    ).scalars().all()
+    highest = 0
+    for existing in issued:
+        tail = existing[len(prefix):]
+        if tail.isdigit():
+            highest = max(highest, int(tail))
+    number = f"{prefix}{highest + 1:04d}"
 
     incident = Incident(
         number=number,
@@ -509,6 +528,9 @@ async def create_incident(
     except Exception:  # noqa: BLE001
         pass
 
+    # Same reason as classify: anything after the refresh above that UPDATEs
+    # the incident row expires server-side columns.
+    await db.refresh(incident)
     return IncidentOut.model_validate(incident)
 
 
@@ -715,6 +737,16 @@ async def get_incident(
             )
         ).scalar_one()
     )
+
+    # Resolve the shift to its label. The column stores the MasterItem id, and
+    # the detail sidebar was printing that id verbatim, so every incident showed
+    # a 25-character cuid where the reader expected "B — Afternoon (14:00–22:00)".
+    out["shiftLabel"] = None
+    if incident.shiftId:
+        shift_row = (
+            await db.execute(select(MasterItem.label).where(MasterItem.id == incident.shiftId))
+        ).scalar_one_or_none()
+        out["shiftLabel"] = shift_row
     return out
 
 
@@ -731,7 +763,10 @@ async def update_incident(
     if incident.status == IncidentStatus.CLOSED:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Cannot edit a closed incident.")
 
-    record = {"reporterId": incident.reporterId}
+    # investigationTeamLead is an owner field: this PATCH is what the Phase-3
+    # panel's "Save Cause Analysis" calls, and the appointed lead holds
+    # INCIDENT.UPDATE only at OWN_RECORDS.
+    record = {"reporterId": incident.reporterId, "investigationTeamLead": incident.investigationTeamLead}
     result = await can(
         db, user.id, "INCIDENT.UPDATE",
         PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
@@ -801,6 +836,12 @@ async def update_incident(
             db.add(IncidentInvestigationMember(incidentId=incident.id, userId=uid, role="LEAD" if i == 0 else "MEMBER"))
 
     await db.flush()
+    # The flush's UPDATE carries a server-side onupdate for `updatedAt`, which
+    # SQLAlchemy expires so it can be re-read. Serialising without re-reading
+    # made pydantic lazy-load it from a synchronous validator, so this endpoint
+    # answered 500 on every successful save — including the investigation
+    # panel's "Save Cause Analysis". Every sibling endpoint already refreshes.
+    await db.refresh(incident)
     return IncidentOut.model_validate(incident)
 
 
@@ -999,6 +1040,12 @@ async def classify_incident(
             f"Could not approve classification step: {str(e)[:200]}",
         ) from e
 
+    # Re-read after the workflow step. Approving moves the register status to
+    # INVESTIGATION, and that second UPDATE expires `updatedAt` (server-side
+    # onupdate), so serialising the pre-approve instance would lazy-load a
+    # column from inside pydantic's synchronous validator and raise
+    # MissingGreenlet — a 500 on an otherwise successful classification.
+    await db.refresh(incident)
     return IncidentOut.model_validate(incident)
 
 
@@ -1474,13 +1521,24 @@ async def create_capa(
     if owner is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid CAPA owner")
 
-    # Generate sequential CAPA number for this incident
-    last = (
+    # Sequential CAPA number for this incident, taken from the highest suffix
+    # already issued rather than from a row count. The investigation panel lets
+    # the lead delete a CAPA that has not started, and a count would then hand
+    # the next CAPA a number the UNIQUE constraint has already seen.
+    prefix = f"{incident.number}-CAPA-"
+    issued = (
         await db.execute(
-            select(func.count()).select_from(IncidentCapa).where(IncidentCapa.incidentId == incident_id)
+            select(IncidentCapa.capaNumber)
+            .where(IncidentCapa.incidentId == incident_id)
+            .where(IncidentCapa.capaNumber.like(f"{prefix}%"))
         )
-    ).scalar_one()
-    capa_number = f"{incident.number}-CAPA-{last + 1:02d}"
+    ).scalars().all()
+    highest = 0
+    for existing in issued:
+        tail = existing[len(prefix):]
+        if tail.isdigit():
+            highest = max(highest, int(tail))
+    capa_number = f"{prefix}{highest + 1:02d}"
 
     capa = IncidentCapa(
         incidentId=incident_id,
@@ -2137,6 +2195,31 @@ async def list_attachments(
     return {"items": [AttachmentOut.model_validate(r) for r in rows]}
 
 
+async def _holds_open_incident_task(db: AsyncSession, user_id: str, incident_id: str) -> bool:
+    """True when the caller has an OPEN workflow task on this incident.
+
+    The generic INCIDENT.UPDATE gate on the attachment upload is scoped: a
+    CAPA owner (Maintenance Head, L&D Manager, Department Head) holds UPDATE
+    only at OWN_RECORDS and is not the reporter, so uploading the completion
+    evidence their own CAPA Execution task exists to collect was refused with
+    403. `can()` has a workflow-assignee fallback but deliberately limits it
+    to READ/EXPORT, leaving each write to prove its own case — this is that
+    proof: an open task on this record is the authorisation to attach
+    evidence to it, and nothing else.
+    """
+    from app.models.workflow import WorkflowTask
+
+    stmt = (
+        select(WorkflowTask.id)
+        .where(WorkflowTask.module == "INCIDENT")
+        .where(WorkflowTask.recordId == incident_id)
+        .where(WorkflowTask.assignedToId == user_id)
+        .where(WorkflowTask.status.in_(["PENDING", "OVERDUE", "ESCALATED"]))
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none() is not None
+
+
 @router.post("/{incident_id}/attachments")
 async def upload_attachment(
     incident_id: str,
@@ -2153,7 +2236,22 @@ async def upload_attachment(
         db, user.id, "INCIDENT.UPDATE",
         PermissionContext(record_id=incident.id, plant_id=incident.plantId, record=record),
     )
-    if not result.allowed:
+    # Two people may attach evidence to an incident besides those with a
+    # plant-wide INCIDENT.UPDATE grant:
+    #   • the reporter, on their own report — the Phase 1 form makes a site
+    #     photo MANDATORY for every injury type, yet a Worker holds only
+    #     INCIDENT.CREATE and READ, so the upload the form had just insisted on
+    #     was refused and silently dropped. Every injury report filed by a
+    #     worker reached the HSE Manager with an empty photo gallery and the
+    #     "no site photos attached" banner still showing.
+    #   • anyone holding an open workflow task on the record — the CAPA owners
+    #     whose whole task is to produce completion evidence.
+    is_reporter = incident.reporterId == user.id
+    if (
+        not result.allowed
+        and not is_reporter
+        and not await _holds_open_incident_task(db, user.id, incident.id)
+    ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, result.reason or "Access denied")
     if not is_storage_configured():
         raise HTTPException(
