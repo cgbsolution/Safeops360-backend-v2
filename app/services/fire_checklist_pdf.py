@@ -725,3 +725,80 @@ def render_assets(rows: list[dict[str, Any]], *, title: str = "FIRE ASSET REGIST
 
 
 __all__ = ["render_grid", "render_form", "render_register", "render_assets"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Generic register (pdfTemplateKey = GENERIC_REGISTER)
+# ═══════════════════════════════════════════════════════════════════════════
+def render_generic_register(payload: dict[str, Any]) -> bytes:
+    """Any register whose columns come from `FireRegisterViewConfig`.
+
+    `render_register` above stays exactly as it was: its column widths are
+    transcribed from PIL/EHSD/CL/028 and tuned to that sheet, and the client's
+    controlled document must not shift because a second register was added. This
+    is the other branch of `pdfTemplateKey` — which is why that field is a key
+    selecting a layout rather than a filename.
+
+    Widths are derived from the column labels rather than declared, because a
+    config-driven register cannot know its own column widths in advance. Long
+    text columns (location, remarks) get a heavier share so the two columns that
+    actually carry sentences are not the ones that wrap to nothing.
+    """
+    doc = payload.get("document") or {}
+    rows = payload.get("rows") or []
+    summary = payload.get("summary") or {}
+    columns = [tuple(c) for c in (doc.get("columns") or []) if c]
+    if not columns:
+        columns = [("equipmentCode", "Code"), ("location", "Location"), ("status", "Status")]
+
+    pdf = _Sheet("L", doc, doc.get("title", "FIRE ASSET REGISTER"))
+    pdf.alias_nb_pages()
+    pdf.add_page()
+
+    total_w = pdf.w - 16
+    WIDE = {"location", "remarks", "make", "model"}
+    NARROW = {"slNo", "status"}
+    weights = [3.0 if k in WIDE else (0.9 if k in NARROW else 1.6) for k, _ in columns]
+    scale = total_w / sum(weights)
+    widths = [w * scale for w in weights]
+
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_text_color(*INK)
+    pdf.cell(
+        total_w, 5.5,
+        _s(f"{summary.get('total', len(rows))} asset(s)   |   "
+           f"Overdue: {summary.get('overdue', 0)}   |   Due within 30 days: {summary.get('dueSoon', 0)}   |   "
+           f"Date not recorded: {summary.get('notRecorded', 0)}"),
+        border=1, new_x="LMARGIN", new_y="NEXT",
+    )
+
+    def header_band() -> None:
+        pdf.set_font("Helvetica", "B", 6.8)
+        pdf.set_fill_color(*NAVY)
+        pdf.set_text_color(255, 255, 255)
+        for (key, label), w in zip(columns, widths):
+            pdf.cell(w, 7, _s(str(label or key))[:34], border=1, align="C", fill=True)
+        pdf.ln()
+        pdf.set_text_color(*INK)
+
+    header_band()
+    pdf.set_font("Helvetica", "", 6.6)
+    for row in rows:
+        # New page before the row, not after — a header band stranded at the
+        # foot of a page is how a register loses its column names mid-table.
+        if pdf.get_y() > pdf.h - 18:
+            pdf.add_page()
+            header_band()
+            pdf.set_font("Helvetica", "", 6.6)
+        for (key, _label), w in zip(columns, widths):
+            value = row.get(key)
+            if value is None:
+                text = ""
+            elif isinstance(value, str) and len(value) >= 10 and value[4] == "-" and "T" in value:
+                text = value[:10]  # ISO timestamp → the date, which is what a register shows
+            else:
+                text = str(value)
+            pdf.cell(w, 5.6, _s(text)[:40], border=1, align="L")
+        pdf.ln()
+
+    return bytes(pdf.output())

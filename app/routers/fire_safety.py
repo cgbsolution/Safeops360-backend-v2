@@ -38,6 +38,7 @@ from app.services import fire_checklist_pdf as firepdf
 from app.services import fire_checklist_xlsx as firexlsx
 from app.services import fire_defects as defectsvc
 from app.services import fire_frequency as freqsvc
+from app.services import fire_qr as qrsvc
 from app.services import fire_permissions as perm
 from app.services import fire_safety as svc
 from app.services.access_scope import build_query_scope
@@ -77,6 +78,12 @@ def _eq(e: FireEquipment) -> dict[str, Any]:
         "nextInspectionDueDate": e.nextInspectionDueDate.isoformat() if e.nextInspectionDueDate else None,
         "inspectionFrequencyDays": e.inspectionFrequencyDays, "status": e.status, "capacitySpec": e.capacitySpec,
         "maintenanceContractor": e.maintenanceContractor, "qrCode": e.qrCode, "isActive": e.isActive,
+        # The opaque sticker value, and whether a label carrying it has been
+        # printed yet — the register's reprint column reads both.
+        "qrToken": qrsvc.token_for(e.qrToken) if e.qrToken else None,
+        "qrTokenValue": e.qrToken,
+        "qrLabelPrintedAt": e.qrLabelPrintedAt.isoformat() if e.qrLabelPrintedAt else None,
+        "qrTokenRotations": e.qrTokenRotations or 0,
         "outOfServiceReason": e.outOfServiceReason,
         "zoneId": e.zoneId, "assetSubtype": e.assetSubtype, "amcContractId": e.amcContractId,
         "frequencyMasterId": e.frequencyMasterId, "frequencyOverrideReason": e.frequencyOverrideReason,
@@ -188,7 +195,15 @@ async def create_equipment(body: EquipmentCreate, user: User = Depends(get_curre
         inspectionFrequencyDays=body.inspectionFrequencyDays, latitude=body.latitude, longitude=body.longitude,
         floorLevel=body.floorLevel, maintenanceContractor=body.maintenanceContractor, installationDate=body.installationDate,
         zoneId=body.zoneId, assetSubtype=body.assetSubtype,
+        # `qrCode` is the legacy derived sticker value, kept only so pre-cutover
+        # labels keep resolving; nothing prints from it any more.
         qrCode=f"SAFEOPS-FIRE-{code}", createdBy=user.id,
+        # The real sticker value, minted here rather than by a later backfill —
+        # an asset created after the backfill ran would otherwise have no token
+        # and refuse to print a label, which reads as a bug at the exact moment
+        # someone is trying to register and tag a new cylinder.
+        qrToken=qrsvc.new_token(),
+        qrTokenGeneratedAt=datetime.now(timezone.utc),
     )
     # Record which frequency rule governs this asset at create time, so the
     # register can show "quarterly per NBC 2016" before the first nightly run.

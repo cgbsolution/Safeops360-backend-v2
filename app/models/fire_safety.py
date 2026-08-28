@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, JSON, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, JSON, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models._base import Base, IdMixin, SoftDeleteMixin
@@ -71,7 +71,41 @@ class FireEquipment(Base, IdMixin, SoftDeleteMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, default="ACTIVE")  # computed
     capacitySpec: Mapped[str | None] = mapped_column(String)
     maintenanceContractor: Mapped[str | None] = mapped_column(String)
+    # LEGACY sticker value: `safeops:fire-asset:<this row's id>`. Kept only so
+    # labels already stuck on cylinders keep resolving through the transition —
+    # see `qrToken` below. Nothing should mint a new one.
     qrCode: Mapped[str | None] = mapped_column(String)
+
+    # ── Opaque QR token ──────────────────────────────────────────────────────
+    #
+    # The sticker used to encode the row's own id. Two things were wrong with
+    # that, and neither is fixable while the token IS the id:
+    #
+    #   * It is not opaque. Ids are sequential-ish hex from the same generator,
+    #     so one sticker photographed in a corridor tells you the shape of every
+    #     other, and a scan URL is a bearer credential — it resolves to the
+    #     asset for anyone who holds it and passes the location scope check.
+    #   * It cannot be revoked. "This label was damaged, issue a new one" has no
+    #     meaning when the value is derived: the only way to invalidate it would
+    #     be to change the row's primary key.
+    #
+    # So the token is now random and stored, and the row id never appears on a
+    # label. `secrets.token_urlsafe(32)` — 256 bits, not guessable, not ordered.
+    # Unique so a collision is a database error rather than two cylinders
+    # answering to one sticker.
+    qrToken: Mapped[str | None] = mapped_column(String)
+    qrTokenGeneratedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Rotations, not a history of old tokens. Keeping the previous value would
+    # defeat the point — a revoked label has to stop resolving, so the old token
+    # is overwritten and gone. The counter is what lets someone answer "has this
+    # label been reissued before?" without the value itself.
+    qrTokenRotations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # When a label carrying the CURRENT token was last produced. Null means the
+    # token has never been printed, so the sticker in the field is still the old
+    # derived one and this asset would go unscannable at cutover. This is the
+    # field the reprint-readiness gate counts; without it "are we ready to cut
+    # over?" is a question nobody can answer except by walking the site.
+    qrLabelPrintedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     outOfServiceReason: Mapped[str | None] = mapped_column(Text)
     isActive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
@@ -84,6 +118,17 @@ class FireEquipment(Base, IdMixin, SoftDeleteMixin):
     # not an enum that needs a migration to extend.
     assetSubtype: Mapped[str | None] = mapped_column(String)
     amcContractId: Mapped[str | None] = mapped_column(String)
+
+    # Who gets told when this asset's checklist goes overdue. Loose id, same
+    # convention as the other cross-module references on this table.
+    #
+    # NULLABLE AND EXPECTED TO BE NULL FOR NOW. Nothing on this platform has
+    # ever assigned a fire asset to a person: `maintenanceContractor` is free
+    # text naming a company, not a user. So the reminder job must behave
+    # correctly with this unset on every row — it reports the gap rather than
+    # picking someone, because a reminder sent to a guessed technician is worse
+    # than one that says nobody is assigned. See services/fire_reminders.py.
+    assignedTechnicianId: Mapped[str | None] = mapped_column(String)
 
     # `inspectionFrequencyDays` above is now an OVERRIDE, not the source of
     # truth. `frequencyMasterId` records which InspectionFrequencyMaster row was
@@ -155,6 +200,15 @@ class FireEquipment(Base, IdMixin, SoftDeleteMixin):
         Index("ix_FireEquipment_allotted", "plantId", "allottedSerialNo"),
         # The register's cylinder-life badge sorts and filters on this.
         Index("ix_FireEquipment_expiry", "expiryDate"),
+        # Every scan is a lookup by this value, so it must be an index hit — and
+        # UNIQUE, because two assets sharing a token means a sticker that
+        # resolves to an arbitrary one of them. Partial: tokens are minted per
+        # asset and NULL until backfilled, and NULLs must not collide.
+        Index("ix_FireEquipment_qrToken", "qrToken", unique=True,
+              postgresql_where=text('"qrToken" IS NOT NULL')),
+        # "which assets still carry an unprinted token" — the reprint-readiness
+        # gate runs this on every check.
+        Index("ix_FireEquipment_qrPrinted", "plantId", "qrLabelPrintedAt"),
     )
 
 
@@ -545,8 +599,68 @@ class FireRegisterViewConfig(Base, IdMixin):
     )
 
 
+class FireChecklistReminder(Base, IdMixin):
+    """One overdue checklist period, and what has been done about it.
+
+    WHY A TABLE AND NOT JUST AN EMAIL
+    ---------------------------------
+    A reminder that exists only as a sent email is a reminder nobody can audit,
+    nobody can see on the asset, and that fires again every night for as long as
+    the sheet stays unfilled. This row is what makes the escalation state:
+
+      * IDEMPOTENT — one row per (asset, template, period), so the daily sweep
+        re-notifies nobody. Enforced by a unique index, not by convention.
+      * VISIBLE — the register and the scan page read `state` off this, so an
+        inspector sees "Overdue — escalated" on the asset rather than the
+        escalation living only in an HSE manager's inbox.
+      * ANSWERABLE — "when did this become overdue, who was told, when was it
+        escalated, to whom" is one row, which is the question an auditor asks
+        about a missed statutory inspection.
+
+    Resolution is recorded, not deleted: a checklist that was three weeks late
+    and then completed is a different fact from one that was never late, and
+    deleting the row would erase the only evidence of the first.
+    """
+
+    __tablename__ = "FireChecklistReminder"
+    assetId: Mapped[str] = mapped_column(String, nullable=False)
+    templateId: Mapped[str] = mapped_column(String, nullable=False)
+    templateCode: Mapped[str | None] = mapped_column(String)
+    frequency: Mapped[str] = mapped_column(String, nullable=False)
+    period: Mapped[str] = mapped_column(String, nullable=False)
+    plantId: Mapped[str] = mapped_column(String, nullable=False)
+    # Last day of the period — the date the sheet stopped being fillable on time.
+    dueDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # PENDING → NOTIFIED → ESCALATED → RESOLVED
+    state: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
+    technicianUserId: Mapped[str | None] = mapped_column(String)
+    notifiedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    escalatedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Who the escalation went to. A list because an EHS lead is a role, not a
+    # person, and more than one may hold it at a site.
+    escalatedTo: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # True when no technician could be resolved. Recorded rather than inferred
+    # from a null id, because "nobody is assigned" and "assigned to someone who
+    # has since left" need different follow-up.
+    unassigned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    resolvedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    createdAt: Mapped[datetime] = _c()
+    updatedAt: Mapped[datetime] = _u()
+
+    __table_args__ = (
+        # One row per occurrence. This is what stops the nightly sweep sending
+        # the same reminder every night for a month.
+        Index("ix_FireChecklistReminder_occurrence", "assetId", "templateId", "period", unique=True),
+        # "what is outstanding at this site" — the register badge and the job's
+        # own resolution pass both run this.
+        Index("ix_FireChecklistReminder_plant_state", "plantId", "state"),
+        Index("ix_FireChecklistReminder_asset", "assetId", "state"),
+    )
+
+
 __all__ = [
-    "FireEquipment", "AssemblyPoint", "FireEmergencyPlan",
+    "FireEquipment", "AssemblyPoint", "FireEmergencyPlan", "FireChecklistReminder",
     "FireDrill", "FireDrillFinding", "FireIncidentLink",
     "FireZone", "InspectionFrequencyMaster", "FireAmcContract",
     "FireAssetCertificate", "FireFalseAlarmLog", "PlantNonWorkingDay",

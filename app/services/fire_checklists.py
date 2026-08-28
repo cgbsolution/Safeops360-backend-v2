@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -190,6 +190,88 @@ def period_start(frequency: str, label: str) -> datetime:
     else:
         y, m, d = int(label), 1, 1
     return datetime.combine(date(y, m, d), time.min, tzinfo=timezone.utc)
+
+
+def period_end(frequency: str, label: str) -> date:
+    """Last DAY of the period — the date the sheet stops being fillable on time.
+
+    A periodic checklist is not late the moment its period opens; it is late once
+    the period has closed with nothing approved. So this, not `period_start`, is
+    what "overdue" is measured from.
+
+    Deliberately derived from the same labels `period_label` mints, so the
+    reminder job and the register grid can never disagree about which month a
+    run belongs to — the alternative, a second cadence calculation living in the
+    job, is exactly how a reminder ends up firing for a period the grid thinks
+    is still open.
+    """
+    validate_period(frequency, label)
+    if frequency == "DAILY":
+        y, m, d = (int(x) for x in label.split("-"))
+        return date(y, m, d)
+    if frequency == "MONTHLY":
+        y, m = int(label[:4]), int(label[5:7])
+        return date(y, m, calendar.monthrange(y, m)[1])
+    if frequency == "QUARTERLY":
+        y, q = int(label[:4]), int(label[-1])
+        m = q * 3
+        return date(y, m, calendar.monthrange(y, m)[1])
+    return date(int(label), 12, 31)
+
+
+def overdue_periods(frequency: str, today: date, *, lookback_days: int) -> list[str]:
+    """Period labels that have CLOSED without being filled, newest first.
+
+    Bounded by `lookback_days` rather than walking back to the asset's
+    commissioning date: an unbounded sweep would mint a reminder row for every
+    month since the register was created the first time this job runs, burying
+    the periods anyone can still act on under years of history nobody will.
+
+    The window also means a job that has not run for a few days catches up
+    rather than silently skipping the periods it missed.
+    """
+    if lookback_days <= 0:
+        return []
+    labels: list[str] = []
+    seen: set[str] = set()
+    # Step by day so every cadence is derived from the one labelling function.
+    # At the default window this is ~45 iterations — cheaper than the DB round
+    # trip it feeds, and it cannot drift from `period_label`.
+    for back in range(0, lookback_days + 1):
+        day = today - timedelta(days=back)
+        label = period_label(frequency, day)
+        if label in seen:
+            continue
+        seen.add(label)
+        if period_end(frequency, label) < today:
+            labels.append(label)
+    return labels
+
+
+def periods_in_range(frequency: str, start: date, end: date) -> list[str]:
+    """Every period label whose period OVERLAPS [start, end], oldest first.
+
+    This is the denominator of a completion rate, and it has to be derived
+    rather than counted from existing runs: a checklist nobody ever opened has
+    no engagement row at all, so counting rows would score a site that did
+    nothing as 100% complete. What is owed comes from the cadence; what was done
+    comes from the runs.
+
+    Same labelling function as everything else, so "which month is this run in"
+    has one answer across the grid, the reminder job and the compliance rate.
+    """
+    if end < start:
+        return []
+    labels: list[str] = []
+    seen: set[str] = set()
+    day = start
+    while day <= end:
+        label = period_label(frequency, day)
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+        day += timedelta(days=1)
+    return labels
 
 
 def _month_days(year: int, month: int) -> list[date]:
@@ -810,6 +892,7 @@ def shift_window(layout: str, window: str, delta: int) -> str:
 __all__ = [
     "ChecklistError", "SOURCE_MODULE", "signature_enforced",
     "STAGE_DRAFT", "STAGE_SUBMITTED", "STAGE_REVIEWED", "STAGE_APPROVED",
+    "period_end", "overdue_periods",
     "stage_of", "is_locked", "period_label", "validate_period", "period_start",
     "grid_periods", "non_working_days", "load_template", "template_meta",
     "ordered_questions", "resolve_asset", "find_run", "get_or_create_run",

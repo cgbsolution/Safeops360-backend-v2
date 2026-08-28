@@ -605,3 +605,66 @@ def render_assets(rows: list[dict[str, Any]], *, title: str = "FIRE ASSET REGIST
 
 
 __all__ = ["render_grid", "render_form", "render_register", "render_assets", "MEDIA_TYPE"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Generic register (pdfTemplateKey = GENERIC_REGISTER)
+# ═══════════════════════════════════════════════════════════════════════════
+def render_generic_register(payload: dict[str, Any]) -> bytes:
+    """Any config-driven register as a workbook, with the autofilter.
+
+    `render_register` above stays as it is — its columns are transcribed from
+    the client's controlled sheet and must not move. This renders whatever
+    `document.columns` says, which is what makes a new register a seed row
+    rather than a second exporter.
+
+    The autofilter is the point of having this next to the PDF at all: "show me
+    every panel overdue" is one click here and a re-run of the export there.
+    """
+    doc = payload.get("document") or {}
+    rows = payload.get("rows") or []
+    summary = payload.get("summary") or {}
+    columns = [tuple(c) for c in (doc.get("columns") or []) if c]
+    if not columns:
+        columns = [("equipmentCode", "Code"), ("location", "Location"), ("status", "Status")]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = _sheet_name("Register")
+
+    subtitle = (
+        f"{summary.get('total', len(rows))} asset(s)   |   "
+        f"Overdue: {summary.get('overdue', 0)}   |   Due within 30 days: {summary.get('dueSoon', 0)}   |   "
+        f"Date not recorded: {summary.get('notRecorded', 0)}"
+    )
+    row = _title_block(ws, doc, doc.get("title") or "FIRE ASSET REGISTER", len(columns), subtitle)
+
+    head_row = row
+    for i, (_key, label) in enumerate(columns, start=1):
+        c = ws.cell(row=head_row, column=i, value=_clean(label))
+        c.font = Font(bold=True, size=9, color=WHITE)
+        c.fill = PatternFill("solid", fgColor=NAVY)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for r_i, data in enumerate(rows, start=head_row + 1):
+        for c_i, (key, _label) in enumerate(columns, start=1):
+            value = data.get(key)
+            # Dates land as real dates, not strings — otherwise sorting the
+            # register by due date sorts it lexically, which is the one thing
+            # someone opens this file to do.
+            as_date = _as_date(value) if isinstance(value, str) else None
+            cell = ws.cell(row=r_i, column=c_i, value=as_date if as_date else value)
+            if as_date:
+                cell.number_format = "DD.MM.YYYY"
+            cell.alignment = Alignment(vertical="top", wrap_text=key in ("location", "remarks"))
+
+    last_row = head_row + len(rows)
+    ws.auto_filter.ref = f"A{head_row}:{ws.cell(row=head_row, column=len(columns)).coordinate[0:1]}{max(last_row, head_row)}"
+    ws.freeze_panes = ws.cell(row=head_row + 1, column=1)
+    for i, (key, label) in enumerate(columns, start=1):
+        width = 34 if key in ("location", "remarks") else max(12, min(24, len(str(label)) + 6))
+        ws.column_dimensions[ws.cell(row=head_row, column=i).column_letter].width = width
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

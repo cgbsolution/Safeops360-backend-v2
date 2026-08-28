@@ -29,6 +29,7 @@ from app.core.db import get_db
 from app.core.deps import get_current_user, require_permission_with_context
 from app.models.capture import CaptureAttachment, CaptureSubmission, CaptureTaxonomy
 from app.models.equipment import Equipment
+from app.models.fire_safety import FireEquipment
 from app.models.observation import ObservationTaxonomy
 from app.models.plant import Area, Plant
 from app.models.user import User
@@ -94,6 +95,58 @@ async def _load(db: AsyncSession, submission_id: str) -> CaptureSubmission:
     return sub
 
 
+def _fire_asset_context(asset: FireEquipment) -> dict[str, Any]:
+    """The asset context a field report carries, and what a reader needs.
+
+    `code` and `location` are the two the reporter and the triager both read —
+    "FE-ACS-0011, Cutting Hall corridor" is what makes a finding actionable.
+    `allottedSerialNo` is the tag actually stencilled on the cylinder, which is
+    what the person standing at it can verify by eye; `type`/`subtype` are what
+    let triage route a panel fault differently from a discharged extinguisher.
+    """
+    return {
+        "id": asset.id,
+        # The sticker's opaque token, so the wizard can map a scan to this asset
+        # ON DEVICE. Without it a corridor scan would need a round-trip to learn
+        # which cylinder it is holding, which is exactly where signal is worst.
+        "qrToken": asset.qrToken,
+        "code": asset.equipmentCode,
+        "allottedSerialNo": asset.allottedSerialNo,
+        "location": asset.location,
+        "type": asset.type,
+        "subtype": asset.assetSubtype,
+        "plantId": asset.plantId,
+    }
+
+
+def _fire_asset_line(snapshot: dict[str, Any] | None) -> str | None:
+    """One human line naming the asset, for records with nowhere to put an id.
+
+    `Observation` has no asset column at all and `NearMiss.equipmentId` means an
+    `Equipment` row, so neither can hold a `FireEquipment` id without creating a
+    reference that resolves to nothing. The structured link stays on the
+    CaptureSubmission — which is the golden-thread anchor conversion already
+    records both ends of — and the converted record carries the asset in the one
+    field that is guaranteed to be read: its narrative.
+    """
+    if not snapshot:
+        return None
+    code = snapshot.get("code") or snapshot.get("id")
+    tag = snapshot.get("allottedSerialNo")
+    where = snapshot.get("location")
+    # Each part is included only when it exists. A snapshot missing its code
+    # still names the location it came from; printing "Fire asset: None" into a
+    # statutory record would be worse than naming one thing less.
+    bits: list[str] = []
+    if code:
+        bits.append(f"Fire asset: {code}")
+    if tag:
+        bits.append(f"tag {tag}")
+    if where:
+        bits.append(where if bits else f"Fire asset at {where}")
+    return " · ".join(bits) or None
+
+
 async def _attachments(db: AsyncSession, submission_id: str) -> list[CaptureAttachment]:
     return list((
         await db.execute(
@@ -112,6 +165,7 @@ async def bootstrap(user: User = Depends(get_current_user), db: AsyncSession = D
     plant = await db.get(Plant, user.plantId) if user.plantId else None
     areas: list[Area] = []
     equipment: list[Equipment] = []
+    fire_assets: list[FireEquipment] = []
     if plant is not None:
         areas = list((
             await db.execute(select(Area).where(Area.plantId == plant.id).order_by(Area.name.asc()))
@@ -129,6 +183,24 @@ async def bootstrap(user: User = Depends(get_current_user), db: AsyncSession = D
                 .limit(1000)
             )
         ).scalars().all())
+        # The same directory for fire-register assets, and for the same reason:
+        # a `safeops:fire-asset:` sticker is scanned in a corridor, which is
+        # where connectivity is worst. Without this the Context Banner would
+        # have to round-trip to name the cylinder the reporter is standing at,
+        # and would show nothing at all in a dead zone.
+        #
+        # A separate list rather than merged into `equipment`: the ids come from
+        # a different table and the wizard must not confuse the two, which is
+        # the whole reason fire assets got their own QR noun.
+        fire_assets = list((
+            await db.execute(
+                select(FireEquipment)
+                .where(FireEquipment.plantId == plant.id)
+                .where(FireEquipment.isDeleted.is_(False))
+                .order_by(FireEquipment.equipmentCode.asc())
+                .limit(1000)
+            )
+        ).scalars().all())
     settings_features = _features()
     return {
         "user": {"id": user.id, "name": user.name, "plantId": user.plantId},
@@ -138,9 +210,75 @@ async def bootstrap(user: User = Depends(get_current_user), db: AsyncSession = D
             {"id": e.id, "code": e.code, "name": e.name, "location": e.location}
             for e in equipment
         ],
+        "fireAssets": [_fire_asset_context(a) for a in fire_assets],
         "taxonomyVersion": await svc.taxonomy_version(db),
         "features": settings_features,
     }
+
+
+@router.get("/fire-asset/by-token/{token}")
+async def fire_asset_by_token(
+    token: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Resolve a scanned fire sticker to its asset, for the capture wizard.
+
+    Declared BEFORE /fire-asset/{asset_id} so "by-token" is never swallowed as
+    an asset id by the path matcher.
+
+    Accepts the current opaque token and, while legacy scanning is on, a
+    pre-reprint label carrying the bare asset id — `fire_qr.resolve` decides
+    which, because only the database can tell them apart.
+    """
+    await _require(db, user, _CREATE)
+    from app.services import fire_qr as qrsvc
+
+    asset, _how = await qrsvc.resolve(db, token)
+    if asset is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "That sticker is not in the fire register.",
+        )
+    if user.plantId and asset.plantId != user.plantId:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "That sticker belongs to a different site.",
+        )
+    return _fire_asset_context(asset)
+
+
+@router.get("/fire-asset/{asset_id}")
+async def fire_asset_context(
+    asset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Resolve one scanned fire-asset sticker, for the wizard's Context Banner.
+
+    The bootstrap already ships a plant-scoped fire asset directory so the
+    common scan resolves on-device with no connectivity. This covers the two
+    cases that directory cannot: an asset registered after the reporter's cache
+    was built, and entry into the wizard by `?fireAsset=<id>` from the fire
+    scan route rather than by scanning inside it.
+
+    Gated on CAPTURE.CREATE, not FIRE.READ. The question being asked is "may
+    this person file a report about the thing they just scanned", and a
+    contractor holding no fire grant can still be the one who finds a
+    discharged cylinder. Nothing here exposes inspection history, certificates
+    or status — only what is printed on the sticker and its location.
+    """
+    await _require(db, user, _CREATE)
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "That sticker is not in the fire register.",
+        )
+    if user.plantId and asset.plantId != user.plantId:
+        # 404 rather than 403: whether a given id exists at another site is not
+        # this reporter's business, and the actionable advice is identical.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "That sticker belongs to a different site.",
+        )
+    return _fire_asset_context(asset)
 
 
 def _features() -> dict[str, bool]:
@@ -434,6 +572,42 @@ async def create_submission(
         if equip is None or equip.plantId != plant_id or not equip.active:
             equipment_id = None
 
+    # Fire-register asset from a `safeops:fire-asset:` sticker. Rejected rather
+    # than dropped when it does not resolve — deliberately the opposite of the
+    # equipment rule above, and the difference is not an inconsistency:
+    #
+    #   * An equipment token arrives from a sticker the reporter may have
+    #     scanned incidentally while aiming at an area code. Losing the link
+    #     costs a cross-reference.
+    #   * A fire-asset token is only ever present because someone deliberately
+    #     scanned a cylinder or panel to report a finding ON IT. A report that
+    #     silently loses that link is a fire finding filed against nothing —
+    #     it reads as a generic area observation and no one re-inspects the
+    #     asset. Dropping it quietly is the more expensive failure.
+    #
+    # The wizard resolves the sticker at scan time (GET fire-asset/{id} below)
+    # and makes the reporter choose, so reaching this 400 means the asset was
+    # deleted or re-plumbed between the scan and the sync — genuinely rare, and
+    # worth an explicit message rather than a quiet downgrade.
+    fire_asset_id = payload.location.fireAssetId
+    fire_snapshot: dict[str, Any] | None = None
+    if fire_asset_id:
+        asset = await db.get(FireEquipment, fire_asset_id)
+        if asset is None or asset.isDeleted:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "That fire asset is no longer in the register, so this report cannot be "
+                "linked to it. Submit again without the scan, or ask your supervisor to "
+                "check whether the sticker is still valid.",
+            )
+        if asset.plantId != plant_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "That fire asset belongs to a different site from the one you are "
+                "reporting against.",
+            )
+        fire_snapshot = _fire_asset_context(asset)
+
     # Category: ids preferred; stable codes resolved (alias-aware) for
     # offline clients with a stale taxonomy cache.
     l1: CaptureTaxonomy | None = None
@@ -527,6 +701,8 @@ async def create_submission(
         mapPinX=payload.location.mapPinX,
         mapPinY=payload.location.mapPinY,
         equipmentId=equipment_id,
+        fireAssetId=fire_asset_id,
+        fireAssetSnapshot=fire_snapshot,
         qrScanned=payload.location.qrScanned,
         categoryL1Id=l1.id if l1 else None,
         categoryL2Id=l2.id if l2 else None,
@@ -738,6 +914,16 @@ async def convert_submission(
     from pydantic import ValidationError
 
     description = (body.description or "").strip() or svc.synth_description(sub)
+    # The scanned fire asset, named up front. Prepended rather than appended
+    # because the converted record's description is what an inspector reads
+    # first, and "which cylinder" is the question that decides whether anyone
+    # walks back out to it. Guarded on the text so a triager who already typed
+    # the code does not get it twice.
+    fire_line = _fire_asset_line(sub.fireAssetSnapshot)
+    if fire_line:
+        code = (sub.fireAssetSnapshot or {}).get("code") or ""
+        if not code or code.lower() not in description.lower():
+            description = f"{fire_line}. {description}".strip()
     # At-risk observations (UNSAFE_ACT / UNSAFE_CONDITION) are gated at >=50
     # chars by the BBS quality rule (bbs_quality.validate_quality). A terse
     # officer note — or a capture where the worker typed nothing — would 400 on
@@ -843,7 +1029,13 @@ async def convert_submission(
                 description=description,
                 potentialSeverity=module_severity,
                 areaId=sub.areaId,
+                # NOT sub.fireAssetId — `equipmentId` here means an `Equipment`
+                # row, and a FireEquipment id in it would dangle. The fire asset
+                # travels in `location` and the description; the structured link
+                # stays on the CaptureSubmission, which conversion records both
+                # ends of.
                 equipmentId=sub.equipmentId,
+                location=(sub.fireAssetSnapshot or {}).get("location") or None,
                 isAnonymous=sub.isAnonymous,
                 reporterType="ANONYMOUS" if sub.isAnonymous else "EMPLOYEE",
                 riskLikelihood=sub.hiraLikelihood,

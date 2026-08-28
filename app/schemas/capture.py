@@ -23,6 +23,11 @@ class LocationIn(BaseModel):
     mapPinX: float | None = Field(default=None, ge=0, le=100)  # % of site layout image
     mapPinY: float | None = Field(default=None, ge=0, le=100)
     equipmentId: str | None = None
+    # A fire-register asset id from a `safeops:fire-asset:` sticker. Distinct
+    # from `equipmentId` because FireEquipment and Equipment are different
+    # tables — see models/capture.py. Unlike equipmentId, an unresolvable value
+    # here is rejected rather than dropped; the submit handler explains why.
+    fireAssetId: str | None = None
     qrScanned: bool = False
 
 

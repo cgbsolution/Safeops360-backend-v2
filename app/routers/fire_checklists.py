@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.models.cams import CamsEngagement, CamsTemplate
-from app.models.fire_safety import FireEquipment, PlantNonWorkingDay
+from app.models.fire_safety import FireChecklistReminder, FireEquipment, PlantNonWorkingDay
 from app.models.user import User
 from app.services import fire_capa
 from app.services import fire_checklist_admin as admin
@@ -45,6 +45,9 @@ from app.services import fire_register as regsvc
 from app.services import fire_signoff
 from app.services import fire_permissions as perm
 from app.services import fire_qr as qrsvc
+from app.services import fire_register_config as regcfg
+from app.services import compliance_read_model as crm
+from app.services import fire_reminders as remsvc
 from app.services.access_scope import build_query_scope
 
 router = APIRouter(prefix="/api/fire", tags=["fire-safety"])
@@ -93,6 +96,23 @@ def _with_names(payload: dict[str, Any], names: dict[str, str]) -> dict[str, Any
 # ═══════════════════════════════════════════════════════════════════════════
 # QR stickers
 # ═══════════════════════════════════════════════════════════════════════════
+def _require_token(asset: FireEquipment) -> str:
+    """The asset's opaque token, or a 409 explaining how to get one.
+
+    Rendering a symbol for an asset with no token would encode the string
+    "None" — which scans perfectly and resolves to nothing. A sticker that fails
+    only once it is on a cylinder in a corridor is the worst possible outcome
+    here, so this refuses to produce one at all.
+    """
+    if not asset.qrToken:
+        raise HTTPException(
+            409,
+            f"{asset.equipmentCode} has no QR token yet, so a label would scan to "
+            "nothing. Run scripts/fire_qr_backfill.py --commit first.",
+        )
+    return asset.qrToken
+
+
 @router.get("/assets/{asset_id}/qr.png")
 async def asset_qr_png(
     asset_id: str,
@@ -105,7 +125,7 @@ async def asset_qr_png(
     if asset is None or asset.isDeleted:
         raise HTTPException(404, "Asset not found in the fire register.")
     await _require(db, user, perm.READ, plant_id=asset.plantId)
-    png = qrsvc.render_png(qrsvc.payload_for(asset.id), scale=scale)
+    png = qrsvc.render_png(qrsvc.payload_for(_require_token(asset)), scale=scale)
     return Response(
         content=png,
         media_type="image/png",
@@ -127,10 +147,50 @@ async def asset_qr_svg(
         raise HTTPException(404, "Asset not found in the fire register.")
     await _require(db, user, perm.READ, plant_id=asset.plantId)
     return Response(
-        content=qrsvc.render_svg(qrsvc.payload_for(asset.id)),
+        content=qrsvc.render_svg(qrsvc.payload_for(_require_token(asset))),
         media_type="image/svg+xml",
         headers={"Content-Disposition": f'attachment; filename="{asset.equipmentCode}-qr.svg"'},
     )
+
+
+@router.post("/assets/{asset_id}/qr-token/rotate")
+async def rotate_asset_qr_token(
+    asset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Reissue this asset's QR token — for a lost, damaged or over-painted label.
+
+    The old token stops resolving the moment this returns. There is no grace
+    period and no list of retired tokens, by design: the reason to reissue is
+    usually that the old label is somewhere you no longer control, and a
+    revocation that keeps working for a while is not a revocation.
+
+    Gated on FIRE.UPDATE rather than READ — this invalidates a physical control
+    on a fire asset and leaves the cylinder unscannable until a new label is
+    printed and applied, which is not something a read-only role should be able
+    to do. `qrLabelPrintedAt` resets to null, so the asset reappears in the
+    reprint report until someone actually prints the replacement.
+    """
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(404, "Asset not found in the fire register.")
+    await _require(db, user, perm.UPDATE, plant_id=asset.plantId)
+
+    had_token = bool(asset.qrToken)
+    token = await qrsvc.rotate_token(db, asset, actor_id=user.id)
+    await db.commit()
+    return {
+        "assetId": asset.id,
+        "equipmentCode": asset.equipmentCode,
+        "qrToken": qrsvc.token_for(token),
+        "rotations": asset.qrTokenRotations,
+        "previousTokenRevoked": had_token,
+        # Said plainly because it is the operational consequence, and whoever
+        # clicked the button is the person who has to act on it.
+        "message": (
+            "The previous label no longer resolves. Print and apply a replacement "
+            "before this asset can be scanned again."
+        ),
+    }
 
 
 @router.get("/assets/qr-sheet.pdf")
@@ -163,13 +223,28 @@ async def asset_qr_sheet(
     if not rows:
         raise HTTPException(404, "No assets matched — nothing to print.")
     rows.sort(key=lambda e: (e.location or "", e.equipmentCode))
+    missing = [e.equipmentCode for e in rows if not e.qrToken]
+    if missing:
+        raise HTTPException(
+            409,
+            f"{len(missing)} asset(s) have no QR token yet, so their labels would "
+            f"scan to nothing: {', '.join(missing[:5])}"
+            + ("…" if len(missing) > 5 else "")
+            + ". Run scripts/fire_qr_backfill.py --commit first.",
+        )
     pdf = qrsvc.sticker_sheet_pdf(
         [
-            {"id": e.id, "equipmentCode": e.equipmentCode,
+            {"id": e.id, "qrToken": e.qrToken, "equipmentCode": e.equipmentCode,
              "allottedSerialNo": e.allottedSerialNo, "location": e.location}
             for e in rows
         ]
     )
+    # Printing is the only moment the system can observe, and reprint readiness
+    # is counted from it. It records "a label was produced", NOT "a label was
+    # applied to the cylinder" — that gap is a physical walk, which is why the
+    # readiness report presents this as evidence for a human decision.
+    await qrsvc.mark_printed(db, rows)
+    await db.commit()
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -177,11 +252,58 @@ async def asset_qr_sheet(
     )
 
 
+@router.get("/scan/{token}/target")
+async def scan_target_by_token(
+    token: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Where a SCANNED STICKER lands — resolved by its opaque token.
+
+    The primary scan entry point. `resolve()` accepts the current opaque token
+    and, while `FIRE_QR_LEGACY_SCAN` is on, a pre-cutover sticker carrying the
+    bare asset id — so the estate keeps scanning through the reprint pass.
+
+    The two failure modes are reported differently on purpose. "Your sticker
+    predates the reprint" and "this sticker is not in the register" send the
+    person holding the phone to two different places, and a single 404 for both
+    would send them to the wrong one half the time.
+    """
+    asset, how = await qrsvc.resolve(db, token)
+    if asset is None:
+        if not qrsvc.legacy_scan_enabled():
+            raise HTTPException(
+                404,
+                "This sticker is not recognised. If it was printed before the QR "
+                "reprint, it has been replaced — check the cylinder for a newer "
+                "label, or ask your supervisor to reprint one.",
+            )
+        raise HTTPException(404, "That sticker refers to an asset that is not in the fire register.")
+    await _require(db, user, perm.READ, plant_id=asset.plantId)
+    payload = await _scan_target_for(db, asset)
+    # Surfaced so the scan page can tell the inspector their label is stale while
+    # it still works, rather than only at cutover when it abruptly does not.
+    payload["resolvedVia"] = how
+    return payload
+
+
 @router.get("/assets/{asset_id}/scan-target")
 async def asset_scan_target(
     asset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Where a scanned sticker should land: this asset's checklists, this period.
+    """The same payload, addressed by asset id rather than by sticker.
+
+    Kept for the in-app paths that already hold an id — the register's "open
+    checklist" action and the `?fireAsset=<id>` capture entry — which are not
+    scans and must not be made to invent a token.
+    """
+    asset = await db.get(FireEquipment, asset_id)
+    if asset is None or asset.isDeleted:
+        raise HTTPException(404, "That sticker refers to an asset that is not in the fire register.")
+    await _require(db, user, perm.READ, plant_id=asset.plantId)
+    return await _scan_target_for(db, asset)
+
+
+async def _scan_target_for(db: AsyncSession, asset: FireEquipment) -> dict[str, Any]:
+    """This asset's checklists with the CURRENT period resolved, one marked primary.
 
     Returns every checklist that applies to the asset's type with the CURRENT
     period already resolved, and marks one `primary`. The scan page sends the
@@ -191,15 +313,19 @@ async def asset_scan_target(
     annual). Guessing between four would land them on the wrong sheet three
     times out of four.
 
+    The scan page sends the inspector straight through when there is only one —
+    the extinguisher case, which is the common one — and offers a short list when
+    the asset carries several cadences, as a fire alarm panel does (daily,
+    monthly, quarterly, annual). Guessing between four would land them on the
+    wrong sheet three times out of four.
+
     Deliberately does NOT return a frontend route. Which URL renders a hydrant
     checklist is the frontend's business; this returns the asset and its
     templates, and the scan page maps them.
-    """
-    asset = await db.get(FireEquipment, asset_id)
-    if asset is None or asset.isDeleted:
-        raise HTTPException(404, "That sticker refers to an asset that is not in the fire register.")
-    await _require(db, user, perm.READ, plant_id=asset.plantId)
 
+    Callers do the permission check — this helper is reached by two routes with
+    different lookups but the same FIRE.READ requirement on the asset's plant.
+    """
     today = _now().date()
     options: list[dict[str, Any]] = []
     for tpl in await admin.list_templates(db):
@@ -247,7 +373,13 @@ async def asset_scan_target(
         },
         "options": options,
         "primaryTemplateCode": primary["templateCode"] if primary else None,
-        "qrToken": qrsvc.token_for(asset.id),
+        # The sticker's short form for the CURRENT token. None when the asset
+        # has not been backfilled yet — surfaced rather than faked, because a
+        # screen that shows a token which resolves to nothing is worse than one
+        # that says there is not a token yet.
+        "qrToken": qrsvc.token_for(asset.qrToken) if asset.qrToken else None,
+        "qrTokenGeneratedAt": asset.qrTokenGeneratedAt.isoformat() if asset.qrTokenGeneratedAt else None,
+        "qrLabelPrintedAt": asset.qrLabelPrintedAt.isoformat() if asset.qrLabelPrintedAt else None,
     }
 
 
@@ -1133,6 +1265,22 @@ async def read_register(
         rows = [e for e in rows if (e.assetSubtype or "").upper() == feType.strip().upper()]
 
     payload = await regsvc.build_register(db, rows)
+    # RETROFIT: the document-control block now comes from the seeded
+    # `FireRegisterViewConfig` row rather than the hardcoded FE_REGISTER_DOC
+    # constant, so this register is config-driven like the other two and its
+    # column order lives in one place instead of three (constant, screen, PDF).
+    #
+    # Falls back to the constant when no config row exists — an un-seeded
+    # deployment must still be able to open its statutory register, and a
+    # register that 500s because a config table is empty is a worse failure than
+    # one rendering from the shipped default.
+    cfg = await regcfg.config_for_type(db, regsvc.EXTINGUISHER,
+                                       tenant_id=getattr(user, "tenantId", None))
+    if cfg is not None:
+        payload["document"] = regcfg.document_from_config(cfg)
+        payload["unmappedColumns"] = (
+            regcfg.unmapped_columns(cfg, payload["rows"][0]) if payload["rows"] else []
+        )
     if badge:
         wanted = badge.strip().upper()
         payload["rows"] = [r for r in payload["rows"] if r["worstBadge"] == wanted]
@@ -1362,3 +1510,303 @@ async def unmark_non_working_day(
         await db.delete(row)
         await db.commit()
     return Response(status_code=204)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Config-driven branded registers (FireRegisterViewConfig)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# `FireRegisterViewConfig` was seeded with all three registers and read by
+# nothing — so "adding the next register is a seed entry, not a screen" was the
+# table's stated purpose and not yet true. These three routes are what make it
+# true: one list, one register, one export pair, all driven by the config row.
+#
+# The extinguisher keeps its own `/register/extinguishers` routes above,
+# unchanged. They are the client's controlled document with certificate-projected
+# columns, and this is deliberately additive rather than a cutover: the register
+# an auditor is handed must not change shape because a second register shipped.
+@router.get("/registers")
+async def list_registers(
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Every branded register this tenant has, for the register switcher."""
+    await _require(db, user, perm.READ)
+    configs = await regcfg.list_configs(db, tenant_id=getattr(user, "tenantId", None))
+    return {
+        "items": [
+            {
+                "assetType": c.assetType,
+                "brandName": c.brandName,
+                "routeSlug": c.routeSlug,
+                "documentNo": c.documentNo,
+                "revision": c.revision,
+                "columnCount": len(c.columns or []),
+                "isClientDocument": bool(c.supersedesNo) or c.documentNo.startswith("PIL/"),
+            }
+            for c in configs
+        ]
+    }
+
+
+@router.get("/registers/{slug}")
+async def read_config_register(
+    slug: str,
+    location: str | None = Query(None),
+    badge: str | None = Query(None, description="OVERDUE | DUE_SOON | OK | NOT_RECORDED"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One branded register: doc-control header, columns and rows, all from config."""
+    await _require(db, user, perm.READ)
+    payload = await _config_register_payload(db, user, slug, location=location)
+    if badge:
+        wanted = badge.strip().upper()
+        payload["rows"] = [r for r in payload["rows"] if r["worstBadge"] == wanted]
+        payload["filtered"] = len(payload["rows"])
+    return payload
+
+
+async def _config_register_payload(
+    db: AsyncSession, user: User, slug: str, *, location: str | None = None,
+) -> dict[str, Any]:
+    cfg = await regcfg.config_for_slug(db, slug, tenant_id=getattr(user, "tenantId", None))
+    if cfg is None:
+        raise HTTPException(404, f"No register is configured at '{slug}'.")
+    scope = await build_query_scope(db, user.id, perm.READ)
+    stmt = scope.apply(
+        select(FireEquipment)
+        .where(FireEquipment.isDeleted.is_(False))
+        .where(FireEquipment.type == cfg.assetType),
+        FireEquipment,
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    if location:
+        needle = location.strip().lower()
+        rows = [e for e in rows if needle in (e.location or "").lower()]
+    return await regcfg.build_register(db, cfg, rows)
+
+
+def _export_filename(doc: dict[str, Any], ext: str) -> str:
+    """The document number, made filesystem-safe — an auditor filing the export
+    should not have to open it to find out which controlled document it is."""
+    stem = (doc.get("documentNo") or doc.get("routeSlug") or "fire-register")
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in stem).strip("-")
+    return f"{safe}.{ext}"
+
+
+@router.get("/registers/{slug}/export.pdf")
+async def export_config_register_pdf(
+    slug: str,
+    location: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    await _require(db, user, perm.EXPORT)
+    payload = await _config_register_payload(db, user, slug, location=location)
+    doc = payload["document"]
+    # `pdfTemplateKey` selects the layout — that is why it is a key and not a
+    # filename: an unknown value degrades to the generic layout rather than
+    # failing halfway through a render.
+    render = (
+        pdfsvc.render_register
+        if doc.get("pdfTemplateKey") == regcfg.TEMPLATE_FE
+        else pdfsvc.render_generic_register
+    )
+    return Response(
+        content=render(payload), media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{_export_filename(doc, "pdf")}"'},
+    )
+
+
+@router.get("/registers/{slug}/export.xlsx")
+async def export_config_register_xlsx(
+    slug: str,
+    location: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    await _require(db, user, perm.EXPORT)
+    payload = await _config_register_payload(db, user, slug, location=location)
+    doc = payload["document"]
+    render = (
+        xlsxsvc.render_register
+        if doc.get("pdfTemplateKey") == regcfg.TEMPLATE_FE
+        else xlsxsvc.render_generic_register
+    )
+    return Response(
+        content=render(payload), media_type=xlsxsvc.MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{_export_filename(doc, "xlsx")}"'},
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Overdue reminders + escalation state
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The escalation has to be visible in the product, not only in an HSE manager's
+# inbox. An email that was sent three weeks ago and never acted on looks exactly
+# like one that was never sent, from inside the app.
+@router.get("/reminders")
+async def list_reminders(
+    plantId: str | None = Query(None),
+    state: str | None = Query(None, description="PENDING | NOTIFIED | ESCALATED | RESOLVED"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Outstanding overdue checklists, worst first — the escalation worklist."""
+    await _require(db, user, perm.READ, plant_id=plantId)
+    scope = await build_query_scope(db, user.id, perm.READ)
+    stmt = scope.apply(
+        select(FireEquipment).where(FireEquipment.isDeleted.is_(False)), FireEquipment,
+    )
+    assets = {a.id: a for a in (await db.execute(stmt)).scalars().all()}
+    if plantId:
+        assets = {k: v for k, v in assets.items() if v.plantId == plantId}
+
+    q = select(FireChecklistReminder).where(FireChecklistReminder.assetId.in_(list(assets) or [""]))
+    if state:
+        q = q.where(FireChecklistReminder.state == state.strip().upper())
+    else:
+        # Default view is what still needs doing — a list dominated by resolved
+        # history is a list nobody scans.
+        q = q.where(FireChecklistReminder.state != remsvc.STATE_RESOLVED)
+    rows = (await db.execute(q.order_by(FireChecklistReminder.dueDate.asc()))).scalars().all()
+
+    rank = {remsvc.STATE_ESCALATED: 0, remsvc.STATE_NOTIFIED: 1, remsvc.STATE_PENDING: 2}
+    rows.sort(key=lambda r: (rank.get(r.state, 9), r.dueDate))
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "assetId": r.assetId,
+                "equipmentCode": assets[r.assetId].equipmentCode if r.assetId in assets else None,
+                "location": assets[r.assetId].location if r.assetId in assets else None,
+                "templateCode": r.templateCode,
+                "frequency": r.frequency,
+                "period": r.period,
+                "dueDate": r.dueDate.isoformat() if r.dueDate else None,
+                "state": r.state,
+                "technicianUserId": r.technicianUserId,
+                "unassigned": r.unassigned,
+                "notifiedAt": r.notifiedAt.isoformat() if r.notifiedAt else None,
+                "escalatedAt": r.escalatedAt.isoformat() if r.escalatedAt else None,
+                "escalatedTo": list(r.escalatedTo or []),
+            }
+            for r in rows
+        ],
+        "escalateAfterDays": remsvc.escalate_after_days(),
+        # Surfaced so an admin can see the sweep is running in report-only mode
+        # rather than wondering why no technician was ever notified.
+        "unassignedStrategy": remsvc.unassigned_strategy(),
+    }
+
+
+@router.post("/reminders/run")
+async def run_reminder_sweep(
+    dryRun: bool = Query(True, description="preview without notifying"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Run the overdue sweep now — the same function the nightly job calls.
+
+    Defaults to a dry run: this sends real notifications, and a button that
+    emails an entire site the first time someone curious clicks it is a button
+    that gets the feature switched off. Gated on FIRE.CALENDAR, the code that
+    already governs the other schedule-affecting action on this module.
+    """
+    await _require(db, user, perm.CALENDAR)
+    result = await remsvc.sweep(db, dry_run=dryRun)
+    if not dryRun:
+        await db.commit()
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compliance completion rate — the shared read model
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ONE aggregation, served to both surfaces. The CAMS Compliance Snapshot and the
+# Operations-side completion panel call this same endpoint; neither computes
+# anything of its own. Two implementations would drift, and the first anyone
+# would notice is an auditor shown 82% on one screen and 91% on another for the
+# same asset.
+#
+# Gated on FIRE.READ like the rest of this router, which means it is also behind
+# the FIRE licence gate — so a tenant without the licence gets no numbers,
+# rather than numbers describing access it does not have.
+@router.get("/compliance")
+async def read_compliance(
+    plantId: str | None = Query(None),
+    assetId: str | None = Query(None),
+    months: int = Query(3, ge=1, le=24),
+    modules: str | None = Query(None, description="comma list; default FIRE,CHEMICAL"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Checklist completion rate over a trailing window.
+
+    `rate` is null — never 0 — when nothing was owed in the window. A site with
+    no fire assets has neither passed nor failed its fire compliance, and every
+    caller renders that as "no data".
+    """
+    await _require(db, user, perm.READ, plant_id=plantId)
+    scope = await build_query_scope(db, user.id, perm.READ)
+    visible = (
+        await db.execute(
+            scope.apply(
+                select(FireEquipment.id).where(FireEquipment.isDeleted.is_(False)), FireEquipment,
+            )
+        )
+    ).scalars().all()
+
+    asset_ids = [assetId] if assetId else list(visible)
+    if assetId and assetId not in set(visible):
+        # Out of scope reads as "no data", not as a zero — a rate of 0% for an
+        # asset the caller cannot see would leak that it exists and is failing.
+        raise HTTPException(404, "Asset not found in your scope.")
+
+    mods = (
+        [m.strip().upper() for m in modules.split(",") if m.strip()]
+        if modules else list(crm.DEFAULT_MODULES)
+    )
+    start, end = crm.default_window(months=months)
+    result = await crm.compute(
+        db, modules=mods,
+        plant_ids=[plantId] if plantId else None,
+        asset_ids=asset_ids,
+        start=start, end=end,
+    )
+    return result.as_dict()
+
+
+@router.get("/compliance/engagement/{engagement_id}")
+async def read_compliance_for_engagement(
+    engagement_id: str,
+    months: int = Query(3, ge=1, le=24),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """The Compliance Snapshot for a CAMS engagement's site.
+
+    Same aggregation as `/compliance`, addressed by the engagement an auditor
+    happens to have open — so the CAMS panel does not have to know how to map an
+    engagement to a plant, and cannot get that mapping subtly different from the
+    Operations side.
+    """
+    eng = await db.get(CamsEngagement, engagement_id)
+    if eng is None:
+        raise HTTPException(404, "Engagement not found.")
+    plant_id = eng.siteId
+    await _require(db, user, perm.READ, plant_id=plant_id)
+    start, end = crm.default_window(months=months)
+    result = await crm.compute(
+        db, plant_ids=[plant_id] if plant_id else None, start=start, end=end,
+    )
+    payload = result.as_dict()
+    payload["engagement"] = {
+        "id": eng.id,
+        "code": eng.engagementCode,
+        "siteId": plant_id,
+        "sourceModule": eng.sourceModule,
+    }
+    return payload

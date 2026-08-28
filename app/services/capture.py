@@ -241,6 +241,12 @@ def submission_out(
         "mapPinX": sub.mapPinX,
         "mapPinY": sub.mapPinY,
         "equipmentId": sub.equipmentId,
+        # The snapshot, not a re-read of the live asset: what the report says
+        # about where the finding was made must not change when the cylinder is
+        # re-tagged or moved. `fireAssetId` is there for callers that want the
+        # current record.
+        "fireAssetId": sub.fireAssetId,
+        "fireAsset": sub.fireAssetSnapshot,
         "qrScanned": sub.qrScanned,
         "categoryL1Id": sub.categoryL1Id,
         "categoryL2Id": sub.categoryL2Id,

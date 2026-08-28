@@ -71,6 +71,24 @@ class CaptureSubmission(Base, IdMixin, TimestampMixin, SoftDeleteMixin):
     equipmentId: Mapped[str | None] = mapped_column(String)
     qrScanned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # A fire-register asset (extinguisher, alarm panel, hydrant) scanned from its
+    # sticker. SEPARATE from `equipmentId` on purpose: that column holds a Field
+    # Capture `Equipment` id, and `FireEquipment` is a different table with
+    # different ids. Writing one into the other yields a row that looks linked
+    # and resolves to nothing — which is exactly the defect this column fixes,
+    # since the scanner has been parsing `safeops:fire-asset:` tokens into a
+    # `fireAssetId` that no caller has ever stored.
+    #
+    # Loose id, no FK — same convention as `equipmentId` and the linked*Ids
+    # above, and the two tables are owned by different modules.
+    fireAssetId: Mapped[str | None] = mapped_column(String, index=True)
+    # {code, allottedSerialNo, location, type, subtype, plantId} as they were at
+    # submit time. Snapshotted for the same reason `categorySnapshot` is: a
+    # cylinder gets condemned, re-tagged or moved, and a report that renders
+    # today's asset record is a report that misstates where the finding was
+    # made. The live row is still reachable through `fireAssetId` when it exists.
+    fireAssetSnapshot: Mapped[dict | None] = mapped_column(JSON)
+
     # category = two CaptureTaxonomy(kind=HAZARD) levels; snapshot keeps the
     # labels as shown at submit time so history survives taxonomy edits.
     categoryL1Id: Mapped[str | None] = mapped_column(String, index=True)

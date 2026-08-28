@@ -172,26 +172,27 @@ _ROUTERS = {
     # for any registered entity. Mounted ungated; each endpoint re-checks the
     # entity's own read/write permission via the evidence registry.
     "attachments": attachments,
-    # Fire Safety (FIRE module). Mounted always-on in dev: the unsigned dev licence
-    # predates the FIRE code, so gating it via ROUTER_MODULE would 403 it. The FIRE
-    # module IS registered in the licensing model (registry/editions) — add
-    # "fire_safety": "FIRE" to ROUTER_MODULE once a FIRE-inclusive licence is issued.
+    # Fire Safety (FIRE module) — now gated via ROUTER_MODULE, with fire_checklists
+    # and chemical, as the Operations bundle. It was mounted always-on because the
+    # dev licence predates the FIRE code; that made the register reachable on every
+    # deployment regardless of licence, which is the opposite of a bootstrap being
+    # harmless. A licence that predates FIRE now has to be reissued to carry it.
     "fire_safety": fire_safety,
     # The Page Industries controlled checklists (PIL/EHS/CL 025-028) and the
-    # Register of Fire Extinguishers. Same /api/fire prefix and the same
-    # INCIDENT.READ/UPDATE gating as fire_safety — split into its own module only
-    # to keep that router from growing past 1,500 lines. Adds no tables: the
-    # checklists run on the CAMS engine.
+    # Register of Fire Extinguishers. Same /api/fire prefix and the same FIRE
+    # licence gate as fire_safety — split into its own module only to keep that
+    # router from growing past 1,500 lines. Adds no tables: the checklists run on
+    # the CAMS engine, but they gate on FIRE, not CAMS.
     "fire_checklists": fire_checklists,
     # Guided Field Capture (CAPTURE module) — same dev-licence situation as
     # fire_safety: registered in the licensing model, mounted ungated until a
     # CAPTURE-inclusive licence is issued ("capture": "CAPTURE" in ROUTER_MODULE).
     "capture": capture,
-    # Chemical / Hazmat Management. Same dev-licence situation as fire_safety and
-    # capture: mounted ungated, with per-endpoint RBAC (INCIDENT.READ/UPDATE plus
-    # ADMIN.MANAGE for the threshold/incompatibility masters) as the real gate.
-    # Add "chemical": "CHEMICAL" to ROUTER_MODULE once a CHEMICAL-inclusive
-    # licence is issued.
+    # Chemical / Hazmat Management — gated on CHEMICAL via ROUTER_MODULE, the
+    # other half of the Operations bundle. Per-endpoint RBAC is now CHEMICAL.*
+    # (services/chemical_permissions.py); it previously borrowed INCIDENT.READ /
+    # INCIDENT.UPDATE, which handed the whole hazmat inventory to WORKER and
+    # CONTRACTOR_WORKMAN — the same bootstrap defect fire_safety already fixed.
     "chemical": chemical,
     # Daily Alert Brief (ALERTS module) — same dev-licence situation; add
     # "alerts": "ALERTS" to ROUTER_MODULE once a licence including it is issued.

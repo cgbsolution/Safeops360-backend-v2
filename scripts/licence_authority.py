@@ -40,6 +40,25 @@ _BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
+# Windows consoles default to cp1252. Issuing a licence and then dying while
+# printing the confirmation is the worst possible failure here — the .lic is
+# already written and signed, but the operator sees a traceback and assumes it
+# is not.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# The app reaches os.environ through app.core.config's load_dotenv; this script
+# deliberately does not import app config (it must run without a database), so
+# it loads `.env` itself. Without this, LICENCE_DEV_PUBLIC_KEYS set in a dev
+# .env is invisible here and the self-verify below warns that a key it should
+# trust is untrusted. override=False keeps real OS env vars authoritative.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(os.path.join(_BACKEND_ROOT, ".env"), override=False)
+except ImportError:  # python-dotenv absent on a minimal Authority host — fine
+    pass
+
 from app.licensing import keys  # noqa: E402
 from app.licensing.crypto import (  # noqa: E402
     LicenceSignatureError,
@@ -206,8 +225,12 @@ def cmd_issue(args: argparse.Namespace) -> None:
     # Sanity: verify with the embedded public key for this kid before delivery.
     public_pem = keys.get_public_key(kid)
     if public_pem is None:
-        print(f"⚠️  WARNING: kid {kid!r} is not embedded in app/licensing/keys.py — "
-              "the client app will REJECT this licence until you embed it.")
+        print(f"!!  WARNING: kid {kid!r} is neither embedded in app/licensing/keys.py nor "
+              "reachable via LICENCE_DEV_PUBLIC_KEYS — the client app will REJECT this "
+              "licence until one of those trusts it.")
+        print("    Production keys go in keys.py. A local dev key should instead be left "
+              "in .licence_keys/ with LICENCE_DEV_PUBLIC_KEYS=.licence_keys set in that "
+              "install's .env, so it is never trusted by a client build.")
     else:
         try:
             verify_compact(token, public_pem)

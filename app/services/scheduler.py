@@ -81,6 +81,11 @@ async def _job_fire_status(db) -> dict:
     return await recompute_all_statuses(db)
 
 
+async def _job_fire_checklist_overdue(db) -> dict:
+    from app.services.fire_reminders import sweep
+    return await sweep(db)
+
+
 async def _job_compliance(db) -> dict:
     from app.services.erm_p2 import generate_tasks, refresh_statuses
     a = await refresh_statuses(db)
@@ -353,6 +358,12 @@ JOBS: dict[str, Job] = {j.id: j for j in [
     Job("incident_risk_alerts", "Incident → ERM risk review flag (I-04)", 6 * HOUR, _job_incident_alerts),
     Job("cams_repeat_findings", "CAMS repeat-finding detection", 12 * HOUR, _job_cams_repeats),
     Job("fire_equipment_status", "Fire equipment status recompute", 1 * DAY, _job_fire_status),
+    # Daily, not hourly: "this sheet is late" changes once a day at most, and an
+    # overdue notice that arrives four times before lunch trains people to
+    # ignore it. Escalation to the EHS lead happens inside the same sweep at
+    # due+N, so there is one job here rather than a reminder job and an
+    # escalation job that could disagree about what is outstanding.
+    Job("fire_checklist_overdue", "Fire checklist overdue reminders + escalation", 1 * DAY, _job_fire_checklist_overdue),
     Job("chemical_sds_review", "Chemical SDS review-due sweep", 1 * DAY, _job_chemical_sds_review),
     Job("chemical_threshold_sweep", "Chemical regulatory-threshold re-evaluation", 6 * HOUR, _job_chemical_threshold_sweep),
     Job("compliance_tasks", "Compliance status + task generation", 1 * DAY, _job_compliance),

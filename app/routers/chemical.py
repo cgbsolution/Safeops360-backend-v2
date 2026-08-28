@@ -4,11 +4,17 @@ Chemical master data, the site inventory ledger, storage assignment with
 co-storage enforcement, regulatory-threshold tracking with the auto-MOC trigger,
 disposal records and the MOC trigger log.
 
-RBAC uses the existing HSE codes (INCIDENT.READ / INCIDENT.UPDATE) plus
-ADMIN.MANAGE for the config masters, matching how fire_safety.py bootstrapped
-before dedicated grants were seeded. Swap the two constants below for CHEMICAL.*
-codes once a licence including them is issued — every endpoint reads them, so it
-is a two-line change rather than an audit.
+RBAC is `CHEMICAL.*` via services/chemical_permissions.py, which also carries the
+migration ramp back to the legacy codes while a deployment's RBAC is un-reseeded.
+Until that swap this router borrowed INCIDENT.READ / INCIDENT.UPDATE, which
+handed the entire hazmat inventory — quantities, storage locations and the
+regulatory-threshold dashboard — to WORKER and CONTRACTOR_WORKMAN, and withheld
+it from AUDITOR. That is the same bootstrap defect fire_safety.py fixed, fixed
+the same way.
+
+The router is also licence-gated on CHEMICAL (`ROUTER_MODULE`), with fire_safety
+and fire_checklists on FIRE — the two codes that together are the Operations
+bundle. There is no separate OPERATIONS module code and deliberately so.
 
 Error-handling convention: `LedgerError` and `SdsError` are operator errors with
 an actionable message and become 400/409. Anything else propagates to the app's
@@ -46,23 +52,28 @@ from app.models.user import User
 from app.services import chemical_hira
 from app.services import chemical_incompatibility as incompat
 from app.services import chemical_ledger as ledger
+from app.services import chemical_permissions as chemperm
 from app.services import chemical_sds as sds
 from app.services import chemical_stock_verification as stockverify
 from app.services.access_scope import build_query_scope
 from app.services.chemical_threshold import evaluate_thresholds
-from app.services.permissions import PermissionContext, can
 
 router = APIRouter(prefix="/api/chemicals", tags=["chemicals"])
 
-_READ = "INCIDENT.READ"
-_WRITE = "INCIDENT.UPDATE"
-# Config masters (ThresholdRule, IncompatibilityMatrix, region mapping) are
-# Admin-only per the build spec's role table. `CONFIGURATION.MASTERS` is the
-# platform's existing code for master-data configuration and is held by ADMIN /
-# ADMIN only — an invented code like "ADMIN.MANAGE" would not exist in
-# the permission catalogue, and `can()` fails closed on an unknown code, so
-# those endpoints would have 403'd for everyone including administrators.
-_ADMIN = "CONFIGURATION.MASTERS"
+# The module's own codes. `chemperm` keeps the legacy fallback in one place, so
+# a deployment whose RBAC has not been reseeded still works and one that has
+# gets the real grants — see services/chemical_permissions.py.
+_READ = chemperm.READ
+_CREATE = chemperm.CREATE
+_WRITE = chemperm.UPDATE
+# Config masters (ThresholdRule, IncompatibilityMatrix, region mapping) keep
+# their own code rather than folding into _WRITE. The threshold rules decide
+# when a site crosses a *regulatory* reporting limit and the matrix decides what
+# may be stored beside what: a storekeeper who can book stock in must not be
+# able to raise the threshold that would otherwise have flagged it. This was
+# CONFIGURATION.MASTERS, which chemical_permissions still degrades to while the
+# CHEMICAL grants are un-seeded.
+_ADMIN = chemperm.CONFIGURE
 
 
 def _tenant(user: User) -> str:
@@ -73,9 +84,9 @@ def _tenant(user: User) -> str:
 
 
 async def _require(db: AsyncSession, user: User, perm: str, plant_id: str | None = None) -> None:
-    res = await can(db, user.id, perm, PermissionContext(plant_id=plant_id))
-    if not res.allowed:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, res.reason or "Access denied")
+    """Every endpoint's gate. Delegates so the un-reseeded-RBAC ramp lives in one
+    place rather than being re-implemented per call site."""
+    await chemperm.require(db, user, perm, plant_id)
 
 
 def _iso(d: datetime | None) -> str | None:
@@ -296,6 +307,22 @@ class IncompatibilityCreate(BaseModel):
     rationale: str | None = None
 
 
+@router.get("/capabilities")
+async def read_capabilities(
+    plantId: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """What this principal may do, so a screen can hide what it cannot offer.
+
+    Mirrors /api/fire/checklists/capabilities. `rbacSeeded` in the response is
+    what lets an admin screen surface the migration state: while it is false the
+    chemical routes are still running on the borrowed INCIDENT.* grants, which
+    means contractors can still read the inventory.
+    """
+    return await chemperm.capabilities(db, user, plantId)
+
+
 # ═══ Chemical master (§7 #1, #2) ══════════════════════════════════════════════
 @router.get("/masters")
 async def list_chemicals(
@@ -347,7 +374,7 @@ async def create_chemical(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    await _require(db, user, _WRITE)
+    await _require(db, user, _CREATE)
     unknown = [h for h in payload.hazardClasses if h not in HAZARD_CLASSES]
     if unknown:
         raise HTTPException(
@@ -534,7 +561,7 @@ async def create_storage_location(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    await _require(db, user, _WRITE, payload.plantId)
+    await _require(db, user, _CREATE, payload.plantId)
     loc = ChemicalStorageLocation(
         tenantId=_tenant(user), createdBy=user.id, **payload.model_dump()
     )
@@ -612,7 +639,7 @@ async def create_inventory_item(
 ) -> dict[str, Any]:
     """Create a batch. Any opening quantity is posted as a RECEIPT ledger row —
     there is no path in this API that writes a quantity onto the item."""
-    await _require(db, user, _WRITE, payload.plantId)
+    await _require(db, user, _CREATE, payload.plantId)
     tenant = _tenant(user)
 
     item = ChemicalInventoryItem(

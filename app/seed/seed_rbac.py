@@ -103,6 +103,22 @@ EXTRA_PERMISSIONS = [
     {"code": "FIRE.TEMPLATE_AUTHOR", "module": "FIRE", "action": "TEMPLATE_AUTHOR", "description": "Create / edit / clone fire checklist templates"},
     {"code": "FIRE.TEMPLATE_APPROVE", "module": "FIRE", "action": "TEMPLATE_APPROVE", "description": "Publish or retire a fire checklist revision"},
     {"code": "FIRE.CALENDAR", "module": "FIRE", "action": "CALENDAR", "description": "Mark plant non-working days on the daily checklist grids"},
+    # CHEMICAL — Chemical / Hazmat Management, the other half of the Operations
+    # bundle. Kept out of OPERATIONAL_MODULES for the same reason as FIRE: the
+    # blanket `for m in OPERATIONAL_MODULES` grants below would hand the hazmat
+    # inventory to every role this matrix has never reviewed for chemical, which
+    # is precisely the defect being fixed — the module borrowed INCIDENT.READ,
+    # and WORKER / CONTRACTOR_WORKMAN hold that at a scope which widens to the
+    # whole plant.
+    #
+    # Four codes, not nine: the router only ever distinguishes read / create /
+    # write / configure, and there is no printed sign-off block here to give
+    # EXECUTE-VERIFY-APPROVE any meaning. No DELETE — chemical records are
+    # statutory and the module retires by status change, never by removal.
+    {"code": "CHEMICAL.READ", "module": "CHEMICAL", "action": "READ", "description": "Read the chemical register, inventory, ledger and threshold dashboards"},
+    {"code": "CHEMICAL.CREATE", "module": "CHEMICAL", "action": "CREATE", "description": "Add a chemical to the master, a storage location, or an inventory item"},
+    {"code": "CHEMICAL.UPDATE", "module": "CHEMICAL", "action": "UPDATE", "description": "Edit a chemical, upload an SDS, move / transfer / dispose stock, reconcile a count"},
+    {"code": "CHEMICAL.CONFIGURE", "module": "CHEMICAL", "action": "CONFIGURE", "description": "Manage regulatory-threshold rules and the storage incompatibility matrix"},
 ]
 
 
@@ -326,6 +342,47 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "EPC", "actions": ["READ", "GATE_OVERRIDE"], "scope": "OWN_PLANT"},
     ],
 }
+
+# ── CHEMICAL — the other half of the Operations bundle ───────────────────────
+#
+# Merged in after the literal rather than written into it, because several role
+# blocks above are built from comprehensions (`for m in [...]`) and a dict
+# literal cannot be dropped into the middle of one.
+#
+# Restated on this side at all because step 3 of this seeder DELETES every
+# RolePermission row before rebuilding from this matrix: without these, a
+# `python -m app.seed.seed_rbac` run silently wipes every chemical grant that
+# prisma/seed-rbac.ts created. That is the same trap FIRE is documented against
+# a few lines up, and the reason the two seeders have to be edited together.
+#
+# WORKER, CONTRACTOR_WORKMAN and GATE_GUARD are absent deliberately — they are
+# the roles that could read the whole hazmat inventory through the borrowed
+# INCIDENT.READ grant, which is the defect being closed.
+_CHEMICAL_GRANTS: dict[str, tuple[list[str], str]] = {
+    "STORE_KEEPER":                   (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
+    "SUPERVISOR":                     (["READ"], "OWN_PLANT"),
+    "SAFETY_OFFICER":                 (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
+    "HSE_MANAGER":                    (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
+    "PLANT_HEAD":                     (["READ"], "OWN_PLANT"),
+    "CORPORATE_HSE":                  (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
+    "DEPARTMENT_HEAD":                (["READ"], "OWN_PLANT"),
+    "MAINTENANCE_HEAD":               (["READ"], "OWN_PLANT"),
+    "ENVIRONMENT_MANAGER":            (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
+    "OCCUPATIONAL_HEALTH_OFFICER":    (["READ"], "OWN_PLANT"),
+    "EMERGENCY_RESPONSE_COORDINATOR": (["READ"], "OWN_PLANT"),
+    "INDUSTRIAL_HYGIENIST":           (["READ"], "OWN_PLANT"),
+    "SITE_HSE_MANAGER":               (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
+    "EXTERNAL_ASSESSOR":              (["READ"], "OWN_PLANT"),
+    "ADMIN":                          (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
+    "SYSTEM_ADMIN":                   (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
+}
+# Scope note: SUPERVISOR and DEPARTMENT_HEAD get OWN_PLANT, not the
+# OWN_DEPARTMENT that FIRE uses for them. OWN_DEPARTMENT does not resolve to
+# anything app-wide today, so granting it here would read as "restricted" while
+# actually taking away the plant-wide chemical read they have right now.
+for _role, (_actions, _scope) in _CHEMICAL_GRANTS.items():
+    if _role in ROLE_GRANTS:
+        ROLE_GRANTS[_role].append({"module": "CHEMICAL", "actions": _actions, "scope": _scope})
 
 # ADMIN absorbs SYSTEM_ADMIN. The two were meant to be aliases and had drifted,
 # so take the UNION rather than pick one — that keeps every capability that

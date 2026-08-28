@@ -41,6 +41,26 @@ ROUTER_MODULE: dict[str, str | None] = {
     "ptw_reports": "PTW",
     "flra": "FLRA",
     "incidents": "INCIDENT",
+    # ── The Operations bundle: Fire & Life Safety + Chemical/Hazmat ──
+    #
+    # These three routers were mounted UNGATED, so every deployment could reach
+    # the fire register, the checklist engine and the full chemical inventory
+    # regardless of what its licence granted. That was a bootstrap left over
+    # from before FIRE and CHEMICAL existed as codes, not a decision.
+    #
+    # There is deliberately NO "OPERATIONS" module code. Fire and Chemical/
+    # Hazmat together ARE the Operations bundle, gated on the two codes that
+    # already exist — inventing a third would mean a new vocabulary in the
+    # registry, both RBAC seeders and every issued licence, to express something
+    # these two already express.
+    #
+    # `fire_checklists` gates on FIRE rather than CAMS even though a checklist
+    # run IS a CamsEngagement: the authority being licensed is the fire
+    # register's periodic inspection, and a CAMS-only client must not get the
+    # fire checklist engine for free by owning the engine it happens to run on.
+    "fire_safety": "FIRE",
+    "fire_checklists": "FIRE",
+    "chemical": "CHEMICAL",
     # ── Risk Management ──
     "hira": "HIRA",
     "eai": "EAI",

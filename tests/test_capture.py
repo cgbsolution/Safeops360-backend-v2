@@ -80,6 +80,7 @@ def test_submission_out_masks_anonymous_reporter():
         id="s1", number="FLD-2026-NW-0001", clientSubmissionId="c1", type="observation",
         status="submitted", isAnonymous=True, reporter=reporter, reporterId=None,
         plantId="p1", areaId=None, mapPinX=None, mapPinY=None, equipmentId=None,
+        fireAssetId=None, fireAssetSnapshot=None,
         qrScanned=False, categoryL1Id=None, categoryL2Id=None, categorySnapshot=None,
         aiSuggested=False, aiConfidence=None, severitySelfReported="high",
         description=None, voiceLangCode=None, transcriptOriginal=None,
@@ -296,3 +297,89 @@ def test_stop_pair_from_snapshot_is_empty_when_category_was_skipped():
     sub = SimpleNamespace(categorySnapshot={"stop": {"axis": "ACT"}})
     assert svc.stop_pair_from_snapshot(sub) == (None, None)
     assert svc.stop_pair_from_snapshot(SimpleNamespace(categorySnapshot=None)) == (None, None)
+
+
+# ── fire-asset link (Build 1) ─────────────────────────────────────────────────
+#
+# `qr-scanner.tsx` parsed `safeops:fire-asset:` tokens into a `fireAssetId` that
+# `wizard.tsx` never read and `capture.py` had nowhere to put — so a scanned
+# cylinder produced a report linked to nothing, silently. These cover the pieces
+# that can be tested without a database; the resolve/reject path itself needs a
+# live asset and is exercised in the live checks.
+def test_location_payload_carries_a_fire_asset_id():
+    from app.schemas.capture import LocationIn
+
+    loc = LocationIn(areaId="a1", fireAssetId="fa-9", qrScanned=True)
+    assert loc.fireAssetId == "fa-9"
+    # It must not collide with the Equipment link — different tables, and one id
+    # in the other's column resolves to nothing.
+    assert loc.equipmentId is None
+    assert LocationIn().fireAssetId is None
+
+
+def test_fire_asset_context_carries_what_a_reader_needs():
+    from app.routers.capture import _fire_asset_context
+
+    asset = SimpleNamespace(
+        id="fa-1", equipmentCode="FE-ACS-0011", allottedSerialNo="36773",
+        location="Cutting Hall corridor", type="FIRE_EXTINGUISHER",
+        assetSubtype="CO2", plantId="p1", qrToken="opaque-token-value",
+    )
+    ctx = _fire_asset_context(asset)
+    assert ctx["code"] == "FE-ACS-0011"
+    # Shipped so a scanned sticker resolves to this asset on-device, in the
+    # corridor where signal is worst.
+    assert ctx["qrToken"] == "opaque-token-value"
+    assert ctx["allottedSerialNo"] == "36773"
+    assert ctx["location"] == "Cutting Hall corridor"
+    assert ctx["type"] == "FIRE_EXTINGUISHER"
+    assert ctx["plantId"] == "p1"
+
+
+def test_fire_asset_line_names_the_asset_for_converted_records():
+    from app.routers.capture import _fire_asset_line
+
+    line = _fire_asset_line({
+        "code": "FE-ACS-0011", "allottedSerialNo": "36773",
+        "location": "Cutting Hall corridor",
+    })
+    assert "FE-ACS-0011" in line
+    assert "36773" in line
+    assert "Cutting Hall corridor" in line
+
+
+def test_fire_asset_line_degrades_without_tag_or_location():
+    from app.routers.capture import _fire_asset_line
+
+    assert _fire_asset_line(None) is None
+    # Nothing to name -> no line at all, rather than "Fire asset: None" in a
+    # statutory record.
+    assert _fire_asset_line({}) is None
+    assert _fire_asset_line({"code": "P-01"}) == "Fire asset: P-01"
+    assert _fire_asset_line({"location": "Pump room"}) == "Fire asset at Pump room"
+
+
+def test_submission_out_exposes_the_fire_asset_snapshot():
+    # The snapshot, not a re-read: a report must keep saying where the finding
+    # was made after the cylinder is re-tagged or moved.
+    snap = {"id": "fa-1", "code": "FE-ACS-0011", "location": "Cutting Hall corridor"}
+    sub = SimpleNamespace(
+        id="s1", number="FLD-2026-NW-0002", clientSubmissionId="c2", type="observation",
+        status="submitted", isAnonymous=False, reporter=None, reporterId="tech-1",
+        plantId="p1", areaId=None, mapPinX=None, mapPinY=None, equipmentId=None,
+        fireAssetId="fa-1", fireAssetSnapshot=snap,
+        qrScanned=True, categoryL1Id=None, categoryL2Id=None, categorySnapshot=None,
+        aiSuggested=False, aiConfidence=None, severitySelfReported="high",
+        description=None, voiceLangCode=None, transcriptOriginal=None,
+        transcriptEnglish=None, transcriptionStatus="none", triagedById=None,
+        triagedAt=None, hiraLikelihood=None, hiraSeverity=None, riskScore=None,
+        riskLevel=None, triageNote=None, convertedEntityType=None,
+        convertedEntityId=None, convertedAt=None, linkedRcaIds=[], linkedCapaIds=[],
+        linkedPtwIds=[], tapCount=4, durationMs=31000, wasOffline=False,
+        appVersion=None, deviceLang="en", createdAtClient=None, createdAt=None,
+    )
+    out = svc.submission_out(sub, viewer_is_owner=True)
+    assert out["fireAssetId"] == "fa-1"
+    assert out["fireAsset"]["code"] == "FE-ACS-0011"
+    # The Equipment link stays empty — the two must never be conflated.
+    assert out["equipmentId"] is None
