@@ -58,9 +58,43 @@ ROUTER_MODULE: dict[str, str | None] = {
     # run IS a CamsEngagement: the authority being licensed is the fire
     # register's periodic inspection, and a CAMS-only client must not get the
     # fire checklist engine for free by owning the engine it happens to run on.
-    "fire_safety": "FIRE",
-    "fire_checklists": "FIRE",
-    "chemical": "CHEMICAL",
+    #
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ TEMPORARILY DISABLED — 2026-08-28. RESTORE, DO NOT DELETE.          │
+    # └─────────────────────────────────────────────────────────────────────┘
+    #
+    # These three shipped to production ahead of a licence carrying FIRE and
+    # CHEMICAL, so Fire Safety & ER and Chemical & Hazmat both went dark with
+    # "module is not included in your licence edition" — two screens that had
+    # worked the day before.
+    #
+    # The fix is a reissued licence, NOT this. But the Ed25519 signing key
+    # (`vf-2026-06`) could not be located, so no licence granting those codes
+    # can be produced at all until a key rotation is done. Rather than leave a
+    # live fire register unreachable while that is sorted out, the gate is
+    # lifted — restoring exactly the behaviour these modules had before Build 2.
+    #
+    # WHAT THIS RE-OPENS, stated plainly so it is not forgotten: with these
+    # commented out, /api/fire/* and /api/chemicals/* are reachable on every
+    # deployment regardless of what its licence grants. That was the status quo
+    # for the life of the product until Build 2, so it is the old hole back, not
+    # a new one — but it IS a hole, and this comment is the only thing tracking
+    # it.
+    #
+    # TO RESTORE (all three conditions, in this order):
+    #   1. a signing key exists again  — see docs/reissue-production-licence.md
+    #   2. every installation's licence carries FIRE and CHEMICAL — verify with
+    #        python scripts/audit_operations_licence.py --fleet <dir-of-.lic>
+    #      which exits 1 while any of them would lose access
+    #   3. uncomment the three lines below, then deploy
+    #
+    # RBAC is unaffected and stays on: chemical still requires CHEMICAL.* and
+    # fire still requires FIRE.*, so the contractor-reads-the-hazmat-inventory
+    # defect Build 2 fixed remains fixed. Only the LICENCE check is lifted.
+    #
+    # "fire_safety": "FIRE",
+    # "fire_checklists": "FIRE",
+    # "chemical": "CHEMICAL",
     # ── Risk Management ──
     "hira": "HIRA",
     "eai": "EAI",
