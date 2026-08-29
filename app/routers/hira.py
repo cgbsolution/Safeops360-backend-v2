@@ -702,17 +702,30 @@ async def create_study(
     if leader is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="teamLeaderId does not exist")
 
-    # Number generation — HIRA-YYYY-PLT-NNN (MAX-based, gap-safe)
-    max_stmt = select(func.max(HiraStudy.number)).where(HiraStudy.plantId == payload.plantId)
-    last_number = (await db.execute(max_stmt)).scalar_one_or_none()
-    if last_number:
+    # Number generation — HIRA-YYYY-PLT-NNN.
+    #
+    # This used to take MAX(number) as a *string*. Any plant carrying a seeded
+    # "HIRA-2026-NW-DEMO-005" wins that comparison against "HIRA-2026-NW-006"
+    # ('D' > '0'), so the generator re-derived sequence 5 forever and the second
+    # study created at that plant died on the unique constraint with a 500.
+    # Compare the parsed numeric suffix instead, over this plant+year prefix.
+    year = datetime.now(timezone.utc).year
+    prefix = f"HIRA-{year}-{plant.code}-"
+    existing = (
+        await db.execute(
+            select(HiraStudy.number).where(
+                HiraStudy.plantId == payload.plantId,
+                HiraStudy.number.like(f"{prefix}%"),
+            )
+        )
+    ).scalars().all()
+    last_seq = 0
+    for num in existing:
         try:
-            last_seq = int(last_number.rsplit("-", 1)[-1])
+            last_seq = max(last_seq, int(num.rsplit("-", 1)[-1]))
         except (ValueError, AttributeError):
-            last_seq = 0
-    else:
-        last_seq = 0
-    number = f"HIRA-{datetime.now(timezone.utc).year}-{plant.code}-{last_seq + 1:03d}"
+            continue
+    number = f"{prefix}{last_seq + 1:03d}"
 
     study = HiraStudy(
         number=number,
@@ -1260,6 +1273,18 @@ async def archive_study(
 
 
 
+async def _study_with_team(db: AsyncSession, study_id: str) -> HiraStudy:
+    """Re-read a study with its team eagerly loaded.
+
+    HiraStudyOut carries `team`, and under async SQLAlchemy a lazy load during
+    Pydantic serialisation raises MissingGreenlet — a 500 on what looks like a
+    successful transition. create_study/archive_study already re-selected; the
+    three lifecycle transitions did not, which is why every study hop 500'd.
+    """
+    stmt = select(HiraStudy).where(HiraStudy.id == study_id).options(selectinload(HiraStudy.team))
+    return (await db.execute(stmt)).scalar_one()
+
+
 @router.post("/studies/{study_id}/submit", response_model=HiraStudyOut)
 async def submit_study(
     study_id: str,
@@ -1279,8 +1304,7 @@ async def submit_study(
     study.status = TRANSITIONS[study.status]
     study.updatedById = user.id
     await db.flush()
-    await db.refresh(study)
-    return HiraStudyOut.model_validate(study)
+    return HiraStudyOut.model_validate(await _study_with_team(db, study_id))
 
 
 @router.post("/studies/{study_id}/approve", response_model=HiraStudyOut)
@@ -1304,9 +1328,26 @@ async def approve_study(
     study.approvedAt = now
     study.effectiveFrom = now
     study.updatedById = user.id
+
+    # Start the review clock. Nothing else did: nextReviewDue was only ever set
+    # when a review cycle was *completed*, and the scheduler only raises cycles
+    # for entries that already have one — so a newly approved study never got a
+    # first cycle and the review frequency chosen at creation did nothing.
+    next_due = _compute_next_review_due(study.reviewFrequency, study.customReviewMonths)
+    study.nextScheduledReviewDate = next_due
+    entries = (
+        await db.execute(
+            select(HiraEntry)
+            .where(HiraEntry.studyId == study_id)
+            .where(HiraEntry.isCurrentVersion.is_(True))
+        )
+    ).scalars().all()
+    for e in entries:
+        if e.nextReviewDue is None:
+            e.nextReviewDue = next_due
+
     await db.flush()
-    await db.refresh(study)
-    return HiraStudyOut.model_validate(study)
+    return HiraStudyOut.model_validate(await _study_with_team(db, study_id))
 
 
 @router.post("/studies/{study_id}/activate", response_model=HiraStudyOut)
@@ -1327,8 +1368,7 @@ async def activate_study(
     study.status = "ACTIVE"
     study.updatedById = user.id
     await db.flush()
-    await db.refresh(study)
-    return HiraStudyOut.model_validate(study)
+    return HiraStudyOut.model_validate(await _study_with_team(db, study_id))
 
 def _derive_level(score: int) -> str:
     if score >= 15:
@@ -1887,6 +1927,39 @@ async def override_unacceptable(
     entry.versionNumber = archive_number + 1
     await db.flush()
     return await _get_entry_detail(entry_id, db)
+
+
+@router.delete("/entries/{entry_id}", response_model=dict)
+async def retract_entry(
+    entry_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Retract an entry from the live register — soft, never a hard DELETE.
+
+    There was no way to take back an entry created in error: HiraEntry carries
+    an ARCHIVED status and every list/detail query already filters on
+    isCurrentVersion, but nothing could set either, so a duplicate or wrong
+    activity stayed on the study permanently. Only an entry that has not been
+    approved may be retracted; an approved one is a statutory record and must
+    go through a review cycle instead.
+    """
+    entry = await db.get(HiraEntry, entry_id, options=[selectinload(HiraEntry.study)])
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Entry not found")
+    await require_permission_with_context(
+        "HIRA.DELETE", user, db, plant_id=entry.study.plantId, record_id=entry.id
+    )
+    if entry.status in ("APPROVED", "ACTIVE"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "An approved entry cannot be retracted. Raise a review cycle to supersede or archive it.",
+        )
+    entry.status = "ARCHIVED"
+    entry.isCurrentVersion = False
+    entry.updatedById = user.id
+    await db.flush()
+    return {"id": entry.id, "status": entry.status, "isCurrentVersion": entry.isCurrentVersion}
 
 
 @router.get("/entries/{entry_id}/capas", response_model=list[HiraCapaOut])

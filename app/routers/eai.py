@@ -356,6 +356,9 @@ async def create_study(
     user: User = Depends(get_current_user),
 ):
     await _require_eai_enabled(db, payload.plantId)
+    # Every other EAI route guards on a permission; this one did not, so any
+    # authenticated user could open an environmental register at any plant.
+    await require_permission_with_context("EAI.CREATE", user, db, plant_id=payload.plantId)
     plant = await db.get(Plant, payload.plantId)
     if plant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Plant not found")
@@ -528,7 +531,11 @@ async def approve_study(
     if study is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Study not found")
     await _require_eai_enabled(db, study.plantId)
-    await require_permission_with_context("EAI.EXECUTE", user, db, plant_id=study.plantId)
+    # Gate on EAI.APPROVE, not EAI.EXECUTE. The grant matrix gives Plant Head
+    # EAI.APPROVE and deliberately withholds EAI.EXECUTE, so gating approval on
+    # EXECUTE made the approver role unable to approve while the permission
+    # named APPROVE controlled nothing. Activation stays on EXECUTE.
+    await require_permission_with_context("EAI.APPROVE", user, db, plant_id=study.plantId)
     if study.status != "APPROVAL_PENDING":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Can only approve from APPROVAL_PENDING; current: {study.status!r}")
     study.status = "APPROVED"
@@ -885,6 +892,12 @@ async def replace_entry_aspects(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes BEFORE inserting. EaiEntryAspect has a unique
+    # (entryId, aspectId); SQLAlchemy's unit of work emits inserts before
+    # deletes, so without this every re-save of an entry that keeps the same
+    # aspect died on the constraint — i.e. an entry could be saved once and
+    # never edited again.
+    await db.flush()
     for item in payload:
         db.add(EaiEntryAspect(entryId=entry_id, **item.model_dump()))
     await db.commit()
@@ -917,6 +930,8 @@ async def replace_entry_impacts(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes before the inserts — see replace_entry_aspects.
+    await db.flush()
     for item in payload:
         db.add(EaiEntryImpact(entryId=entry_id, **item.model_dump()))
     await db.commit()
@@ -949,6 +964,8 @@ async def replace_entry_controls(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes before the inserts — see replace_entry_aspects.
+    await db.flush()
     for item in payload:
         db.add(EaiEntryControl(entryId=entry_id, **item.model_dump()))
     await db.commit()
@@ -981,14 +998,19 @@ async def replace_entry_recommended_controls(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes before the inserts — see replace_entry_aspects.
+    await db.flush()
     for item in payload:
         db.add(EaiEntryRecommendedControl(entryId=entry_id, **item.model_dump()))
     await db.commit()
+    # EaiEntryRecommendedControl has no sortOrder column — ordering by it raised
+    # AttributeError and 500'd, so a recommended control could never be saved at
+    # all. Order by creation instead, which is the order they were sent in.
     return (
         await db.execute(
             select(EaiEntryRecommendedControl)
             .where(EaiEntryRecommendedControl.entryId == entry_id)
-            .order_by(EaiEntryRecommendedControl.sortOrder.asc())
+            .order_by(EaiEntryRecommendedControl.createdAt.asc())
         )
     ).scalars().all()
 
@@ -1013,6 +1035,8 @@ async def replace_compliance_obligations(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes before the inserts — see replace_entry_aspects.
+    await db.flush()
     for item in payload:
         db.add(EaiComplianceObligation(entryId=entry_id, **item.model_dump()))
     await db.commit()
@@ -1045,6 +1069,8 @@ async def replace_regulation_refs(
     ).scalars().all()
     for row in existing:
         await db.delete(row)
+    # Flush the deletes before the inserts — see replace_entry_aspects.
+    await db.flush()
     for item in payload:
         db.add(EaiEntryRegulationRef(entryId=entry_id, **item.model_dump()))
     # ISO 14001 §6.1.3 — adding a legal regulation forces the aspect SIGNIFICANT.

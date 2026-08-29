@@ -161,6 +161,10 @@ class HiraStudyCreate(BaseModel):
 
 class HiraStudyUpdate(BaseModel):
     model_config = ConfigDict(extra="ignore")
+    # update_study names nextScheduledReviewDate as the one field editable on an
+    # APPROVED/ACTIVE study, but it was missing here — so the carve-out could
+    # never be exercised and a review date could not be corrected after sign-off.
+    nextScheduledReviewDate: datetime | None = None
     title: str | None = None
     description: str | None = None
     targetCompletionDate: datetime | None = None
