@@ -37,6 +37,7 @@ from app.models.observation_sla import (
     DEROSTER_PENDING,
     DEROSTER_REINSTATED,
     PARTY_CONTRACTOR_WORKER,
+    PARTY_MANUAL,
     PARTY_USER,
     ROSTER_ACTIVE,
     ROSTER_DEROSTERED,
@@ -121,40 +122,67 @@ async def persist_workers_involved(
     dropping it — a High-severity act attributed to a worker who does not exist
     is worse than a rejected form. Duplicates within one submission are
     collapsed.
+
+    MANUAL entries are the exception: there is no table to resolve them
+    against, so the typed name / works ID / employer ARE the snapshot. They are
+    de-duplicated on the normalised (code, name) pair so the same person typed
+    twice in one submission still yields one row.
     """
     seen: set[tuple[str, str]] = set()
     out: list[ObservationWorkerInvolved] = []
 
     for entry in entries:
         party = entry.partyType
-        ref = entry.userId if party == PARTY_USER else entry.contractorWorkerId
-        if (party, ref) in seen:
-            continue
-        seen.add((party, ref))
+        code = (getattr(entry, "code", None) or "").strip() or None
 
-        if party == PARTY_USER:
-            person = await db.get(User, ref)
-            if person is None:
-                raise DerosterError(f"Worker not found: {ref}")
-            name, role, employer = person.name, person.designation, person.department
+        if party == PARTY_MANUAL:
+            name = (entry.name or "").strip()
+            # Key on the works ID when one was given — two people can share a
+            # name, and the ID is what a later reconciliation would match on.
+            dedupe_ref = (code or name).casefold()
+            if (party, dedupe_ref) in seen:
+                continue
+            seen.add((party, dedupe_ref))
+            role = None
+            employer = (getattr(entry, "employer", None) or "").strip() or None
         else:
-            person = await db.get(ContractorWorker, ref)
-            if person is None:
-                raise DerosterError(f"Contractor worker not found: {ref}")
-            from app.models.epc import ContractorCompany
+            ref = entry.userId if party == PARTY_USER else entry.contractorWorkerId
+            if (party, ref) in seen:
+                continue
+            seen.add((party, ref))
 
-            company = await db.get(ContractorCompany, person.contractorCompanyId)
-            name, role = person.fullName, person.primaryTrade
-            employer = company.name if company else None
+            if party == PARTY_USER:
+                person = await db.get(User, ref)
+                if person is None:
+                    raise DerosterError(f"Worker not found: {ref}")
+                name, role, employer = person.name, person.designation, person.department
+                # The employee directory carries no works number — `User` has
+                # email/name/designation/department and nothing else to snapshot
+                # here. A client-supplied code is dropped rather than trusted:
+                # on a linked row the directory is the authority.
+                code = None
+            else:
+                person = await db.get(ContractorWorker, ref)
+                if person is None:
+                    raise DerosterError(f"Contractor worker not found: {ref}")
+                from app.models.epc import ContractorCompany
+
+                company = await db.get(ContractorCompany, person.contractorCompanyId)
+                name, role = person.fullName, person.primaryTrade
+                employer = company.name if company else None
+                code = person.workerCode
 
         row = ObservationWorkerInvolved(
             observationId=obs.id,
             partyType=party,
-            userId=ref if party == PARTY_USER else None,
-            contractorWorkerId=ref if party == PARTY_CONTRACTOR_WORKER else None,
+            userId=entry.userId if party == PARTY_USER else None,
+            contractorWorkerId=(
+                entry.contractorWorkerId if party == PARTY_CONTRACTOR_WORKER else None
+            ),
             nameSnapshot=name,
             roleSnapshot=role,
             employerSnapshot=employer,
+            codeSnapshot=code,
             addedById=actor_id,
         )
         db.add(row)
@@ -205,6 +233,7 @@ async def load_workers_involved(db: AsyncSession, observation_id: str) -> list[d
             "name": w.nameSnapshot,
             "role": w.roleSnapshot,
             "employer": w.employerSnapshot,
+            "code": w.codeSnapshot,
             "rosterStatus": getattr(person, "rosterStatus", None) if person else None,
             "deroster": None,
         }
@@ -371,8 +400,18 @@ async def trigger_for_observation(
     observations confirm/overrule separately). Idempotent — a worker who already
     has a flag on this observation is skipped, so a retried submission cannot
     double-flag. Returns the rows created.
+
+    MANUAL rows are skipped. The soft-lock works by setting `rosterStatus` on a
+    User or ContractorWorker row, and a hand-typed name has neither — a flag
+    against it would block nothing, gate nothing and could never be reinstated,
+    while still showing up as an open review someone has to decide. The name is
+    recorded on the observation; the review is what needs a real person.
     """
-    if not observation_qualifies(obs) or not workers:
+    if not observation_qualifies(obs):
+        return []
+
+    workers = [w for w in workers if w.partyType != PARTY_MANUAL]
+    if not workers:
         return []
 
     cfg = await resolve_config(db, obs.plantId)

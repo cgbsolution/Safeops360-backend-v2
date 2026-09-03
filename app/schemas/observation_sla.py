@@ -10,8 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.observation_sla import (
     CATEGORY_GROUPS,
     DEFAULT_REVIEW_SLA_HOURS,
+    PARTY_MANUAL,
     PARTY_TYPES,
 )
+
+# A hand-typed name that is one character long is a slip, not a person.
+MIN_MANUAL_NAME = 2
 
 
 # ── SLA matrix ───────────────────────────────────────────────────────────────
@@ -117,16 +121,44 @@ class CategoryGroupUpsert(BaseModel):
 
 # ── worker involvement ───────────────────────────────────────────────────────
 class WorkerInvolvedIn(BaseModel):
-    """One named worker. Exactly one of userId / contractorWorkerId, matching
-    partyType — validated server-side in the router, where the DB is reachable."""
+    """One named worker.
+
+    USER / CONTRACTOR_WORKER carry exactly one id and are resolved against
+    their own table — name, role and employer come from the record, never from
+    the client, so a submitted name cannot contradict the directory.
+
+    MANUAL carries no id at all: it is the escape hatch for someone in neither
+    people table (agency hand, visiting vendor, driver), and there the typed
+    name and works ID ARE the record. Trusted because there is nothing to check
+    them against — which is exactly why a MANUAL row never triggers the roster
+    soft-lock; see services/observation_deroster.
+    """
 
     partyType: str
     userId: str | None = None
     contractorWorkerId: str | None = None
+    # MANUAL only. Ignored on a linked row, which snapshots from its own record.
+    name: str | None = None
+    code: str | None = None
+    employer: str | None = None
 
     def validated(self) -> "WorkerInvolvedIn":
         if self.partyType not in PARTY_TYPES:
             raise ValueError(f"Unknown partyType '{self.partyType}'.")
+
+        if self.partyType == PARTY_MANUAL:
+            if self.userId or self.contractorWorkerId:
+                raise ValueError(
+                    "A manually entered worker carries no userId or contractorWorkerId — "
+                    "pick them from the directory instead."
+                )
+            if len((self.name or "").strip()) < MIN_MANUAL_NAME:
+                raise ValueError(
+                    "A manually entered worker needs a name of at least "
+                    f"{MIN_MANUAL_NAME} characters."
+                )
+            return self
+
         has_user = bool(self.userId)
         has_worker = bool(self.contractorWorkerId)
         if has_user == has_worker:
@@ -171,6 +203,10 @@ class WorkerInvolvedOut(BaseModel):
     name: str
     role: str | None
     employer: str | None
+    # Employee / works / gate-pass number. Always present on a MANUAL row (it is
+    # the only handle that row has); on a linked row, only when the source
+    # record carried one.
+    code: str | None = None
     rosterStatus: str | None = None
     deroster: DerosterOut | None = None
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, func
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, JSON, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models._base import Base, IdMixin
@@ -24,6 +24,16 @@ from app.models._base import Base, IdMixin
 
 class InsightSnapshot(Base, IdMixin):
     __tablename__ = "InsightSnapshot"
+
+    # Mirrors scripts/create_insight_snapshot_table.py. The unique index is not
+    # decoration: repo.upsert_week's ON CONFLICT names exactly these columns, and
+    # without a matching index Postgres raises InvalidColumnReferenceError and the
+    # whole week's snapshot write is lost (lifecycle then never leaves `new`).
+    __table_args__ = (
+        Index("ux_InsightSnapshot_identity_week", "tenantId", "module", "identityKey", "weekOf", unique=True),
+        Index("ix_InsightSnapshot_identity_weekdesc", "tenantId", "module", "identityKey", "weekOf"),
+        Index("ix_InsightSnapshot_week_score", "tenantId", "module", "weekOf", "score"),
+    )
 
     tenantId: Mapped[str] = mapped_column(String, nullable=False, index=True)
     module: Mapped[str] = mapped_column(String, nullable=False)

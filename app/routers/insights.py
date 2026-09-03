@@ -60,6 +60,11 @@ async def module_weekly(
         return await get_current_week_view(db, module=internal, plant=plant)
     except Exception as e:  # noqa: BLE001 — never break the screen on an engine/DDL issue
         log.warning("weekly insight view failed for %s: %s", internal, e)
+        # The engine writes inside the request session, so a mid-compute failure
+        # leaves it in an aborted transaction. Swallowing without this rollback
+        # hands get_db a session whose commit() raises PendingRollbackError —
+        # turning a degraded view into a 500.
+        await db.rollback()
         return {"module": internal, "weekOf": None, "hero": None, "row": [], "moreCount": 0, "empty": None}
 
 

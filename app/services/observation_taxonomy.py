@@ -176,6 +176,13 @@ async def validate_selection(
     Safe observations pass through with all three set to None: they don't carry
     the STOP taxonomy, and quietly keeping a stale code on one would reintroduce
     exactly the mismatch this validates against.
+
+    The sub-category is OPTIONAL. The category is what every downstream consumer
+    groups by (legacy `category` dual-write, the SLA category-group matrix, the
+    heat-map), so it stays mandatory on an at-risk type; the sub-category only
+    refines it. When one IS supplied it is still validated against the
+    (category, axis) pair — optional means "may be omitted", never "may be
+    wrong".
     """
     axis = axis_for_type(obs_type)
     type_label = _as_str(obs_type)
@@ -186,12 +193,26 @@ async def validate_selection(
     category_code = (category_code or "").strip() or None
     sub_category_code = (sub_category_code or "").strip() or None
 
-    if not category_code or not sub_category_code:
+    if not category_code:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            f"{type_label} observations require both a category and a sub-category "
-            "from the STOP taxonomy.",
+            f"{type_label} observations require a category from the STOP taxonomy.",
         )
+
+    if sub_category_code is None:
+        # Category-only. Still has to be a category that exists on this axis —
+        # the composite FK to ObservationTaxonomy is MATCH SIMPLE, so a NULL
+        # sub-category switches it off entirely and this check becomes the only
+        # thing standing between "sub-category omitted" and "Reactions of People
+        # recorded as a condition".
+        eligible = {c["categoryCode"] for c in await list_categories(db, axis)}
+        if category_code not in eligible:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Category '{category_code}' does not apply to a {type_label}. "
+                f"Valid categories: {', '.join(sorted(eligible))}.",
+            )
+        return category_code, None, axis
 
     row = (
         await db.execute(

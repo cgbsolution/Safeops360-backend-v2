@@ -67,7 +67,13 @@ AXIS_ANY = "ANY"
 
 PARTY_USER = "USER"
 PARTY_CONTRACTOR_WORKER = "CONTRACTOR_WORKER"
-PARTY_TYPES = (PARTY_USER, PARTY_CONTRACTOR_WORKER)
+# A person the observer typed in by hand because neither people table has them:
+# an agency hand on their first shift, a visiting vendor engineer, a driver.
+# Refusing the observation until someone is onboarded loses the observation,
+# which is the one outcome worse than an unlinked name. A MANUAL row carries no
+# userId and no contractorWorkerId — see ObservationWorkerInvolved.
+PARTY_MANUAL = "MANUAL"
+PARTY_TYPES = (PARTY_USER, PARTY_CONTRACTOR_WORKER, PARTY_MANUAL)
 
 # targetDate provenance
 SOURCE_AUTO_SLA = "auto_sla"
@@ -205,7 +211,11 @@ class ObservationWorkerInvolved(Base, IdMixin):
     to — `TrainingAssignment.personUserId` is a User). `ContractorWorker` is the
     EPC workforce and is documented as deliberately self-contained with no
     `userAccountId` FK. An unsafe act can be committed by either, so exactly one
-    of `userId` / `contractorWorkerId` is populated per row.
+    of `userId` / `contractorWorkerId` is populated per row — or neither, on a
+    `MANUAL` row, where the observer typed a name and works ID for someone who
+    is in neither directory (agency hand, visiting vendor, driver). A MANUAL row
+    is a record, not a link: it cannot be soft-locked or assigned training,
+    because there is nothing to lock or assign to.
 
     This is also the child table `training_engine.classify.build_classification`
     was waiting for — its comment reads "Observation has no person-involved
@@ -232,6 +242,11 @@ class ObservationWorkerInvolved(Base, IdMixin):
     nameSnapshot: Mapped[str] = mapped_column(String, nullable=False)
     roleSnapshot: Mapped[str | None] = mapped_column(String)
     employerSnapshot: Mapped[str | None] = mapped_column(String)
+    # Employee / works / gate-pass number. The only handle a MANUAL row has for
+    # matching the person later, so it is captured alongside the name rather
+    # than folded into it; also snapshotted for linked rows when the source
+    # record carries one.
+    codeSnapshot: Mapped[str | None] = mapped_column(String)
 
     addedById: Mapped[str | None] = mapped_column(String)
     createdAt: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -378,6 +393,7 @@ __all__ = [
     "PARTY_USER",
     "PARTY_CONTRACTOR_WORKER",
     "PARTY_TYPES",
+    "PARTY_MANUAL",
     "SOURCE_AUTO_SLA",
     "SOURCE_MANUAL_OVERRIDE",
     "SOURCE_SECTION_HEAD_REASSIGNED",
