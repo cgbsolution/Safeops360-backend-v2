@@ -9,7 +9,14 @@ recommend a corrective action.
 from __future__ import annotations
 
 AT_RISK_TYPES = {"UNSAFE_ACT", "UNSAFE_CONDITION"}
-MIN_AT_RISK_DESCRIPTION = 50  # chars — a vague at-risk obs is not actionable
+# Length no longer gates submission. It was 50 chars on at-risk types, which is
+# every type the form now offers — so the gate had gone from "reject the vague
+# ones" to "reject the terse ones", and a real observation typed one-handed on a
+# shop floor ("guard missing on knitting m/c 4") is short, not vague. Length
+# still feeds `quality_score`, so specificity is measured and reported; it is
+# just not a wall. Set to 0 rather than deleted because the score thresholds and
+# the wording below are the only other consumers.
+MIN_AT_RISK_DESCRIPTION = 0
 
 
 def is_at_risk(obs_type: str) -> bool:
@@ -34,9 +41,18 @@ def quality_label(score: int) -> str:
 
 
 def validate_quality(obs_type: str, description: str) -> str | None:
-    """Return an error message if an at-risk observation is too vague to action,
-    else None. (Soft for safe observations — only at-risk submissions are gated.)"""
-    if is_at_risk(obs_type) and len((description or "").strip()) < MIN_AT_RISK_DESCRIPTION:
+    """Return an error message if the description is unusable, else None.
+
+    Only emptiness is rejected now. A minimum length is a poor proxy for
+    specificity — it blocked terse-but-clear reports while passing 50
+    characters of padding — so the judgement moved entirely to
+    `quality_score`, which measures and reports rather than refusing.
+    """
+    if not (description or "").strip():
+        return "Describe what was observed."
+    if MIN_AT_RISK_DESCRIPTION and is_at_risk(obs_type) and (
+        len(description.strip()) < MIN_AT_RISK_DESCRIPTION
+    ):
         return (
             f"At-risk observations need a specific description (≥{MIN_AT_RISK_DESCRIPTION} chars): "
             "name the unsafe act/condition, where, and who — so it can be actioned."

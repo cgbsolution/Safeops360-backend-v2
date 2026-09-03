@@ -71,16 +71,26 @@ def _ptw_receiver_steps(seq: int, sla: int) -> list[dict[str, Any]]:
 # (module, recordType, name, description, steps[])
 DEFINITIONS: list[dict[str, Any]] = [
     {
+        # 4 steps, not 5. "Section Head Review" was removed: its only real
+        # output was naming the action owner, and that is now a field on the
+        # maker form (Observation.responsiblePersonId, set at submit). What
+        # remained was a 24h approval gate between someone reporting a hazard
+        # and anyone being asked to fix it. Verification and closure are still
+        # separate, independent hands — the review that matters is on the fix,
+        # not on the report.
+        #
+        # `approverField: ACTION_OWNER` now resolves the value the observer
+        # picked; when they leave it blank the engine falls back to the
+        # initiator (the observer). See services/workflow_engine._resolve_assignee.
         "module": "OBSERVATION",
         "recordType": None,
         "name": "Safety Observation — default",
-        "description": "Maker → Section Head approves → Action Owner executes → Safety Officer verifies → HSE Manager closes",
+        "description": "Maker → Action Owner executes → Safety Officer verifies → HSE Manager closes",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted by Observer"},
-            {"sequence": 2, "stepType": "CHECKER", "name": "Section Head Review", "approverRole": "DEPARTMENT_HEAD", "slaHours": 24},
-            {"sequence": 3, "stepType": "ASSIGNEE_TASK", "name": "Action Owner Executes", "approverField": "ACTION_OWNER", "slaHours": 168, "escalationRole": "HSE_MANAGER"},
-            {"sequence": 4, "stepType": "VERIFIER", "name": "Safety Officer Verifies", "approverRole": "SAFETY_OFFICER", "slaHours": 48},
-            {"sequence": 5, "stepType": "CLOSURE", "name": "HSE Manager Closes", "approverRole": "HSE_MANAGER"},
+            {"sequence": 2, "stepType": "ASSIGNEE_TASK", "name": "Action Owner Executes", "approverField": "ACTION_OWNER", "slaHours": 168, "escalationRole": "HSE_MANAGER"},
+            {"sequence": 3, "stepType": "VERIFIER", "name": "Safety Officer Verifies", "approverRole": "SAFETY_OFFICER", "slaHours": 48},
+            {"sequence": 4, "stepType": "CLOSURE", "name": "HSE Manager Closes", "approverRole": "HSE_MANAGER"},
         ],
     },
     {

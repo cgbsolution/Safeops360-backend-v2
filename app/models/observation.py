@@ -112,6 +112,13 @@ class Observation(Base, IdMixin):
 
     plantId: Mapped[str] = mapped_column(ForeignKey("Plant.id"), nullable=False)
     areaId: Mapped[str | None] = mapped_column(ForeignKey("Area.id"))
+    # Free text, typed by the observer. Deliberately NOT an FK to a department
+    # master: observers name the department the way the site says it out loud
+    # ("Dye House", "Utilities night shift"), and gating the observation on a
+    # master row that hasn't been created yet loses the observation. Analytics
+    # that need a clean grouping should key on plantId/areaId, which are
+    # structured.
+    department: Mapped[str | None] = mapped_column(String)
     # The Prisma schema has no `location` or `correctiveAction` column on
     # Observation — those live on NearMiss / Incident. Don't add them here
     # or INSERT will fail with "column does not exist".

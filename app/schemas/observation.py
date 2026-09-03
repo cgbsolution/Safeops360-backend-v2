@@ -24,6 +24,8 @@ class ObservationCreate(BaseModel):
 
     plantId: str
     areaId: str | None = None
+    # Free text — the department as the site names it. See Observation.department.
+    department: str | None = None
     type: ObservationType
     # Legacy hazard category. Required for the SAFE types (which don't carry
     # the STOP taxonomy); for at-risk types the router DERIVES it from
@@ -95,6 +97,7 @@ class ObservationUpdate(BaseModel):
     category: ObservationCategory | None = None
     categoryCode: str | None = None
     subCategoryCode: str | None = None
+    department: str | None = None
     severity: Severity | None = None
     # Same rule as on create, but only evaluated when the edit actually touches
     # something the suggestion depends on (severity, taxonomy, type or area).
@@ -118,6 +121,7 @@ class ObservationOut(BaseModel):
     severity: Severity
     plantId: str
     areaId: str | None
+    department: str | None = None
     observerId: str
     responsiblePersonId: str | None
     contractorCompanyId: str | None = None

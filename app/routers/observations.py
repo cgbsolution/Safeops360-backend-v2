@@ -399,6 +399,7 @@ async def create_observation(
         severity=payload.severity,
         plantId=payload.plantId,
         areaId=payload.areaId,
+        department=(payload.department or "").strip() or None,
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
         contractorCompanyId=payload.contractorCompanyId,
@@ -727,7 +728,7 @@ async def update_observation(
         v is not None
         for v in (
             payload.type, payload.category, payload.categoryCode, payload.subCategoryCode,
-            payload.severity, payload.description, payload.areaId,
+            payload.severity, payload.description, payload.areaId, payload.department,
         )
     )
     if core_edit and obs.status == ObservationStatus.CLOSED:
@@ -774,6 +775,8 @@ async def update_observation(
         obs.description = payload.description
     if payload.areaId is not None:
         obs.areaId = payload.areaId or None
+    if payload.department is not None:
+        obs.department = payload.department.strip() or None
     if payload.responsiblePersonId is not None:
         obs.responsiblePersonId = payload.responsiblePersonId or None
     if payload.targetDate is not None:
