@@ -101,14 +101,20 @@ ACTIVITY_OTHER_LABEL = "Other"
 # is in src/lib/near-miss/risk-masters.ts, which is what renders the form and
 # the detail view. Codes are the contract; labels have one home.
 #
-# L × S over two 1-3 scales can only produce these six numbers, so every
-# reachable rating is listed rather than inferred from thresholds.
+# The card bands the six ratings L × S can actually produce: 1,2 low · 3,4
+# medium · 6,9 high. 5, 7 and 8 are unreachable by multiplication but ARE
+# storable, because the coordinator can set the rating by hand; they are banded
+# by continuing the card's own boundaries. Must stay in step with
+# RATING_TO_CATEGORY in src/lib/near-miss/risk-masters.ts.
 RISK_RATING_TO_CATEGORY: dict[int, str] = {
     1: "LOW_RISK",
     2: "LOW_RISK",
     3: "MEDIUM_RISK",
     4: "MEDIUM_RISK",
+    5: "MEDIUM_RISK",
     6: "HIGH_RISK",
+    7: "HIGH_RISK",
+    8: "HIGH_RISK",
     9: "HIGH_RISK",
 }
 
@@ -151,17 +157,33 @@ NEAR_MISS_CATEGORY_CODES: frozenset[str] = frozenset(
 )
 
 
-def risk_calculator(probability: int | None, severity: int | None) -> tuple[int | None, str | None]:
-    """Rating and category for a probability/severity pair, or (None, None)
-    when the reporter left the calculator blank. Recomputed here rather than
-    trusted from the payload — the arithmetic is the whole point of the
-    control, and a client that sent its own answer could under-rate a near
-    miss into a longer SLA band."""
+RISK_CATEGORIES: frozenset[str] = frozenset(RISK_RATING_TO_CATEGORY.values())
 
-    if not probability or not severity:
-        return None, None
-    rating = probability * severity
-    return rating, RISK_RATING_TO_CATEGORY.get(rating)
+
+def risk_calculator(
+    probability: int | None,
+    severity: int | None,
+    rating_override: int | None = None,
+    category_override: str | None = None,
+) -> tuple[int | None, str | None]:
+    """The rating and category to store.
+
+    L × S is the default, but the printed card hands this box to the EHS
+    Coordinator, and the form lets them pick a different number — so an
+    override wins when one is sent. Both are bounded (the schema caps the
+    rating at 1-9; an unrecognised category is dropped rather than stored), and
+    a rating with no matching category falls back to the band its number sits
+    in, so the two can never disagree."""
+
+    rating = rating_override
+    if rating is None and probability and severity:
+        rating = probability * severity
+
+    category = category_override if category_override in RISK_CATEGORIES else None
+    if category is None:
+        category = RISK_RATING_TO_CATEGORY.get(rating) if rating else None
+
+    return rating, category
 
 
 # ─── Risk matrix → level mapping (5×5 standard) ────────────────────────
@@ -490,7 +512,10 @@ async def create_near_miss(
     )
 
     risk_rating, risk_category = risk_calculator(
-        payload.riskProbability, payload.riskSeverityLevel
+        payload.riskProbability,
+        payload.riskSeverityLevel,
+        payload.riskRating,
+        payload.riskCategory,
     )
 
     # CRITICAL severity → flag for auto-promotion to an Incident (+ SMS/email).
@@ -1119,6 +1144,24 @@ async def update_near_miss(
         nm.departmentName = payload.departmentName or None
     if payload.shiftId is not None:
         nm.shiftId = payload.shiftId if payload.shiftId in NEAR_MISS_SHIFTS else None
+    if (
+        payload.riskProbability is not None
+        or payload.riskSeverityLevel is not None
+        or payload.riskRating is not None
+        or payload.riskCategory is not None
+    ):
+        if payload.riskProbability is not None:
+            nm.riskProbability = payload.riskProbability
+        if payload.riskSeverityLevel is not None:
+            nm.riskSeverityLevel = payload.riskSeverityLevel
+        if payload.riskSeverityDescription is not None:
+            nm.riskSeverityDescription = payload.riskSeverityDescription.strip() or None
+        nm.riskRating, nm.riskCategory = risk_calculator(
+            nm.riskProbability,
+            nm.riskSeverityLevel,
+            payload.riskRating,
+            payload.riskCategory,
+        )
     if payload.hazardCategories is not None:
         nm.hazardCategories = [
             c for c in payload.hazardCategories if c in HAZARD_CATEGORY_CODES

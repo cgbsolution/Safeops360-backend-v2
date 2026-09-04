@@ -119,12 +119,19 @@ class NearMissCreate(BaseModel):
     nearMissCategory: str | None = None
     nearMissCategoryDetail: str | None = None
 
-    # Risk Calculator (RR = L × S) — two 1-3 scales off the site's card. The
-    # rating and category are recomputed server-side; a client that sends them
-    # is ignored, so a tampered payload cannot under-rate a near miss.
+    # Risk Calculator (RR = L × S) — two 1-3 scales off the site's card.
+    #
+    # riskRating and riskCategory are the coordinator's answer, not a
+    # derivation: the form fills both in from probability × severity and then
+    # lets them pick a different number, which is what the printed card's
+    # "to be filled by EHS Coordinator" box is for. The server bounds them and
+    # falls back to the product when they are absent; it does not overwrite a
+    # deliberate override.
     riskProbability: int | None = Field(default=None, ge=1, le=3)
     riskSeverityLevel: int | None = Field(default=None, ge=1, le=3)
     riskSeverityDescription: str | None = None
+    riskRating: int | None = Field(default=None, ge=1, le=9)
+    riskCategory: str | None = None
 
     # Risk matrix (5 × 5) — the separate section further down the form
     riskLikelihood: int | None = Field(default=None, ge=1, le=5)
@@ -166,6 +173,11 @@ class NearMissUpdate(BaseModel):
     hazardCategoryOther: str | None = None
     nearMissCategory: str | None = None
     nearMissCategoryDetail: str | None = None
+    riskProbability: int | None = Field(default=None, ge=1, le=3)
+    riskSeverityLevel: int | None = Field(default=None, ge=1, le=3)
+    riskSeverityDescription: str | None = None
+    riskRating: int | None = Field(default=None, ge=1, le=9)
+    riskCategory: str | None = None
     hazardCategory: str | None = None
     energySource: str | None = None
     activityBeingPerformed: str | None = None
