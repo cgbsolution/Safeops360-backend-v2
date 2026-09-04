@@ -23,13 +23,24 @@ def is_at_risk(obs_type: str) -> bool:
     return obs_type in AT_RISK_TYPES
 
 
-def quality_score(description: str, area_id: str | None, responsible_id: str | None) -> int:
+def quality_score(
+    description: str,
+    area_id: str | None,
+    responsible_id: str | None,
+    location: str | None = None,
+) -> int:
     """0..3 specificity: named act (≥40 chars of specifics) + named location +
-    named person/role."""
+    named person/role.
+
+    The location point is scored from EITHER a structured area or the free-text
+    `location` the form now collects. Keying it on `area_id` alone would have
+    docked every observation filed since the Area dropdown was replaced, which
+    would read as a site-wide collapse in reporting quality that never happened.
+    """
     score = 0
     if description and len(description.strip()) >= 40:
         score += 1
-    if area_id:
+    if area_id or (location or "").strip():
         score += 1
     if responsible_id:
         score += 1

@@ -23,8 +23,11 @@ class ObservationCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     plantId: str
+    # Legacy / API callers only — the form now sends `location` instead.
     areaId: str | None = None
-    # Free text — the department as the site names it. See Observation.department.
+    # Free text — where on site this was seen. See Observation.location.
+    location: str | None = None
+    # Picked from the site department list. See Observation.department.
     department: str | None = None
     type: ObservationType
     # Legacy hazard category. Required for the SAFE types (which don't carry
@@ -97,6 +100,7 @@ class ObservationUpdate(BaseModel):
     category: ObservationCategory | None = None
     categoryCode: str | None = None
     subCategoryCode: str | None = None
+    location: str | None = None
     department: str | None = None
     severity: Severity | None = None
     # Same rule as on create, but only evaluated when the edit actually touches
@@ -121,6 +125,7 @@ class ObservationOut(BaseModel):
     severity: Severity
     plantId: str
     areaId: str | None
+    location: str | None = None
     department: str | None = None
     observerId: str
     responsiblePersonId: str | None

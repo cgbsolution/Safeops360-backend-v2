@@ -95,12 +95,74 @@ _STOP_CATEGORY_CODES = frozenset({
     "HOUSEKEEPING",
 })
 
+# ─── Page Industries category master → legacy enum bucket ────────────────────
+# The site's own 17 condition / 19 act categories replaced the DuPont six on the
+# form (prisma/seed-page-observation-categories.ts). `Observation.category` is a
+# NOT NULL native Postgres enum with 15 labels, so each new code has to roll up
+# to one of them.
+#
+# Rolling up rather than extending the enum is deliberate. The precise category
+# is kept in full fidelity in `categoryCode` (plain TEXT, no constraint), which
+# is what the observation detail view, the taxonomy API and the SLA
+# category-group matrix all key on. `category` stays a coarse bucket so the
+# fifteen-odd existing dashboards that group by it keep producing the same
+# shape of answer instead of sprouting 36 new slices — and so this change needs
+# no ALTER TYPE against a live enum.
+#
+# Codes with no honest bucket (Ergonomics, Environmental, Structural, Utilities)
+# map to OTHERS. That is a real loss of resolution in `category`-grouped
+# reporting only; group by `categoryCode` to get the site's own list back.
+#
+# Keep in step with the `legacy` field in seed-page-observation-categories.ts.
+_PAGE_CATEGORY_TO_LEGACY: dict[str, str] = {
+    # Unsafe condition — a state of the plant.
+    "UC_POOR_HOUSEKEEPING": "HOUSEKEEPING",
+    "UC_SLIP_AND_TRIP": "HOUSEKEEPING",
+    "UC_MACHINE_SAFETY": "TOOLS_EQUIPMENT",
+    "UC_ELECTRICAL_HAZARD": "ELECTRICAL",
+    "UC_FIRE_AND_EMERGENCY": "EMERGENCY_PREP",
+    "UC_CHEMICAL_SAFETY": "CHEMICAL_HANDLING",
+    "UC_MATERIAL_STACKING": "MATERIAL_HANDLING",
+    "UC_WORK_AT_HEIGHT": "WORK_AT_HEIGHT",
+    "UC_PPE": "PPE",
+    "UC_ERGONOMICS": "OTHERS",
+    "UC_VEHICLE_TRAFFIC_PARKING": "MOBILE_EQUIPMENT",
+    "UC_TOOLS_AND_EQUIPMENT": "TOOLS_EQUIPMENT",
+    "UC_LOTO": "PROCEDURES",
+    "UC_ENVIRONMENTAL": "OTHERS",
+    "UC_STRUCTURAL": "OTHERS",
+    "UC_UTILITIES": "OTHERS",
+    "UC_OTHERS": "OTHERS",
+    # Unsafe act — something a person did.
+    "UA_WORKING_WITHOUT_AUTHORIZATION": "PROCEDURES",
+    "UA_FAILURE_TO_USE_PPE": "PPE",
+    "UA_IMPROPER_USE_OF_EQUIPMENT": "TOOLS_EQUIPMENT",
+    "UA_BYPASSING_SAFETY_DEVICE": "TOOLS_EQUIPMENT",
+    "UA_IMPROPER_MATERIAL_HANDLING": "MATERIAL_HANDLING",
+    "UA_VIOLATION_OF_WORK_PERMIT": "PROCEDURES",
+    "UA_HORSEPLAY": "REACTIONS_OF_PEOPLE",
+    "UA_FAILURE_TO_FOLLOW_SOP": "PROCEDURES",
+    "UA_FAILURE_TO_USE_LOTO": "PROCEDURES",
+    "UA_WORKING_IN_UNSECURE_POSITION": "POSITIONS_OF_PEOPLE",
+    "UA_FAILURE_TO_REPORT_HAZARD": "REACTIONS_OF_PEOPLE",
+    "UA_UNAUTHORIZED_MODIFICATION": "PROCEDURES",
+    "UA_ENTERING_RESTRICTED_AREA": "POSITIONS_OF_PEOPLE",
+    "UA_DISTRACTED_WORKING": "REACTIONS_OF_PEOPLE",
+    "UA_IMPROPER_CHEMICAL_HANDLING": "CHEMICAL_HANDLING",
+    "UA_REVERSING_WITHOUT_CHECKING": "MOBILE_EQUIPMENT",
+    "UA_FAILURE_TO_COMMUNICATE": "PROCEDURES",
+    "UA_UNAUTHORIZED_EQUIPMENT_USE": "TOOLS_EQUIPMENT",
+    "UA_OTHERS": "OTHERS",
+}
+
 
 def legacy_category_for(category_code: str | None) -> str | None:
     """The value to store in the legacy `category` enum column."""
-    if category_code and category_code in _STOP_CATEGORY_CODES:
+    if not category_code:
+        return None
+    if category_code in _STOP_CATEGORY_CODES:
         return category_code
-    return None
+    return _PAGE_CATEGORY_TO_LEGACY.get(category_code)
 
 
 # ─── Reads ────────────────────────────────────────────────────────────────────

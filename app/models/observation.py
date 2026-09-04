@@ -111,17 +111,21 @@ class Observation(Base, IdMixin):
     taxonomyAxis: Mapped[str | None] = mapped_column(String, index=True)
 
     plantId: Mapped[str] = mapped_column(ForeignKey("Plant.id"), nullable=False)
+    # Kept for legacy records and for the area hazard tier the severity engine
+    # reads. New observations leave it null and carry `location` instead.
     areaId: Mapped[str | None] = mapped_column(ForeignKey("Area.id"))
-    # Free text, typed by the observer. Deliberately NOT an FK to a department
-    # master: observers name the department the way the site says it out loud
-    # ("Dye House", "Utilities night shift"), and gating the observation on a
-    # master row that hasn't been created yet loses the observation. Analytics
-    # that need a clean grouping should key on plantId/areaId, which are
-    # structured.
+    # Free text, typed by the observer — where on site this was seen. Replaced
+    # the Area dropdown: the place something is observed is rarely one of a
+    # plant's registered areas ("behind the Elastic line, near the RM door"),
+    # and a master row nobody has created must not be what stops an observation
+    # being filed. Added by apply-observation-location-ddl.ts.
+    location: Mapped[str | None] = mapped_column(String)
+    # Picked from the site department list (src/lib/observation-masters.ts).
+    # Stored as text, not an FK: there is no Department table in this schema.
     department: Mapped[str | None] = mapped_column(String)
-    # The Prisma schema has no `location` or `correctiveAction` column on
-    # Observation — those live on NearMiss / Incident. Don't add them here
-    # or INSERT will fail with "column does not exist".
+    # NOTE: `correctiveAction` still does NOT exist on Observation — it lives on
+    # NearMiss / Incident. Don't add it here or INSERT will fail with
+    # "column does not exist".
 
     observerId: Mapped[str] = mapped_column(ForeignKey("User.id"), nullable=False)
     responsiblePersonId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))

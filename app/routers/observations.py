@@ -308,7 +308,12 @@ async def create_observation(
     _qerr = validate_quality(_otype, payload.description)
     if _qerr:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, _qerr)
-    _qscore = quality_score(payload.description, payload.areaId, payload.responsiblePersonId)
+    _qscore = quality_score(
+        payload.description,
+        payload.areaId,
+        payload.responsiblePersonId,
+        location=payload.location,
+    )
 
     # ─── STOP taxonomy gate ───
     # 400s on a category/sub-category that doesn't belong to this type's axis
@@ -399,6 +404,7 @@ async def create_observation(
         severity=payload.severity,
         plantId=payload.plantId,
         areaId=payload.areaId,
+        location=(payload.location or "").strip() or None,
         department=(payload.department or "").strip() or None,
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
@@ -623,26 +629,40 @@ async def get_observation(
             {"id": company.id, "name": company.name} if company else None
         )
 
-    # The STOP taxonomy row behind categoryCode/subCategoryCode. Null on safe
-    # observations and on legacy at-risk rows the migration couldn't map.
+    # The taxonomy row behind categoryCode. Null on safe observations and on
+    # legacy at-risk rows the migration couldn't map.
+    #
+    # Keyed on (categoryCode, axis) ONLY. It used to require subCategoryCode
+    # too, which meant that once the Sub-category field was removed every new
+    # observation fell through to the coarse legacy `category` enum — a record
+    # filed as "Bypassing safety device / guards" displayed as "Tools
+    # Equipment". The sub-category label is still returned when the record
+    # happens to carry one.
     out["stopTaxonomy"] = None
-    if obs.categoryCode and obs.subCategoryCode and obs.taxonomyAxis:
-        tax = (
-            await db.execute(
-                select(
-                    ObservationTaxonomy.categoryLabel,
-                    ObservationTaxonomy.subCategoryLabel,
-                    ObservationTaxonomy.stopReferenceCode,
-                )
-                .where(ObservationTaxonomy.categoryCode == obs.categoryCode)
-                .where(ObservationTaxonomy.subCategoryCode == obs.subCategoryCode)
-                .where(ObservationTaxonomy.observationType == obs.taxonomyAxis)
+    if obs.categoryCode and obs.taxonomyAxis:
+        stmt = (
+            select(
+                ObservationTaxonomy.categoryLabel,
+                ObservationTaxonomy.subCategoryLabel,
+                ObservationTaxonomy.stopReferenceCode,
             )
-        ).first()
+            .where(ObservationTaxonomy.categoryCode == obs.categoryCode)
+            .where(ObservationTaxonomy.observationType == obs.taxonomyAxis)
+        )
+        if obs.subCategoryCode:
+            stmt = stmt.where(ObservationTaxonomy.subCategoryCode == obs.subCategoryCode)
+        else:
+            # Any row for this category carries the category's own label; take
+            # the first in display order for a stable answer.
+            stmt = stmt.order_by(ObservationTaxonomy.displayOrder)
+        tax = (await db.execute(stmt.limit(1))).first()
         if tax is not None:
             out["stopTaxonomy"] = {
                 "categoryLabel": tax[0],
-                "subCategoryLabel": tax[1],
+                # Only meaningful when the record actually carries one — the
+                # placeholder "General" row must never surface as a real
+                # sub-category the observer chose.
+                "subCategoryLabel": tax[1] if obs.subCategoryCode else None,
                 "stopReferenceCode": tax[2],
             }
 
@@ -728,7 +748,8 @@ async def update_observation(
         v is not None
         for v in (
             payload.type, payload.category, payload.categoryCode, payload.subCategoryCode,
-            payload.severity, payload.description, payload.areaId, payload.department,
+            payload.severity, payload.description, payload.areaId, payload.location,
+            payload.department,
         )
     )
     if core_edit and obs.status == ObservationStatus.CLOSED:
@@ -775,6 +796,8 @@ async def update_observation(
         obs.description = payload.description
     if payload.areaId is not None:
         obs.areaId = payload.areaId or None
+    if payload.location is not None:
+        obs.location = payload.location.strip() or None
     if payload.department is not None:
         obs.department = payload.department.strip() or None
     if payload.responsiblePersonId is not None:
