@@ -85,12 +85,17 @@ DEFINITIONS: list[dict[str, Any]] = [
         "module": "OBSERVATION",
         "recordType": None,
         "name": "Safety Observation — default",
-        "description": "Maker → Action Owner executes → Safety Officer verifies → HSE Manager closes",
+        # Verification returns to the OBSERVER who raised the report (ORIGINATOR),
+        # and closure is the Plant Head. See the same block in
+        # prisma/seed-workflows.ts for the reasoning, and
+        # scripts/observation_verifier_closure.py for how it is applied to a
+        # populated database without orphaning in-flight instances.
+        "description": "Maker → Action Owner executes → Observer verifies → Plant Head closes",
         "steps": [
             {"sequence": 1, "stepType": "MAKER", "name": "Submitted by Observer"},
             {"sequence": 2, "stepType": "ASSIGNEE_TASK", "name": "Action Owner Executes", "approverField": "ACTION_OWNER", "slaHours": 168, "escalationRole": "HSE_MANAGER"},
-            {"sequence": 3, "stepType": "VERIFIER", "name": "Safety Officer Verifies", "approverRole": "SAFETY_OFFICER", "slaHours": 48},
-            {"sequence": 4, "stepType": "CLOSURE", "name": "HSE Manager Closes", "approverRole": "HSE_MANAGER"},
+            {"sequence": 3, "stepType": "VERIFIER", "name": "Observer Verification", "approverField": "ORIGINATOR", "slaHours": 24, "escalationRole": "HSE_MANAGER"},
+            {"sequence": 4, "stepType": "CLOSURE", "name": "Plant Head Closure", "approverRole": "PLANT_HEAD"},
         ],
     },
     {

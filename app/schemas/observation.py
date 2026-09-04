@@ -29,6 +29,8 @@ class ObservationCreate(BaseModel):
     location: str | None = None
     # Picked from the site department list. See Observation.department.
     department: str | None = None
+    # COMPANY | CONTRACTOR. See Observation.employmentType.
+    employmentType: str | None = None
     type: ObservationType
     # Legacy hazard category. Required for the SAFE types (which don't carry
     # the STOP taxonomy); for at-risk types the router DERIVES it from
@@ -102,6 +104,7 @@ class ObservationUpdate(BaseModel):
     subCategoryCode: str | None = None
     location: str | None = None
     department: str | None = None
+    employmentType: str | None = None
     severity: Severity | None = None
     # Same rule as on create, but only evaluated when the edit actually touches
     # something the suggestion depends on (severity, taxonomy, type or area).
@@ -127,6 +130,7 @@ class ObservationOut(BaseModel):
     areaId: str | None
     location: str | None = None
     department: str | None = None
+    employmentType: str | None = None
     observerId: str
     responsiblePersonId: str | None
     contractorCompanyId: str | None = None

@@ -301,6 +301,16 @@ async def create_observation(
     if plant is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid plant")
 
+    # "Employed By" — COMPANY | CONTRACTOR. Validated rather than trusted: the
+    # column carries a CHECK constraint, and a bad value would surface as an
+    # opaque IntegrityError at flush rather than a message the caller can act on.
+    _employment_type = (payload.employmentType or "").strip().upper() or None
+    if _employment_type not in (None, "COMPANY", "CONTRACTOR"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "employmentType must be COMPANY or CONTRACTOR.",
+        )
+
     # P3-1 BBS quality gate — reject vague at-risk submissions; compute specificity.
     from app.services.bbs_quality import capa_recommended, quality_score, validate_quality
 
@@ -406,6 +416,7 @@ async def create_observation(
         areaId=payload.areaId,
         location=(payload.location or "").strip() or None,
         department=(payload.department or "").strip() or None,
+        employmentType=_employment_type,
         observerId=user.id,
         responsiblePersonId=payload.responsiblePersonId,
         contractorCompanyId=payload.contractorCompanyId,
@@ -800,6 +811,14 @@ async def update_observation(
         obs.location = payload.location.strip() or None
     if payload.department is not None:
         obs.department = payload.department.strip() or None
+    if payload.employmentType is not None:
+        _et = payload.employmentType.strip().upper() or None
+        if _et not in (None, "COMPANY", "CONTRACTOR"):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "employmentType must be COMPANY or CONTRACTOR.",
+            )
+        obs.employmentType = _et
     if payload.responsiblePersonId is not None:
         obs.responsiblePersonId = payload.responsiblePersonId or None
     if payload.targetDate is not None:
@@ -1001,6 +1020,46 @@ async def list_attachments(
     return {"items": [_attachment_to_dict(r) for r in rows]}
 
 
+async def _guard_attachment_category(
+    db: AsyncSession, obs: Observation, user: User, category: str
+) -> None:
+    """Restrict each attachment category to the person whose evidence it is.
+
+    Deliberately not folded into the `can()` check above: this is not about a
+    role holding a permission, it is about which of several legitimate
+    participants owns which half of the record's evidence.
+    """
+    if category == "INITIAL_PHOTO":
+        if obs.observerId != user.id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Site photos belong to the observer who filed this observation. "
+                "If you are completing the corrective action, attach your photos "
+                "as action evidence when you submit the task.",
+            )
+        return
+
+    if category == "ACTION_EVIDENCE":
+        from app.models.workflow import WorkflowTask
+
+        held = (
+            await db.execute(
+                select(WorkflowTask.id)
+                .where(WorkflowTask.module == "OBSERVATION")
+                .where(WorkflowTask.recordId == obs.id)
+                .where(WorkflowTask.assignedToId == user.id)
+                .where(WorkflowTask.taskType == "EXECUTION")
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if held is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Action evidence can only be attached by the person holding the "
+                "execution task for this observation.",
+            )
+
+
 @router.post("/{observation_id}/attachments")
 async def upload_attachment(
     observation_id: str,
@@ -1034,6 +1093,20 @@ async def upload_attachment(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "File name is required")
         if category not in VALID_OBS_CATEGORIES:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invalid category. Must be one of: {', '.join(VALID_OBS_CATEGORIES)}")
+
+        # ─── Who may attach WHAT ───
+        # OBSERVATION.UPDATE alone is not the right gate here: it is held by the
+        # action owner, the verifier and every HSE role, so it let anyone in the
+        # workflow add photos to the maker's own "Photos & Evidence" section. The
+        # two categories are different pieces of evidence owned by different
+        # people, and mixing them makes the record unreadable — you can no longer
+        # tell what was seen from what was done about it.
+        #
+        # INITIAL_PHOTO  — what the observer saw. Theirs alone.
+        # ACTION_EVIDENCE — proof the fix happened. Only from someone actually
+        #                   holding the execution task, which is what the
+        #                   "Submit Completed Task" panel does.
+        await _guard_attachment_category(db, obs, user, category)
         if file_size <= 0:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "File size must be a positive number")
         if file_size > MAX_OBS_FILE_SIZE:

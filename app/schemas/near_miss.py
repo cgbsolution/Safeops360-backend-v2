@@ -53,7 +53,8 @@ class NearMissCreate(BaseModel):
 
     # Department & shift
     departmentId: str | None = None
-    shiftId: str | None = None
+    departmentName: str | None = None  # free-text pick from the site department list
+    shiftId: str | None = None  # MasterItem(SHIFT) id, or a NEAR_MISS_SHIFT code (GS/FS/SS/NS)
 
     # Reporter context
     reporterType: Literal["EMPLOYEE", "CONTRACTOR", "EXTERNAL", "ANONYMOUS"] | None = None
@@ -112,6 +113,8 @@ class NearMissUpdate(BaseModel):
     areaId: str | None = None
     location: str | None = None
     specificLocation: str | None = None
+    departmentName: str | None = None
+    shiftId: str | None = None
     hazardCategory: str | None = None
     energySource: str | None = None
     activityBeingPerformed: str | None = None
@@ -143,6 +146,7 @@ class NearMissOut(BaseModel):
 
     # Departmental / shift
     departmentId: str | None
+    departmentName: str | None
     shiftId: str | None
 
     reporterType: str | None

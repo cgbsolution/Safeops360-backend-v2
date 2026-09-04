@@ -72,6 +72,20 @@ from app.services.storage import (
 router = APIRouter(prefix="/api/near-miss", tags=["near-miss"])
 
 
+# ─── Shift codes ───────────────────────────────────────────────────────
+# The site runs four named shifts. They are stored in NearMiss.shiftId as
+# the code itself rather than as a MasterItem id: the generic SHIFT master
+# (A/B/C/G) is shared with Incidents and is not this site's roster, and
+# forking it would have changed the Incident form too. Historic near
+# misses still hold MasterItem ids, so both resolve on read.
+NEAR_MISS_SHIFTS: dict[str, str] = {
+    "GS": "GS — General Shift",
+    "FS": "FS — First Shift",
+    "SS": "SS — Second Shift",
+    "NS": "NS — Night Shift",
+}
+
+
 # ─── Risk matrix → level mapping (5×5 standard) ────────────────────────
 
 _RISK_LEVELS: dict[int, str] = {}
@@ -367,7 +381,10 @@ async def create_near_miss(
     payload_suggested_owner = payload.suggestedActionOwnerId if await _fk_exists(User, payload.suggestedActionOwnerId) else None
     # shiftId, hazardCategory, energySource, activityBeingPerformed all FK
     # by id to MasterItem (untyped — generic lookup). Validate.
-    payload_shift_id = payload.shiftId if await _fk_exists(_MI, payload.shiftId) else None
+    # A shift is either one of the four site codes or a legacy MasterItem id.
+    payload_shift_id = payload.shiftId if payload.shiftId in NEAR_MISS_SHIFTS else None
+    if payload_shift_id is None:
+        payload_shift_id = payload.shiftId if await _fk_exists(_MI, payload.shiftId) else None
     payload_hazard_cat = payload.hazardCategory if await _fk_exists(_MI, payload.hazardCategory) else None
     payload_energy_src = payload.energySource if await _fk_exists(_MI, payload.energySource) else None
     payload_activity = payload.activityBeingPerformed if await _fk_exists(_MI, payload.activityBeingPerformed) else None
@@ -398,6 +415,7 @@ async def create_near_miss(
         gpsLatitude=payload.gpsLatitude,
         gpsLongitude=payload.gpsLongitude,
         departmentId=payload_department_id,
+        departmentName=payload.departmentName,
         shiftId=payload_shift_id,
         reporterType=reporter_type,
         isAnonymous=payload.isAnonymous,
@@ -718,10 +736,15 @@ async def get_near_miss(
     )
     out["actionOwner"] = people.get(nm.actionOwnerId) if nm.actionOwnerId else None
 
+    # New submissions carry the department as text (departmentName); records
+    # raised before that carry a Department FK. Expose both under one shape so
+    # the detail view has a single field to read.
     out["department"] = None
     if nm.departmentId:
         dept = await db.get(Department, nm.departmentId)
         out["department"] = {"id": dept.id, "name": dept.name} if dept else None
+    if out["department"] is None and nm.departmentName:
+        out["department"] = {"id": None, "name": nm.departmentName}
 
     out["equipment"] = None
     if nm.equipmentId:
@@ -766,7 +789,12 @@ async def get_near_miss(
             ).all()
         }
     out["shift"] = (
-        {"id": nm.shiftId, "label": mi_labels.get(nm.shiftId)} if nm.shiftId else None
+        {
+            "id": nm.shiftId,
+            "label": NEAR_MISS_SHIFTS.get(nm.shiftId) or mi_labels.get(nm.shiftId),
+        }
+        if nm.shiftId
+        else None
     )
     out["activityBeingPerformedLabel"] = mi_labels.get(nm.activityBeingPerformed)
     out["hazardCategoryLabel"] = mi_labels.get(nm.hazardCategory)
@@ -902,6 +930,10 @@ async def update_near_miss(
         nm.location = payload.location or None
     if payload.specificLocation is not None:
         nm.specificLocation = payload.specificLocation or None
+    if payload.departmentName is not None:
+        nm.departmentName = payload.departmentName or None
+    if payload.shiftId is not None:
+        nm.shiftId = payload.shiftId if payload.shiftId in NEAR_MISS_SHIFTS else None
     if payload.hazardCategory is not None:
         nm.hazardCategory = payload.hazardCategory or None
     if payload.energySource is not None:

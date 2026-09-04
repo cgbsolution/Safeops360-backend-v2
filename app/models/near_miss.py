@@ -47,7 +47,12 @@ class NearMiss(Base, IdMixin):
     gpsLongitude: Mapped[float | None] = mapped_column(Float)
 
     departmentId: Mapped[str | None] = mapped_column(ForeignKey("Department.id"))
-    shiftId: Mapped[str | None] = mapped_column(String)  # FK by id to MasterItem(type=SHIFT)
+    # The reporting form picks from the site's own fixed department list
+    # (the same twenty names the Safety Observation form uses), which is not
+    # the plant-scoped Department master — so it is stored as text, exactly
+    # as Observation.department is. departmentId stays for the legacy/FK path.
+    departmentName: Mapped[str | None] = mapped_column(String)
+    shiftId: Mapped[str | None] = mapped_column(String)  # MasterItem(type=SHIFT) id, or a NEAR_MISS_SHIFT code
 
     reporterType: Mapped[str | None] = mapped_column(String)
     isAnonymous: Mapped[bool] = mapped_column(Boolean, default=False)

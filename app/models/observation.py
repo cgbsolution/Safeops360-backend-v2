@@ -123,6 +123,13 @@ class Observation(Base, IdMixin):
     # Picked from the site department list (src/lib/observation-masters.ts).
     # Stored as text, not an FK: there is no Department table in this schema.
     department: Mapped[str | None] = mapped_column(String)
+    # COMPANY | CONTRACTOR — the "Employed By" answer on the maker form. Used to
+    # be inferred from whether contractorCompanyId was set; once the Contractor
+    # Company dropdown was removed that inference had nothing to read, so the
+    # answer is stored directly. Null on pre-existing records: they have no
+    # recorded answer, and COMPANY would be an invented one.
+    # Added by apply-observation-employment-type-ddl.ts (CHECK-constrained).
+    employmentType: Mapped[str | None] = mapped_column(String)
     # NOTE: `correctiveAction` still does NOT exist on Observation — it lives on
     # NearMiss / Incident. Don't add it here or INSERT will fail with
     # "column does not exist".
