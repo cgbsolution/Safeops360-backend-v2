@@ -85,6 +85,84 @@ NEAR_MISS_SHIFTS: dict[str, str] = {
     "NS": "NS — Night Shift",
 }
 
+# ─── "Other" activity ──────────────────────────────────────────────────
+# activityBeingPerformed normally holds an ACTIVITY_TYPE MasterItem id. This
+# sentinel is the one value that is not one: the reporter chose "Other" and
+# described the activity in the free-text `activity` field instead. Kept out
+# of the shared ACTIVITY_TYPE master because that master also feeds the
+# Incident form.
+ACTIVITY_OTHER = "OTHER"
+ACTIVITY_OTHER_LABEL = "Other"
+
+
+# ─── Risk Calculator (RR = L × S) ──────────────────────────────────────
+# The site's printed near miss card scores risk on two independent 1-3 scales
+# and bands their product. Only the codes live here — the wording of each level
+# is in src/lib/near-miss/risk-masters.ts, which is what renders the form and
+# the detail view. Codes are the contract; labels have one home.
+#
+# L × S over two 1-3 scales can only produce these six numbers, so every
+# reachable rating is listed rather than inferred from thresholds.
+RISK_RATING_TO_CATEGORY: dict[int, str] = {
+    1: "LOW_RISK",
+    2: "LOW_RISK",
+    3: "MEDIUM_RISK",
+    4: "MEDIUM_RISK",
+    6: "HIGH_RISK",
+    9: "HIGH_RISK",
+}
+
+HAZARD_CATEGORY_CODES: frozenset[str] = frozenset(
+    {
+        "SLIP_TRIP_HAZARD",
+        "POOR_HOUSEKEEPING",
+        "EQUIPMENT_DEFICIENCY",
+        "OVERHEAD_LOAD",
+        "UNSAFE_EQUIPMENT",
+        "SHARP_EDGES",
+        "CHEMICAL_SPILLAGE",
+        "STRUCTURAL_DAMAGE",
+        "PERMIT_NON_COMPLIANCE",
+        "MATERIAL_MOVEMENT",
+        "PROCEDURE_NON_COMPLIANCE",
+        "SUDDEN_LOUD_NOISE",
+        "AWKWARD_POSTURE",
+        "PPE_NON_COMPLIANCE",
+        "ELECTRICAL_HAZARD",
+        "MANUAL_HANDLING",
+        "OTHER_UNSAFE_ACT_CONDITION",
+    }
+)
+
+NEAR_MISS_CATEGORY_CODES: frozenset[str] = frozenset(
+    {
+        "ABOUT_TO_FALL_FROM_EDGE",
+        "ABOUT_TO_TOUCH_HOT_SURFACE",
+        "ABOUT_TO_HIT_BY_LOW_HEIGHT_OBJECTS",
+        "ESCAPED_CRUSHING_OF_HANDS",
+        "MILD_ELECTRIC_SHOCK_OR_SPARK",
+        "SLIPPED_ON_FLOOR_OR_STAIRS",
+        "ESCAPED_FROM_SHARP_OBJECTS",
+        "TRIPPED_ON_FLOOR",
+        "ESCAPED_FROM_FALLING_OBJECT",
+        "ABOUT_TO_HIT_BY_MATERIAL_MOVEMENT",
+        "OTHER",
+    }
+)
+
+
+def risk_calculator(probability: int | None, severity: int | None) -> tuple[int | None, str | None]:
+    """Rating and category for a probability/severity pair, or (None, None)
+    when the reporter left the calculator blank. Recomputed here rather than
+    trusted from the payload — the arithmetic is the whole point of the
+    control, and a client that sent its own answer could under-rate a near
+    miss into a longer SLA band."""
+
+    if not probability or not severity:
+        return None, None
+    rating = probability * severity
+    return rating, RISK_RATING_TO_CATEGORY.get(rating)
+
 
 # ─── Risk matrix → level mapping (5×5 standard) ────────────────────────
 
@@ -387,12 +465,40 @@ async def create_near_miss(
         payload_shift_id = payload.shiftId if await _fk_exists(_MI, payload.shiftId) else None
     payload_hazard_cat = payload.hazardCategory if await _fk_exists(_MI, payload.hazardCategory) else None
     payload_energy_src = payload.energySource if await _fk_exists(_MI, payload.energySource) else None
-    payload_activity = payload.activityBeingPerformed if await _fk_exists(_MI, payload.activityBeingPerformed) else None
+    if payload.activityBeingPerformed == ACTIVITY_OTHER:
+        payload_activity = ACTIVITY_OTHER
+    else:
+        payload_activity = (
+            payload.activityBeingPerformed
+            if await _fk_exists(_MI, payload.activityBeingPerformed)
+            else None
+        )
 
     contractor_company_id = payload_contractor_id
 
-    # CRITICAL severity → flag for auto-promotion. The actual Incident
-    # record + SMS/email notifications land in Commit 3.
+    # Hazard grid and category tile — fixed code lists, so an unknown code is a
+    # bug or a tampered payload rather than stale master data. Drop unknowns
+    # instead of 400-ing: a near miss report is never worth rejecting over a
+    # checkbox, and the reporter cannot fix a code they never saw.
+    hazard_categories = [
+        c for c in (payload.hazardCategories or []) if c in HAZARD_CATEGORY_CODES
+    ] or None
+    near_miss_category = (
+        payload.nearMissCategory
+        if payload.nearMissCategory in NEAR_MISS_CATEGORY_CODES
+        else None
+    )
+
+    risk_rating, risk_category = risk_calculator(
+        payload.riskProbability, payload.riskSeverityLevel
+    )
+
+    # CRITICAL severity → flag for auto-promotion to an Incident (+ SMS/email).
+    # The report form no longer offers CRITICAL: the site's printed card bands
+    # risk LOW / MEDIUM / HIGH and has no fourth tier, so in practice this is
+    # False for everything raised through the UI. The branch stays because the
+    # severity is editable afterwards and because auto_promote_near_miss is
+    # still the right behaviour if a CRITICAL ever arrives.
     auto_promote = payload.potentialSeverity == Severity.CRITICAL
 
     # Legacy CSV from new structured potentialConsequences for back-compat
@@ -423,14 +529,24 @@ async def create_near_miss(
         activityIsRoutine=payload.activityIsRoutine,
         activity=payload.activity,
         immediateAction=payload.immediateAction,
+        equipmentInvolved=payload.equipmentInvolved,
         equipmentId=payload_equipment_id,
         contractorCompanyId=contractor_company_id,
         potentialSeverity=payload.potentialSeverity,
         potentialConsequence=legacy_consequence,
         potentialConsequences=[c.model_dump(exclude_none=True) for c in (payload.potentialConsequences or [])] or None,
         multipleWorkersAggravator=payload.multipleWorkersAggravator,
+        hazardCategories=hazard_categories,
+        hazardCategoryOther=(payload.hazardCategoryOther or "").strip() or None,
         hazardCategory=payload_hazard_cat,
         energySource=payload_energy_src,
+        nearMissCategory=near_miss_category,
+        nearMissCategoryDetail=(payload.nearMissCategoryDetail or "").strip() or None,
+        riskProbability=payload.riskProbability,
+        riskSeverityLevel=payload.riskSeverityLevel,
+        riskSeverityDescription=(payload.riskSeverityDescription or "").strip() or None,
+        riskRating=risk_rating,
+        riskCategory=risk_category,
         riskLikelihood=payload.riskLikelihood,
         riskConsequence=payload.riskConsequence,
         riskScore=risk_score,
@@ -450,16 +566,81 @@ async def create_near_miss(
     db.add(nm)
     await db.flush()
 
-    # Persist child records (persons involved / affected / witnesses)
-    if payload.personsInvolved:
-        for p in payload.personsInvolved:
-            db.add(NearMissPersonInvolved(nearMissId=nm.id, userId=p.userId, role=p.role))
-    if payload.personsPotentiallyAffected:
-        for p in payload.personsPotentiallyAffected:
-            db.add(NearMissPersonAffected(nearMissId=nm.id, userId=p.userId, proximityToHazard=p.proximityToHazard))
-    if payload.witnesses:
-        for p in payload.witnesses:
-            db.add(NearMissWitness(nearMissId=nm.id, witnessId=p.userId, statementCaptured=p.statementCaptured))
+    # ── Persist child records (persons involved / affected / witnesses) ──
+    # Each entry is either a directory link (partyType USER + userId) or a
+    # hand-typed MANUAL row, which is what the report form now sends. Names
+    # are snapshotted on both so the detail view reads one field, and so a
+    # linked person still reads correctly after a rename or a transfer.
+    def _validate(entries, field: str):
+        out = []
+        for entry in entries or []:
+            try:
+                out.append(entry.validated())
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, f"{field}: {exc}"
+                ) from exc
+        return out
+
+    persons_involved = _validate(payload.personsInvolved, "personsInvolved")
+    persons_affected = _validate(payload.personsPotentiallyAffected, "personsPotentiallyAffected")
+    witnesses = _validate(payload.witnesses, "witnesses")
+
+    # NearMissPersonAffected has no manual columns — it is not offered on the
+    # form and there is nowhere to put a typed name.
+    for entry in persons_affected:
+        if entry.partyType == "MANUAL":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "personsPotentiallyAffected takes directory users only.",
+            )
+
+    linked_ids = {
+        e.userId
+        for e in (*persons_involved, *persons_affected, *witnesses)
+        if e.userId
+    }
+    linked_names: dict[str, str] = {}
+    if linked_ids:
+        linked_names = dict(
+            (
+                await db.execute(select(User.id, User.name).where(User.id.in_(linked_ids)))
+            ).all()
+        )
+
+    def _snapshot(entry) -> str | None:
+        if entry.partyType == "MANUAL":
+            return (entry.name or "").strip() or None
+        return linked_names.get(entry.userId)
+
+    for p in persons_involved:
+        db.add(
+            NearMissPersonInvolved(
+                nearMissId=nm.id,
+                partyType=p.partyType,
+                userId=p.userId,
+                nameSnapshot=_snapshot(p),
+                codeSnapshot=(p.code or "").strip() or None,
+                role=p.role,
+            )
+        )
+    for p in persons_affected:
+        db.add(
+            NearMissPersonAffected(
+                nearMissId=nm.id, userId=p.userId, proximityToHazard=p.proximityToHazard
+            )
+        )
+    for p in witnesses:
+        db.add(
+            NearMissWitness(
+                nearMissId=nm.id,
+                partyType=p.partyType,
+                witnessId=p.userId,
+                nameSnapshot=_snapshot(p),
+                codeSnapshot=(p.code or "").strip() or None,
+                statementCaptured=p.statementCaptured,
+            )
+        )
 
     await db.flush()
     await db.refresh(nm)
@@ -796,7 +977,11 @@ async def get_near_miss(
         if nm.shiftId
         else None
     )
-    out["activityBeingPerformedLabel"] = mi_labels.get(nm.activityBeingPerformed)
+    out["activityBeingPerformedLabel"] = (
+        ACTIVITY_OTHER_LABEL
+        if nm.activityBeingPerformed == ACTIVITY_OTHER
+        else mi_labels.get(nm.activityBeingPerformed)
+    )
     out["hazardCategoryLabel"] = mi_labels.get(nm.hazardCategory)
     out["energySourceLabel"] = mi_labels.get(nm.energySource)
 
@@ -934,6 +1119,20 @@ async def update_near_miss(
         nm.departmentName = payload.departmentName or None
     if payload.shiftId is not None:
         nm.shiftId = payload.shiftId if payload.shiftId in NEAR_MISS_SHIFTS else None
+    if payload.hazardCategories is not None:
+        nm.hazardCategories = [
+            c for c in payload.hazardCategories if c in HAZARD_CATEGORY_CODES
+        ] or None
+    if payload.hazardCategoryOther is not None:
+        nm.hazardCategoryOther = payload.hazardCategoryOther.strip() or None
+    if payload.nearMissCategory is not None:
+        nm.nearMissCategory = (
+            payload.nearMissCategory
+            if payload.nearMissCategory in NEAR_MISS_CATEGORY_CODES
+            else None
+        )
+    if payload.nearMissCategoryDetail is not None:
+        nm.nearMissCategoryDetail = payload.nearMissCategoryDetail.strip() or None
     if payload.hazardCategory is not None:
         nm.hazardCategory = payload.hazardCategory or None
     if payload.energySource is not None:

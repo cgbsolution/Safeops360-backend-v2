@@ -64,6 +64,12 @@ class NearMiss(Base, IdMixin):
     immediateAction: Mapped[str | None] = mapped_column(Text)
 
     # Equipment / contractor
+    # The report form asks "equipment involved? yes / no" and, on yes, takes the
+    # items as typed text — the Equipment master is registered per plant and is
+    # empty for most of them, so the dropdown had nothing to offer. Three states
+    # all carry meaning: None = not answered, [] = reporter said no, [...] = the
+    # named items. equipmentId stays for the records that already link one.
+    equipmentInvolved: Mapped[list | None] = mapped_column(JSON)
     equipmentId: Mapped[str | None] = mapped_column(ForeignKey("Equipment.id"))
     contractorCompanyId: Mapped[str | None] = mapped_column(ForeignKey("ContractorCompany.id"))
 
@@ -76,8 +82,29 @@ class NearMiss(Base, IdMixin):
     multipleWorkersAggravator: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Hazard
-    hazardCategory: Mapped[str | None] = mapped_column(String)
-    energySource: Mapped[str | None] = mapped_column(String)
+    # The report form ticks any number off the site's printed hazard grid; the
+    # codes are in src/lib/near-miss/risk-masters.ts. hazardCategory (a single
+    # MasterItem id) and energySource are the shape it used to send and are
+    # kept for the records that carry them.
+    hazardCategories: Mapped[list | None] = mapped_column(JSON)
+    hazardCategoryOther: Mapped[str | None] = mapped_column(String)
+    hazardCategory: Mapped[str | None] = mapped_column(String)  # legacy MasterItem id
+    energySource: Mapped[str | None] = mapped_column(String)  # legacy MasterItem id
+
+    # Near miss category — exactly one tile off the pictogram grid on the card,
+    # with free text for "Others".
+    nearMissCategory: Mapped[str | None] = mapped_column(String)
+    nearMissCategoryDetail: Mapped[str | None] = mapped_column(String)
+
+    # Risk Calculator (RR = L × S) off the site's printed card. Two independent
+    # 1-3 scales, deliberately separate from the 5×5 pair below: those columns
+    # hold 1-5 readings on the existing records and mixing scales would change
+    # what that data means.
+    riskProbability: Mapped[int | None] = mapped_column(Integer)
+    riskSeverityLevel: Mapped[int | None] = mapped_column(Integer)
+    riskSeverityDescription: Mapped[str | None] = mapped_column(String)
+    riskRating: Mapped[int | None] = mapped_column(Integer)
+    riskCategory: Mapped[str | None] = mapped_column(String)
 
     # Risk matrix
     riskLikelihood: Mapped[int | None] = mapped_column(Integer)

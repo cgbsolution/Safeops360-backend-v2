@@ -6,15 +6,46 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.models.near_miss import NearMissStatus
 from app.models.observation import Severity
 
+#: Matches MIN_MANUAL_NAME in schemas/observation_sla.py — the two modules take
+#: hand-typed people through the same UI component and must agree on what
+#: counts as a name.
+MIN_MANUAL_NAME = 2
+
 
 class NearMissPersonInput(BaseModel):
     """Sub-payload for personsInvolved / personsPotentiallyAffected /
-    witnesses arrays — the form sends `[{userId, role?}]` per person."""
+    witnesses arrays.
 
-    userId: str
+    Two shapes. A USER row carries `userId` and links to the directory. A
+    MANUAL row carries `name` (and usually `code`, the works number) and no id
+    at all — the report form hand-types the people on a near miss, so this is
+    what it sends. Trusted because there is nothing to check it against, which
+    is also why a MANUAL row links to nothing downstream.
+    """
+
+    partyType: Literal["USER", "MANUAL"] = "USER"
+    userId: str | None = None
+    name: str | None = None
+    code: str | None = None
     role: str | None = None
     proximityToHazard: str | None = None  # only for affected
     statementCaptured: bool = False  # only for witnesses
+
+    def validated(self) -> "NearMissPersonInput":
+        if self.partyType == "MANUAL":
+            if self.userId:
+                raise ValueError(
+                    "A manually entered person carries no userId — "
+                    "pick them from the directory instead."
+                )
+            if len((self.name or "").strip()) < MIN_MANUAL_NAME:
+                raise ValueError(
+                    "A manually entered person needs a name of at least "
+                    f"{MIN_MANUAL_NAME} characters."
+                )
+        elif not self.userId:
+            raise ValueError("partyType USER requires userId.")
+        return self
 
 
 class PotentialConsequenceItem(BaseModel):
@@ -67,6 +98,8 @@ class NearMissCreate(BaseModel):
     immediateAction: str | None = None
 
     # Equipment & contractor
+    # None = not asked, [] = "no equipment involved", [...] = the typed items.
+    equipmentInvolved: list[str] | None = None
     equipmentId: str | None = None
     contractorCompanyId: str | None = None
 
@@ -75,11 +108,25 @@ class NearMissCreate(BaseModel):
     potentialConsequences: list[PotentialConsequenceItem] | None = None
     multipleWorkersAggravator: bool = False
 
-    # Hazard
+    # Hazard — the printed grid is tick-any-number; the single MasterItem id
+    # and energySource are the legacy shape and still accepted.
+    hazardCategories: list[str] | None = None
+    hazardCategoryOther: str | None = None
     hazardCategory: str | None = None
     energySource: str | None = None
 
-    # Risk matrix
+    # Near miss category — one pictogram tile, free text for "Others"
+    nearMissCategory: str | None = None
+    nearMissCategoryDetail: str | None = None
+
+    # Risk Calculator (RR = L × S) — two 1-3 scales off the site's card. The
+    # rating and category are recomputed server-side; a client that sends them
+    # is ignored, so a tampered payload cannot under-rate a near miss.
+    riskProbability: int | None = Field(default=None, ge=1, le=3)
+    riskSeverityLevel: int | None = Field(default=None, ge=1, le=3)
+    riskSeverityDescription: str | None = None
+
+    # Risk matrix (5 × 5) — the separate section further down the form
     riskLikelihood: int | None = Field(default=None, ge=1, le=5)
     riskConsequence: int | None = Field(default=None, ge=1, le=5)
 
@@ -115,6 +162,10 @@ class NearMissUpdate(BaseModel):
     specificLocation: str | None = None
     departmentName: str | None = None
     shiftId: str | None = None
+    hazardCategories: list[str] | None = None
+    hazardCategoryOther: str | None = None
+    nearMissCategory: str | None = None
+    nearMissCategoryDetail: str | None = None
     hazardCategory: str | None = None
     energySource: str | None = None
     activityBeingPerformed: str | None = None
@@ -158,6 +209,7 @@ class NearMissOut(BaseModel):
     activity: str | None
     immediateAction: str | None
 
+    equipmentInvolved: list[str] | None
     equipmentId: str | None
     contractorCompanyId: str | None
 
@@ -167,8 +219,19 @@ class NearMissOut(BaseModel):
     potentialConsequences: list[dict[str, Any]] | None
     multipleWorkersAggravator: bool
 
+    hazardCategories: list[str] | None
+    hazardCategoryOther: str | None
     hazardCategory: str | None
     energySource: str | None
+
+    nearMissCategory: str | None
+    nearMissCategoryDetail: str | None
+
+    riskProbability: int | None
+    riskSeverityLevel: int | None
+    riskSeverityDescription: str | None
+    riskRating: int | None
+    riskCategory: str | None
 
     riskLikelihood: int | None
     riskConsequence: int | None
