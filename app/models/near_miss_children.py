@@ -79,8 +79,13 @@ class NearMissCapa(Base, IdMixin):
     )
     description: Mapped[str] = mapped_column(Text, nullable=False)
     type: Mapped[str] = mapped_column(String, nullable=False)
-    ownerId: Mapped[str] = mapped_column(ForeignKey("User.id"), nullable=False)
-    targetDate: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Null between the report being raised and the Safety Officer naming an
+    # owner at step 2 — the reporter writes the CAPA, the Safety Officer says
+    # who does it. The Safety Officer Review step cannot be completed while any
+    # CAPA on the record is still unowned, so a null never reaches execution.
+    ownerId: Mapped[str | None] = mapped_column(ForeignKey("User.id"))
+    # Null for the same window as ownerId — the Safety Officer sets both.
+    targetDate: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
     evidenceUrl: Mapped[str | None] = mapped_column(String)
     evidenceDescription: Mapped[str | None] = mapped_column(Text)

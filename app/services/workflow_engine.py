@@ -416,6 +416,16 @@ async def _resolve_assignee(
                 or record_data.get("investigationLeadId")
                 or record_data.get("actionOwnerId")
             )
+        if approver_field == "SAFETY_OFFICER":
+            # The near miss report names its own Safety Officer. Deliberately
+            # does NOT return when the field is blank — every other branch
+            # here returns unconditionally and so ends the lookup, whereas the
+            # v2 definition sets approverRole="SAFETY_OFFICER" precisely so an
+            # unnamed officer falls through to whoever holds that role at the
+            # plant. Returning None would strand the task with no assignee.
+            safety_officer = record_data.get("safetyOfficerId")
+            if safety_officer:
+                return safety_officer
         if approver_field == "ASSIGNED_INSPECTOR":
             return record_data.get("inspectorId")
         if approver_field == "RECEIVER":
@@ -891,23 +901,32 @@ async def _create_tasks_for_step(
             assignees = [initiator_id]
 
     elif strategy == "CAPA_FAN_OUT" and module == "NEAR_MISS":
-        # One task per NearMissCapa row attached to this near miss. Each
-        # CAPA owner gets their own EXECUTION task; the parent step
-        # advances only when ALL CAPAs are completed.
+        # One EXECUTION task per CAPA OWNER on this near miss; the parent step
+        # advances only when every owner is done.
+        #
+        # Deduped by owner, matching the INCIDENT branch below and for the same
+        # reason: a WorkflowTask has no column saying which CAPA it belongs to,
+        # so two tasks for one person on one step are indistinguishable in their
+        # inbox and their submissions ambiguous. That used to be rare, because
+        # CAPAs were written one at a time at a review meeting. Now the reporter
+        # writes several on the form and the Safety Officer routinely hands them
+        # to the same maintenance lead, so it is the normal case.
         from app.models.near_miss_children import NearMissCapa
 
         capa_rows = (
             await db.execute(
-                select(NearMissCapa).where(NearMissCapa.nearMissId == record_id)
+                select(NearMissCapa)
+                .where(NearMissCapa.nearMissId == record_id)
+                .order_by(NearMissCapa.createdAt.asc())
             )
         ).scalars().all()
         for capa in capa_rows:
-            if capa.ownerId:
+            if capa.ownerId and capa.ownerId not in assignees:
                 assignees.append(capa.ownerId)
         if not assignees:
-            # No CAPAs defined — fall back to single task assigned to
-            # the suggested action owner / initiator. The reviewer will
-            # add CAPAs at the previous step normally.
+            # No CAPAs defined — fall back to a single task on the initiator.
+            # The Safety Officer Review gate stops an owner-less CAPA reaching
+            # here, so this only fires when a near miss carries no CAPA at all.
             assignees = [initiator_id]
 
     elif strategy == "CAPA_FAN_OUT" and module == "INCIDENT":
@@ -1440,6 +1459,28 @@ async def approve(
             inc_row.closingRemark = comments.strip()
             inc_row.closedById = user_id
             await db.flush()
+
+    # NEAR_MISS: the Safety Officer Review step hands the work out, so it
+    # cannot be signed off while a CAPA still has nobody to do it or no date to
+    # do it by. Without this the next step's CAPA_FAN_OUT silently skips every
+    # owner-less row, and — if that leaves no assignees at all — routes one
+    # task back to the initiator, which reads as "no CAPAs were needed" rather
+    # than "nobody was assigned". Checked here rather than in the router
+    # because approving is the only way past this step.
+    if task.module == "NEAR_MISS" and current_step.name == "Safety Officer Review":
+        from app.models.near_miss_children import NearMissCapa
+
+        capa_rows = (
+            await db.execute(
+                select(NearMissCapa).where(NearMissCapa.nearMissId == task.recordId)
+            )
+        ).scalars().all()
+        unassigned = [c for c in capa_rows if not c.ownerId or not c.targetDate]
+        if unassigned:
+            raise WorkflowError(
+                f"{len(unassigned)} of {len(capa_rows)} CAPAs still need an owner and a "
+                "target date. Assign them before approving this step."
+            )
 
     return await _advance(
         db,

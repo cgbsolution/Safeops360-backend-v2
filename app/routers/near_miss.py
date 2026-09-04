@@ -40,6 +40,8 @@ from app.models.epc import ContractorCompany
 from app.models.near_miss import NearMiss, NearMissStatus
 from app.models.near_miss_children import (
     NearMissAttachment,
+    NearMissCapa,
+    NearMissComment,
     NearMissPersonAffected,
     NearMissPersonInvolved,
     NearMissWitness,
@@ -455,6 +457,10 @@ async def create_near_miss(
     # Compute risk + SLA
     risk_score, risk_level = _compute_risk(payload.riskLikelihood, payload.riskConsequence)
     sla_hours = _SLA_HOURS_BY_SEVERITY.get(payload.potentialSeverity, 168)
+    # The report form offers SLA presets; severity supplies the default. Stored
+    # as well as applied so a later severity edit cannot move the deadline.
+    if payload.slaHours:
+        sla_hours = payload.slaHours
     sla_target = datetime.now(timezone.utc) + timedelta(hours=sla_hours)
 
     # Auto-detection
@@ -585,7 +591,9 @@ async def create_near_miss(
         activePermitId=active_permit_id,
         permitReviewFlagged=bool(active_permit_id),
         autoPromoteToIncident=auto_promote,
+        slaHours=sla_hours,
         slaTargetAt=sla_target,
+        targetDate=payload.targetDate,
         status=NearMissStatus.REPORTED,
     )
     db.add(nm)
@@ -655,6 +663,21 @@ async def create_near_miss(
                 nearMissId=nm.id, userId=p.userId, proximityToHazard=p.proximityToHazard
             )
         )
+    # CAPAs written on the report form. Owner-less by design: the Safety
+    # Officer names an owner for each at step 2, and that step will not
+    # complete while any is still unowned.
+    for capa_in in payload.capas or []:
+        db.add(
+            NearMissCapa(
+                nearMissId=nm.id,
+                description=capa_in.description.strip(),
+                type=capa_in.type,
+                ownerId=None,
+                targetDate=capa_in.targetDate,
+                status="PENDING",
+            )
+        )
+
     for p in witnesses:
         db.add(
             NearMissWitness(
@@ -685,6 +708,10 @@ async def create_near_miss(
                     "plantId": nm.plantId,
                     "reporterId": nm.reporterId,
                     "departmentId": nm.departmentId,
+                    # Resolves step 2's assignee — see _resolve_assignee's
+                    # SAFETY_OFFICER branch. Falls back to the role when the
+                    # reporter named nobody.
+                    "safetyOfficerId": nm.suggestedActionOwnerId,
                     "isCritical": auto_promote,
                 },
                 initiator_id=user.id,
@@ -1463,24 +1490,32 @@ async def download_attachment(
 
 
 # ─── CAPAs ─────────────────────────────────────────────────────────────
+# Most CAPAs arrive with the report itself (see NearMissCreate.capas). These
+# endpoints cover the rest of the life cycle.
 # Read-list is open to anyone who can read the parent near miss.
-# Create: ONLY the actor assigned the step-3 "Review Meeting & CAPA Definition"
-#         task — not every HSE Manager. The workflow assignment is the rule.
-# PATCH: owner submits completion / verifier approves-or-rejects.
-
-from app.models.near_miss_children import NearMissCapa, NearMissComment
+# Create / assign: ONLY the actor holding the "Safety Officer Review" task —
+#         not every HSE Manager. The workflow assignment is the rule.
+# PATCH: Safety Officer names the owner / owner submits completion /
+#         verifier approves-or-rejects.
 
 # Step name (from the seeded workflow definition) at which CAPAs are defined.
 # Kept in sync with the frontend gate in near-miss/[id]/page.tsx.
+# CAPAs are written on the report form now; what this step still gates is
+# giving each one an owner and a date. v1 records mid-flight are still sitting
+# at the old step name, so both are accepted — a v1 reviewer keeps the powers
+# they had when their record was raised.
+CAPA_ASSIGNMENT_STEP = "Safety Officer Review"
 CAPA_DEFINITION_STEP = "Review Meeting & CAPA Definition"
+CAPA_STEP_NAMES = (CAPA_ASSIGNMENT_STEP, CAPA_DEFINITION_STEP)
 _OPEN_TASK_STATUSES = ("PENDING", "OVERDUE", "ESCALATED")
 
 
 async def _is_capa_definition_actor(db: AsyncSession, user_id: str, near_miss_id: str) -> bool:
-    """True only if the caller currently holds the OPEN
-    "Review Meeting & CAPA Definition" task for this near miss. That assignee
-    is the single person allowed to define CAPAs — being an HSE Manager or
-    having taken some earlier step in the workflow is not enough."""
+    """True only if the caller currently holds the OPEN CAPA-owning task for
+    this near miss — "Safety Officer Review" on the v2 workflow, or the old
+    "Review Meeting & CAPA Definition" on a record raised before it. That
+    assignee is the single person allowed to add CAPAs and name their owners;
+    being an HSE Manager or having taken some earlier step is not enough."""
     from app.models.workflow import WorkflowTask
 
     stmt = (
@@ -1488,7 +1523,7 @@ async def _is_capa_definition_actor(db: AsyncSession, user_id: str, near_miss_id
         .where(WorkflowTask.module == "NEAR_MISS")
         .where(WorkflowTask.recordId == near_miss_id)
         .where(WorkflowTask.assignedToId == user_id)
-        .where(WorkflowTask.stepName == CAPA_DEFINITION_STEP)
+        .where(WorkflowTask.stepName.in_(CAPA_STEP_NAMES))
         .where(WorkflowTask.status.in_(_OPEN_TASK_STATUSES))
         .limit(1)
     )
@@ -1551,17 +1586,22 @@ async def create_capa(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """The actor assigned the step-3 "Review Meeting & CAPA Definition" task
-    defines the CAPAs. Restricted to that assignee — not every HSE Manager and
-    not the reporter — so it follows the workflow assignment. Multiple CAPAs
-    fan out into parallel execution tasks at the next step."""
+    """Adds a CAPA the report did not carry. Restricted to the actor holding
+    the Safety Officer Review task — not every HSE Manager, and not the
+    reporter, who has already had their say on the form itself.
+
+    ownerId and targetDate are optional here for the same reason they are on
+    the form: the Safety Officer may add the action first and name its owner
+    in the same sitting or the next. The step cannot be completed until every
+    CAPA has both. Multiple CAPAs fan out into parallel execution tasks at the
+    next step."""
     nm = await db.get(NearMiss, nm_id)
     if nm is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Near miss not found")
     if not await _is_capa_definition_actor(db, user.id, nm_id):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Only the reviewer assigned the Review Meeting & CAPA Definition step can define CAPAs.",
+            "Only the reviewer holding the Safety Officer Review step can add CAPAs.",
         )
 
     description = str(payload.get("description") or "").strip()
@@ -1572,20 +1612,20 @@ async def create_capa(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "description required")
     if capa_type not in {"CORRECTIVE", "PREVENTIVE"}:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "type must be CORRECTIVE or PREVENTIVE")
-    if not owner_id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "ownerId required")
-    if not target_str:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "targetDate required")
-    try:
-        target = datetime.fromisoformat(str(target_str).replace("Z", "+00:00"))
-    except ValueError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid targetDate") from e
+    if owner_id and await db.get(User, owner_id) is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid owner")
+    target = None
+    if target_str:
+        try:
+            target = datetime.fromisoformat(str(target_str).replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid targetDate") from e
 
     capa = NearMissCapa(
         nearMissId=nm_id,
         description=description,
         type=capa_type,
-        ownerId=owner_id,
+        ownerId=owner_id or None,
         targetDate=target,
         status="PENDING",
     )
@@ -1603,7 +1643,9 @@ async def update_capa(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Three callers:
+    """Four callers:
+      • Safety Officer assigns — sets ownerId (and targetDate) on a CAPA the
+        reporter wrote. Only the holder of the Safety Officer Review task.
       • CAPA owner submits — sets status=COMPLETED, evidenceUrl/Description,
         completionNotes, completedAt
       • Verifier approves — status=VERIFIED, verifiedById, verifiedAt
@@ -1617,7 +1659,34 @@ async def update_capa(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Near miss not found")
 
     action = str(payload.get("action") or "").upper()
-    if action == "SUBMIT":
+    if action == "ASSIGN":
+        # Naming who does the work is the Safety Officer's step, and only
+        # theirs — the same gate that guards creating a CAPA.
+        if not await _is_capa_definition_actor(db, user.id, nm_id):
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Only the reviewer holding the Safety Officer Review step can assign a CAPA owner.",
+            )
+        owner_id = str(payload.get("ownerId") or "").strip()
+        if not owner_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "ownerId required")
+        if await db.get(User, owner_id) is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid owner")
+        capa.ownerId = owner_id
+        target_str = payload.get("targetDate")
+        if target_str:
+            try:
+                capa.targetDate = datetime.fromisoformat(
+                    str(target_str).replace("Z", "+00:00")
+                )
+            except ValueError as e:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid targetDate") from e
+        if capa.targetDate is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "targetDate required — the owner needs a date to work to.",
+            )
+    elif action == "SUBMIT":
         if capa.ownerId != user.id and not await _is_workflow_actor(db, user.id, nm_id):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the CAPA owner can submit")
         capa.completionNotes = payload.get("completionNotes")
@@ -1651,7 +1720,9 @@ async def update_capa(
         capa.rejectionReason = reason
         capa.reworkRound = (capa.reworkRound or 0) + 1
     else:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "action must be SUBMIT | VERIFY | REJECT")
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "action must be ASSIGN | SUBMIT | VERIFY | REJECT"
+        )
 
     await db.flush()
     await db.refresh(capa)

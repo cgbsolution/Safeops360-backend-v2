@@ -172,6 +172,10 @@ class NearMiss(Base, IdMixin):
     closureTriggers: Mapped[list | None] = mapped_column(JSON)
 
     # SLA
+    # Closure SLA in hours, chosen on the report form. Stored rather than
+    # re-derived from severity so editing the severity later cannot silently
+    # move a record's deadline; severity only supplies the default.
+    slaHours: Mapped[int | None] = mapped_column(Integer)
     slaTargetAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slaActualClosedAt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slaPerformance: Mapped[str | None] = mapped_column(String)

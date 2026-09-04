@@ -48,6 +48,19 @@ class NearMissPersonInput(BaseModel):
         return self
 
 
+class NearMissCapaInput(BaseModel):
+    """A CAPA written on the report form.
+
+    No owner: the reporter says what should be done, the Safety Officer says
+    who does it at step 2. targetDate is optional for the same reason — a
+    reporter can leave the date to whoever is given the work.
+    """
+
+    description: str = Field(min_length=3)
+    type: Literal["CORRECTIVE", "PREVENTIVE"] = "CORRECTIVE"
+    targetDate: datetime | None = None
+
+
 class PotentialConsequenceItem(BaseModel):
     """One element of the potentialConsequences array — see brief
     Section 4. Keeping this loose so future sub-rating shapes don't
@@ -146,7 +159,14 @@ class NearMissCreate(BaseModel):
     recommendedActions: str | None = None
     suggestedActionOwnerId: str | None = None
 
+    # Closure SLA. The form offers presets; severity supplies the default when
+    # the reporter leaves it alone. Bounded at a year so a typo cannot park a
+    # near miss beyond any reporting period.
+    slaHours: int | None = Field(default=None, ge=1, le=8760)
+    targetDate: datetime | None = None
+
     # Children — sent inline
+    capas: list[NearMissCapaInput] | None = None
     personsInvolved: list[NearMissPersonInput] | None = None
     personsPotentiallyAffected: list[NearMissPersonInput] | None = None
     witnesses: list[NearMissPersonInput] | None = None
@@ -244,6 +264,8 @@ class NearMissOut(BaseModel):
     riskSeverityDescription: str | None
     riskRating: int | None
     riskCategory: str | None
+
+    slaHours: int | None
 
     riskLikelihood: int | None
     riskConsequence: int | None
