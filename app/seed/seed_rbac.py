@@ -185,12 +185,29 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
         {"module": "TRAINING", "actions": ["READ"], "scope": "OWN_PLANT"},
     ],
     "SAFETY_OFFICER": [
-        {"module": "OBSERVATION", "actions": ["CREATE", "READ", "VERIFY"], "scope": "OWN_PLANT"},
-        {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "APPROVE"], "scope": "OWN_PLANT"},
-        {"module": "INCIDENT", "actions": ["CREATE", "READ"], "scope": "OWN_PLANT"},
-        {"module": "PTW", "actions": ["READ", "APPROVE"], "scope": "OWN_PLANT"},
-        PTW_RECEIVER_EXECUTE,
-        {"module": "FLRA", "actions": ["READ"], "scope": "OWN_PLANT"},
+        # ── OPERATIONAL SAFETY — full authority, group-wide ──────────────
+        # Every action in the Permission catalogue for the eight modules in the
+        # sidebar's "Operational Safety" group, at ALL_PLANTS, on an explicit
+        # instruction that Safety Officers hold every action across every plant.
+        #
+        # Restated here because step 3 of this seeder wipes RolePermission
+        # wholesale before rebuilding from this matrix: without these rows a run
+        # of `python -m app.seed.seed_rbac` silently reverts the grant.
+        # prisma/seed-rbac.ts carries the same block, and
+        # prisma/patch-safety-officer-operational-access.ts applies it to a live
+        # database without a destructive re-seed. All three must stay in step.
+        #
+        # DELETE and CAPTURE.UNMASK are policy choices, not defaults — see the
+        # note in the TypeScript matrix before treating either as routine.
+        {"module": "OBSERVATION", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "NEAR_MISS", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "PTW", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "FLRA", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "INCIDENT", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT"], "scope": "ALL_PLANTS"},
+        {"module": "FIRE", "actions": ["CREATE", "READ", "UPDATE", "DELETE", "APPROVE", "EXECUTE", "VERIFY", "CLOSE", "EXPORT", "TEMPLATE_AUTHOR", "TEMPLATE_APPROVE", "CALENDAR"], "scope": "ALL_PLANTS"},
+        {"module": "CHEMICAL", "actions": ["CREATE", "READ", "UPDATE", "CONFIGURE"], "scope": "ALL_PLANTS"},
+        {"module": "CAPTURE", "actions": ["CREATE", "READ", "TRIAGE", "UNMASK"], "scope": "ALL_PLANTS"},
+        # ─────────────────────────────────────────────────────────────────
         {"module": "INSPECTION", "actions": ["READ", "VERIFY"], "scope": "OWN_PLANT"},
         {"module": "PPE", "actions": ["READ", "CREATE", "UPDATE", "EXPORT", "ISSUE", "INSPECT", "VERIFY", "RETIRE_APPROVE"], "scope": "OWN_PLANT"},
         # Auditee: view plant audits + respond to findings routed to them (the
@@ -361,7 +378,11 @@ ROLE_GRANTS: dict[str, list[dict[str, Any]]] = {
 _CHEMICAL_GRANTS: dict[str, tuple[list[str], str]] = {
     "STORE_KEEPER":                   (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
     "SUPERVISOR":                     (["READ"], "OWN_PLANT"),
-    "SAFETY_OFFICER":                 (["CREATE", "READ", "UPDATE"], "OWN_PLANT"),
+    # SAFETY_OFFICER is absent here on purpose. Its CHEMICAL grant moved into
+    # the ROLE_GRANTS matrix above as part of the full Operational Safety set
+    # (all four actions, ALL_PLANTS). Leaving a row here too would emit
+    # CHEMICAL.CREATE/READ/UPDATE twice for one role with two different scopes,
+    # which collides on the uq_role_permission unique constraint.
     "HSE_MANAGER":                    (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
     "PLANT_HEAD":                     (["READ"], "OWN_PLANT"),
     "CORPORATE_HSE":                  (["CREATE", "READ", "UPDATE", "CONFIGURE"], "ALL_PLANTS"),
